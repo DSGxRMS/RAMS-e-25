@@ -22,6 +22,10 @@ setup(
         'console_scripts': [
             'lidar_node = perception.lidar_node:main',
             'lidar_debug = perception.debug.lidar_debug:main',
+            'camera_node = perception.camera_node:main',
+            'camera_debug = perception.debug.camera_debug:main',
+            'fusion_node = perception.fusion_node:main',
+            'fusion_debug = perception.debug.fusion_debug:main',
         ],
     },
 )
