@@ -200,6 +200,7 @@ class ConeFusionNode(Node):
         # TODO: Handle camera-only cones (cam_pts indices not used in any association).
         # For now, we ignore them because LiDAR is trusted for geometry and
         # camera-only detections are more likely to be false positives.
+        # Currently decent matches available
 
         # 3) Publish fused cloud
         fields = [
