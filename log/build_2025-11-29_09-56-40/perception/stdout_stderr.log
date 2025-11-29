@@ -1,0 +1,23 @@
+/home/armaanm/.local/lib/python3.8/site-packages/setuptools/_distutils/dist.py:261: UserWarning: Unknown distribution option: 'tests_require'
+  warnings.warn(msg)
+running develop
+running egg_info
+creating perception.egg-info
+writing perception.egg-info/PKG-INFO
+writing dependency_links to perception.egg-info/dependency_links.txt
+writing entry points to perception.egg-info/entry_points.txt
+writing requirements to perception.egg-info/requires.txt
+writing top-level names to perception.egg-info/top_level.txt
+writing manifest file 'perception.egg-info/SOURCES.txt'
+reading manifest file 'perception.egg-info/SOURCES.txt'
+writing manifest file 'perception.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/armaanm/eufs_dev/RAMS-e-25/install/perception/lib/python3.8/site-packages/perception.egg-link (link to .)
+Installing lidar_debug script to /home/armaanm/eufs_dev/RAMS-e-25/install/perception/lib/perception
+Installing lidar_node script to /home/armaanm/eufs_dev/RAMS-e-25/install/perception/lib/perception
+
+Installed /home/armaanm/eufs_dev/RAMS-e-25/build/perception
+running symlink_data
+creating /home/armaanm/eufs_dev/RAMS-e-25/install/perception/share/ament_index/resource_index/packages
+symbolically linking /home/armaanm/eufs_dev/RAMS-e-25/build/perception/resource/perception -> /home/armaanm/eufs_dev/RAMS-e-25/install/perception/share/ament_index/resource_index/packages
+symbolically linking /home/armaanm/eufs_dev/RAMS-e-25/build/perception/package.xml -> /home/armaanm/eufs_dev/RAMS-e-25/install/perception/share/perception

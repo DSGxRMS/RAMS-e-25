@@ -1,0 +1,3 @@
+[console_scripts]
+lidar_debug = perception.debug.lidar_debug:main
+lidar_node = perception.lidar_node:main
