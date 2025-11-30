@@ -40,9 +40,9 @@ class ConeFusionNode(Node):
         super().__init__("cone_fusion_node")
 
         # Parameters
-        self.declare_parameter("lidar_topic", "/cones")
-        self.declare_parameter("camera_topic", "/cones_colour")
-        self.declare_parameter("output_topic", "/cones_fused")
+        self.declare_parameter("lidar_topic", "/perception/cones")
+        self.declare_parameter("camera_topic", "/perception/cones_colour")
+        self.declare_parameter("output_topic", "/perception/cones_fused")
         self.declare_parameter("match_radius", 1.5)  # meters
 
         self.lidar_topic = self.get_parameter("lidar_topic").get_parameter_value().string_value
@@ -213,9 +213,9 @@ class ConeFusionNode(Node):
         cloud = pc2.create_cloud(header, fields, fused_points)
         self.pub_fused.publish(cloud)
 
-        self.get_logger().info(
-            f"[ConeFusion] LiDAR cones: {nL}, camera cones: {nC}, fused: {len(fused_points)}"
-        )
+        # self.get_logger().info(
+        #     # f"[ConeFusion] LiDAR cones: {nL}, camera cones: {nC}, fused: {len(fused_points)}"
+        # )
 
 
 def main(args=None):

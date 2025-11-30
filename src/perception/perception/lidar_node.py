@@ -42,7 +42,7 @@ class LidarCropGround2DNode(Node):
 
         # -------- Parameters --------
         self.declare_parameter("input_topic", "/velodyne_points")
-        self.declare_parameter("output_topic", "/cones")
+        self.declare_parameter("output_topic", "/perception/cones")
 
         # Box limits (meters)
         # X forward, Y left/right, Z up from ground
@@ -316,12 +316,12 @@ class LidarCropGround2DNode(Node):
         now = time.time()
         if now - self._last_log > 1.5:
             self._last_log = now
-            self.get_logger().info(
-                f"[LidarCropGround2D] Frame {self._frames}: "
-                f"in={n_in} pts, crop={n_crop} pts, nonground={n_ng} pts, "
-                f"clusters={n_clusters}, "
-                f"{dt*1000.0:.1f} ms."
-            )
+            # self.get_logger().info(
+            #     f"[LidarCropGround2D] Frame {self._frames}: "
+            #     f"in={n_in} pts, crop={n_crop} pts, nonground={n_ng} pts, "
+            #     f"clusters={n_clusters}, "
+            #     f"{dt*1000.0:.1f} ms."
+            # )
 
 
 def main(args=None):

@@ -30,7 +30,7 @@ class ConesColourPlotter(Node):
 
         self.sub = self.create_subscription(
             PointCloud2,
-            "/cones_colour",
+            "/perception/cones_colour",
             self.cb_cones,
             qos_profile_sensor_data,
         )

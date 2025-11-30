@@ -82,14 +82,14 @@ class CameraConesNode(Node):
         # Publisher: 2D cones in car frame + class_id
         self.pub_cones = self.create_publisher(
             PointCloud2,
-            "/cones_colour",
+            "/perception/cones_colour",
             qos_profile_sensor_data,
         )
 
         # Timer for processing
         self.create_timer(0.1, self.process_pipeline)
 
-        self.get_logger().info("[CameraConesNode] Running (same vision logic, no odom, no map).")
+        # self.get_logger().info("[CameraConesNode] Running (same vision logic, no odom, no map).")
 
     # ------------- Callbacks -------------
     def cb_left(self, msg: RosImage):
@@ -174,7 +174,7 @@ class CameraConesNode(Node):
 
         cloud = pc2.create_cloud(header, fields, points)
         self.pub_cones.publish(cloud)
-        self.get_logger().info(f"[CameraConesNode] Published {len(cones)} cones on /cones_colour.")
+        # self.get_logger().info(f"[CameraConesNode] Published {len(cones)} cones on /cones_colour.")
 
 
 def main(args=None):

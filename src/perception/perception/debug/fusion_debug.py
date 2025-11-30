@@ -30,7 +30,7 @@ class FusedConesPlotter(Node):
 
         self.sub = self.create_subscription(
             PointCloud2,
-            "/cones_fused",
+            "/perception/cones_fused",
             self.cb_fused,
             qos_profile_sensor_data,
         )

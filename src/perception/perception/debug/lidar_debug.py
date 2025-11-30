@@ -38,7 +38,7 @@ class ConeViewer2D(Node):
         super().__init__("cone_viewer_2d")
 
         # -------- Parameters --------
-        self.declare_parameter("input_topic", "/cones")
+        self.declare_parameter("input_topic", "/perception/cones")
 
         # Plot bounds (in meters, sensor frame)
         # X forward, Y left/right
