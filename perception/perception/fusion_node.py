@@ -200,7 +200,7 @@ class ConeFusionNode(Node):
         # TODO: Handle camera-only cones (cam_pts indices not used in any association).
         # For now, we ignore them because LiDAR is trusted for geometry and
         # camera-only detections are more likely to be false positives.
-        # Currently decent matches available
+        # Currently decent matches available - Can sustain cam points if YOLO v8 turns out better.
 
         # 3) Publish fused cloud
         fields = [
