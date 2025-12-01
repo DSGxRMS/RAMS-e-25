@@ -47,7 +47,7 @@ class LidarCropGround2DNode(Node):
         # Box limits (meters)
         # X forward, Y left/right, Z up from ground
         self.declare_parameter("x_min", 0.2)
-        self.declare_parameter("x_max", 30.0)
+        self.declare_parameter("x_max", 15.0)
         self.declare_parameter("y_abs_max", 8.0)
         self.declare_parameter("z_min", -2.0)
         self.declare_parameter("z_max", 2.0)

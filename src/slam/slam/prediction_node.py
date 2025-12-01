@@ -71,11 +71,11 @@ class ImuWheelEKF(Node):
         self.declare_parameter("topics.imu", "/imu/data")
         self.declare_parameter("topics.out_odom", "/slam/odom_raw")
 
-        self.declare_parameter("run.bias_window_s", 5.0)
+        self.declare_parameter("run.bias_window_s", 3.0)
         self.declare_parameter("run.bias_min_samples", 200)
 
         # logging controls
-        self.declare_parameter("log.enable", False)
+        self.declare_parameter("log.enable", True)
         self.declare_parameter("log.cli_hz", 1.0)
 
         self.declare_parameter("input.imu_use_rate_hz", 0.0)  # 0 => use all IMU samples
