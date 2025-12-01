@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import math, time
 from collections import deque
-import bisect  # no longer used but kept if you later re-add GT
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
+from rclpy.qos import (
+    QoSProfile,
+    QoSHistoryPolicy,
+    QoSReliabilityPolicy,
+    QoSDurabilityPolicy,
+)
 from rclpy.time import Time as RclTime
 
 from sensor_msgs.msg import Imu
@@ -26,11 +30,14 @@ def rot3_from_quat(qx, qy, qz, qw):
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
     wx, wy, wz = w * x, w * y, w * z
-    return np.array([
-        [1 - 2 * (yy + zz), 2 * (xy - wz),       2 * (xz + wy)],
-        [2 * (xy + wz),     1 - 2 * (xx + zz),   2 * (yz - wx)],
-        [2 * (xz - wy),     2 * (yz + wx),       1 - 2 * (xx + yy)]
-    ], dtype=float)
+    return np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=float,
+    )
 
 
 def yaw_from_quat(qx, qy, qz, qw) -> float:
@@ -55,7 +62,10 @@ def is_finite(*vals) -> bool:
 class ImuWheelEKF(Node):
     def __init__(self):
         # Keep the same node name for compatibility
-        super().__init__("fastslam_localizer", automatically_declare_parameters_from_overrides=True)
+        super().__init__(
+            "fastslam_localizer",
+            automatically_declare_parameters_from_overrides=True,
+        )
 
         # --- Parameters ---
         self.declare_parameter("topics.imu", "/imu/data")
@@ -63,18 +73,21 @@ class ImuWheelEKF(Node):
 
         self.declare_parameter("run.bias_window_s", 5.0)
         self.declare_parameter("run.bias_min_samples", 200)
+
+        # logging controls
+        self.declare_parameter("log.enable", False)
         self.declare_parameter("log.cli_hz", 1.0)
 
-        self.declare_parameter("input.imu_use_rate_hz", 0.0)   # 0 => use all IMU samples
-        self.declare_parameter("vel_leak_hz", 0.0)             # keep 0.0 while debugging
+        self.declare_parameter("input.imu_use_rate_hz", 0.0)  # 0 => use all IMU samples
+        self.declare_parameter("vel_leak_hz", 0.0)            # keep 0.0 while debugging
         self.declare_parameter("gravity.sign", 1.0)           # world g = [0,0,sign*G]
 
         # Yaw-scale (centripetal), deterministic updates
         self.declare_parameter("yawscale.enable", True)
-        self.declare_parameter("yawscale.alpha", 0.04)         # EMA toward median
-        self.declare_parameter("yawscale.v_min", 0.5)          # m/s
-        self.declare_parameter("yawscale.gz_min", 0.10)        # rad/s
-        self.declare_parameter("yawscale.aperp_min", 0.40)     # m/s^2
+        self.declare_parameter("yawscale.alpha", 0.04)           # EMA toward median
+        self.declare_parameter("yawscale.v_min", 0.5)            # m/s
+        self.declare_parameter("yawscale.gz_min", 0.10)          # rad/s
+        self.declare_parameter("yawscale.aperp_min", 0.40)       # m/s^2
         self.declare_parameter("yawscale.par_over_perp_max", 0.5)
         self.declare_parameter("yawscale.k_min", 0.6)
         self.declare_parameter("yawscale.k_max", 2.4)
@@ -91,7 +104,10 @@ class ImuWheelEKF(Node):
 
         self.bias_window_s = float(P("run.bias_window_s"))
         self.bias_min_samples = int(P("run.bias_min_samples"))
+
+        self.log_enable = bool(P("log.enable"))
         self.cli_hz = float(P("log.cli_hz"))
+
         self.imu_use_rate_hz = float(P("input.imu_use_rate_hz"))
         self.vel_leak_hz = float(P("vel_leak_hz"))
         self.gravity_sign = float(P("gravity.sign"))
@@ -148,18 +164,19 @@ class ImuWheelEKF(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=200,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE
+            durability=QoSDurabilityPolicy.VOLATILE,
         )
 
         # Subscriptions / publishers
         self.create_subscription(Imu, self.topic_imu, self.cb_imu, qos_fast)
         self.pub_out = self.create_publisher(Odometry, self.topic_out, 10)
-        self.create_timer(max(0.05, 1.0 / self.cli_hz), self.on_cli_timer)
+        self.create_timer(max(0.05, 1.0 / max(self.cli_hz, 1e-3)), self.on_cli_timer)
 
-        self.get_logger().info(
-            f"[IMU-PRED] imu={self.topic_imu} | out={self.topic_out}\n"
-            f"           bias_window={self.bias_window_s}s (min_samples={self.bias_min_samples}) | publish=IMU rate"
-        )
+        if self.log_enable:
+            self.get_logger().info(
+                f"[IMU-PRED] imu={self.topic_imu} | out={self.topic_out}\n"
+                f"           bias_window={self.bias_window_s}s (min_samples={self.bias_min_samples}) | publish=IMU rate"
+            )
 
     # ---------- Utils ----------
     def _normalize_quat(self, q):
@@ -180,7 +197,7 @@ class ImuWheelEKF(Node):
             return A[0]
         k = int(max(0, min(n // 2, round(trim * n))))
         if k > 0:
-            A = np.sort(A, axis=0)[k:n - k]
+            A = np.sort(A, axis=0)[k : n - k]
         return np.mean(A, axis=0)
 
     def _trimmed_mean_scalar(self, arr, trim=0.1):
@@ -192,12 +209,16 @@ class ImuWheelEKF(Node):
             return float(a[0])
         k = int(max(0, min(n // 2, round(trim * n))))
         if k > 0:
-            a = np.sort(a)[k:n - k]
+            a = np.sort(a)[k : n - k]
         return float(np.mean(a))
 
     # ---------- Yaw-scale (deterministic) ----------
     def _maybe_update_k_yaw(self, t, v_prev, gz_avg, ax_avg, ay_avg):
-        if (not self.yawscale_enable) or (v_prev <= self.yawscale_v_min) or (abs(gz_avg) <= self.yawscale_gz_min):
+        if (
+            (not self.yawscale_enable)
+            or (v_prev <= self.yawscale_v_min)
+            or (abs(gz_avg) <= self.yawscale_gz_min)
+        ):
             return
 
         # Heading from velocity
@@ -208,8 +229,12 @@ class ImuWheelEKF(Node):
         a_par = ax_avg * vx_h + ay_avg * vy_h
         a_perp = ax_avg * nx + ay_avg * ny
 
-        if (abs(a_perp) > self.yawscale_aperp_min) and (abs(a_par) <= self.yawscale_par_over_perp_max * abs(a_perp)):
-            k_obs = abs(a_perp) / (max(v_prev, 1e-3) * max(abs(gz_avg), 1e-6))
+        if (abs(a_perp) > self.yawscale_aperp_min) and (
+            abs(a_par) <= self.yawscale_par_over_perp_max * abs(a_perp)
+        ):
+            k_obs = abs(a_perp) / (
+                max(v_prev, 1e-3) * max(abs(gz_avg), 1e-6)
+            )
             if math.isfinite(k_obs):
                 k_obs = max(self.yawscale_k_min, min(self.yawscale_k_max, k_obs))
                 self._k_obs_buf.append((t, k_obs))
@@ -226,7 +251,10 @@ class ImuWheelEKF(Node):
             k_med = ks[len(ks) // 2]
             k_target = (1.0 - self.yawscale_alpha) * self.k_yaw + self.yawscale_alpha * k_med
             dk = max(-self.k_step_max, min(self.k_step_max, k_target - self.k_yaw))
-            self.k_yaw = max(self.yawscale_k_min, min(self.yawscale_k_max, self.k_yaw + dk))
+            self.k_yaw = max(
+                self.yawscale_k_min,
+                min(self.yawscale_k_max, self.k_yaw + dk),
+            )
             self._last_k_update_t = t
 
     # ---------- IMU callback ----------
@@ -235,8 +263,16 @@ class ImuWheelEKF(Node):
         if self.bias_t0 is None:
             self.bias_t0 = t
 
-        ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
-        gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
+        ax, ay, az = (
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z,
+        )
+        gx, gy, gz = (
+            msg.angular_velocity.x,
+            msg.angular_velocity.y,
+            msg.angular_velocity.z,
+        )
         q = msg.orientation
 
         if not is_finite(ax, ay, az, gx, gy, gz, q.x, q.y, q.z, q.w):
@@ -258,23 +294,29 @@ class ImuWheelEKF(Node):
         if not self.bias_locked:
             a_raw = np.array([ax, ay, az], float)
             g_body = Rbw @ g_world
-            spec_plus_bias = (a_raw - g_body)  # specific force + bias (in body)
+            spec_plus_bias = a_raw - g_body  # specific force + bias (in body)
             self._acc_all.append(spec_plus_bias.tolist())
             self._gz_all.append(gz)
             self._bias_samp_count += 1
 
             # "still" gating
             w_norm = math.sqrt(gx * gx + gy * gy + gz * gz)
-            if (abs(gz) < 0.05) and (w_norm < 0.2) and (abs(np.linalg.norm(a_raw) - G) < 0.6):
+            if (abs(gz) < 0.05) and (w_norm < 0.2) and (
+                abs(np.linalg.norm(a_raw) - G) < 0.6
+            ):
                 self._acc_still.append(spec_plus_bias.tolist())
                 self._gz_still.append(gz)
 
             # lock condition
-            if ((t - self.bias_t0) >= self.bias_window_s) and (self._bias_samp_count >= self.bias_min_samples):
-                use_still = (len(self._acc_still) >= self.bias_min_samples // 2)
+            if ((t - self.bias_t0) >= self.bias_window_s) and (
+                self._bias_samp_count >= self.bias_min_samples
+            ):
+                use_still = len(self._acc_still) >= self.bias_min_samples // 2
                 if use_still:
                     self.acc_b = np.mean(np.asarray(self._acc_still, float), axis=0)
-                    self.gz_b = float(np.mean(np.asarray(self._gz_still, float)))
+                    self.gz_b = float(
+                        np.mean(np.asarray(self._gz_still, float))
+                    )
                     src = "STILL"
                 else:
                     acc_tm = self._trimmed_mean_vec(self._acc_all, trim=0.10)
@@ -284,11 +326,12 @@ class ImuWheelEKF(Node):
                     src = "FALLBACK"
 
                 self.bias_locked = True
-                self.get_logger().info(
-                    f"[IMU-PRED] Bias locked [{src}] (N_total={self._bias_samp_count}, "
-                    f"N_still={len(self._acc_still)}): "
-                    f"acc_bias_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
-                )
+                if self.log_enable:
+                    self.get_logger().info(
+                        f"[IMU-PRED] Bias locked [{src}] (N_total={self._bias_samp_count}, "
+                        f"N_still={len(self._acc_still)}): "
+                        f"acc_bias_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
+                    )
 
                 # initialize state timing & integrator prevs
                 self.x[2] = yaw_q
@@ -342,7 +385,11 @@ class ImuWheelEKF(Node):
 
         # Velocity leak (optional)
         def leak(dt):
-            return math.exp(-self.vel_leak_hz * dt) if self.vel_leak_hz > 0.0 else 1.0
+            return (
+                math.exp(-self.vel_leak_hz * dt)
+                if self.vel_leak_hz > 0.0
+                else 1.0
+            )
 
         # Integrate with sub-steps
         for _ in range(n_steps):
@@ -373,6 +420,8 @@ class ImuWheelEKF(Node):
 
     # ---------- CLI logging (no error metrics) ----------
     def on_cli_timer(self):
+        if not self.log_enable:
+            return
         if not self.bias_locked:
             return
         now = time.time()
@@ -392,7 +441,15 @@ class ImuWheelEKF(Node):
 
     # ---------- Publish ----------
     def _publish_output(self, t: float):
-        from geometry_msgs.msg import Pose, PoseWithCovariance, Twist, TwistWithCovariance, Point, Quaternion, Vector3
+        from geometry_msgs.msg import (
+            Pose,
+            PoseWithCovariance,
+            Twist,
+            TwistWithCovariance,
+            Point,
+            Quaternion,
+            Vector3,
+        )
 
         x, y, yaw = self.x[0], self.x[1], self.x[2]
         v = float(math.hypot(self.x[3], self.x[4]))
@@ -411,16 +468,16 @@ class ImuWheelEKF(Node):
 
         od.pose.pose = Pose(
             position=Point(x=x, y=y, z=0.0),
-            orientation=quat_from_yaw(yaw_pub)
+            orientation=quat_from_yaw(yaw_pub),
         )
 
         od.twist.twist = Twist(
             linear=Vector3(
                 x=v * math.cos(yaw_pub),
                 y=v * math.sin(yaw_pub),
-                z=0.0
+                z=0.0,
             ),
-            angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate)
+            angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate),
         )
 
         self.pub_out.publish(od)
