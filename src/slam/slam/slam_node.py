@@ -3,7 +3,6 @@ import math
 import threading
 from collections import deque
 import bisect
-from typing import Dict, List
 
 import numpy as np
 
@@ -24,14 +23,9 @@ from sensor_msgs_py import point_cloud2 as pc2
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Circle
 
-# Import gating helpers
-from .slam_utils.gating import (
-    Landmark as GateLandmark,
-    GateConfig,
-    gate_measurements,
-)
+from .slam_utils import association   # <- NEW
 
 
 def yaw_from_quat(qx, qy, qz, qw) -> float:
@@ -47,18 +41,13 @@ def rot2d(th: float) -> np.ndarray:
 
 class VirtualWorldPlotter(Node):
     """
-    Visualiser + "dumb SLAM" with Mahalanobis gating and yaw-rate–dependent ellipse.
-
-    - Odom: /slam/odom_raw or /ground_truth/odom (pose in MAP frame).
-    - Cones: /perception/cones_fused in BASE frame (x,y,z,class_id).
-
-    Logic:
-      1) Use odom buffer to get pose (x,y,yaw,yawrate) at the cones' timestamp.
-      2) Transform cones from BASE -> MAP.
-      3) For each measurement frame:
-           - Use Mahalanobis gating against existing landmarks.
-           - Measurements outside gate => new landmarks.
-      4) Plot trajectory + landmarks + gate ellipses.
+    'Dumb SLAM' visualiser with:
+      - Time-synchronised odom + cones
+      - Cones in base_link frame -> transformed to map
+      - Mahalanobis gating with yaw-rate-dependent sigma
+      - Hungarian association per colour (1-to-1)
+      - Landmark update (simple EMA) + new landmark creation
+      - Gate visualisation
     """
 
     def __init__(self):
@@ -74,22 +63,43 @@ class VirtualWorldPlotter(Node):
 
         # Plot params
         self.declare_parameter("plot.trail_max_points", 20000)
+        self.declare_parameter("plot.cone_max_points_per_class", 20000)
         self.declare_parameter("plot.fixed_window", False)
         self.declare_parameter("plot.window_half_size", 60.0)
         self.declare_parameter("plot.show_gates", True)
 
-        gp = self.get_parameter
-        odom_topic = str(gp("topics.odom_in").value)
-        cones_topic = str(gp("topics.cones_in").value)
+        # Gating params (Mahalanobis in 2D, dynamic sigma on yaw-rate)
+        self.declare_parameter("gate.base_sigma", 0.4)   # m
+        self.declare_parameter("gate.max_sigma", 1.5)    # m
+        self.declare_parameter("gate.yaw_ref", 0.6)      # rad/s where we reach max_sigma
+        self.declare_parameter("gate.chi2", 9.21)        # ~99% 2D (chi-square with 2 dof)
 
-        best_effort = bool(gp("qos.best_effort").value)
-        depth = int(gp("qos.depth").value)
-        self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
+        # Association params
+        self.declare_parameter("assoc.large_cost", 1e6)
+        self.declare_parameter("assoc.update_alpha", 0.2)  # EMA blend weight for measurement
 
-        self.trail_max_points = int(gp("plot.trail_max_points").value)
-        self.fixed_window = bool(gp("plot.fixed_window").value)
-        self.window_half_size = float(gp("plot.window_half_size").value)
-        self.show_gates = bool(gp("plot.show_gates").value)
+        P = lambda k: self.get_parameter(k).value
+
+        odom_topic = str(P("topics.odom_in"))
+        cones_topic = str(P("topics.cones_in"))
+
+        best_effort = bool(P("qos.best_effort"))
+        depth = int(P("qos.depth"))
+        self.odom_buffer_sec = float(P("odom_buffer_sec"))
+
+        self.trail_max_points = int(P("plot.trail_max_points"))
+        self.cone_max_points = int(P("plot.cone_max_points_per_class"))
+        self.fixed_window = bool(P("plot.fixed_window"))
+        self.window_half_size = float(P("plot.window_half_size"))
+        self.show_gates = bool(P("plot.show_gates"))
+
+        self.gate_base_sigma = float(P("gate.base_sigma"))
+        self.gate_max_sigma = float(P("gate.max_sigma"))
+        self.gate_yaw_ref = float(P("gate.yaw_ref"))
+        self.gate_chi2 = float(P("gate.chi2"))
+
+        self.large_cost = float(P("assoc.large_cost"))
+        self.landmark_update_alpha = float(P("assoc.update_alpha"))
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -109,29 +119,23 @@ class VirtualWorldPlotter(Node):
         # ---- State ----
         self.data_lock = threading.Lock()
 
-        # odom buffer: (t, x, y, yaw, yawrate)
+        # odom buffer: (t, x, y, yaw)
         self.odom_buf: deque = deque()
 
-        # car pose & trajectory (for plotting)
+        # car pose & trajectory (for drawing)
         self.car_x = None
         self.car_y = None
         self.car_yaw = 0.0
-        self.car_yawrate = 0.0
+        self.car_yaw_rate = 0.0  # for dynamic gate
         self.traj_x = []
         self.traj_y = []
 
-        # landmarks per class_id: cid -> List[GateLandmark]
-        self.landmarks_by_class: Dict[int, List[GateLandmark]] = {}
+        # cones in map frame per class_id (landmarks)
+        # class_id -> list[(x, y)]
+        self.map_cones = {}
 
-        # Gating config (tuned for your use case)
-        self.gate_cfg = GateConfig(
-            chi2_thr=9.21,
-            sigma_along_base=0.25,
-            sigma_across_base=0.15,
-            k_yawrate=2.5,
-            scale_min=1.0,
-            scale_max=2.5,
-        )
+        # gating visualisation
+        self.last_gate_radius = None  # m
 
         # ---- Plot ----
         self.fig, self.ax = plt.subplots()
@@ -139,7 +143,7 @@ class VirtualWorldPlotter(Node):
         self.ax.grid(True)
         self.ax.set_xlabel("X [m]")
         self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("Virtual World (odom + Mahalanobis-gated map)")
+        self.ax.set_title("Virtual World (odom + cones + Hungarian association)")
 
         self.get_logger().info(
             f"[virtual_world_plotter] odom={odom_topic}, cones={cones_topic}"
@@ -149,8 +153,8 @@ class VirtualWorldPlotter(Node):
 
     def _pose_at(self, t_query: float):
         """
-        Interpolate pose (x,y,yaw,yawrate) at time t_query using odom_buf.
-        Returns tuple or None if no odom yet.
+        Interpolate pose (x,y,yaw) at time t_query using odom_buf.
+        Returns (x,y,yaw) or None if no odom yet.
         """
         if not self.odom_buf:
             return None
@@ -159,29 +163,36 @@ class VirtualWorldPlotter(Node):
         idx = bisect.bisect_left(times, t_query)
 
         if idx == 0:
-            _, x0, y0, yaw0, yr0 = self.odom_buf[0]
-            return x0, y0, yaw0, yr0
+            _, x0, y0, yaw0 = self.odom_buf[0]
+            return x0, y0, yaw0
         if idx >= len(self.odom_buf):
-            _, x1, y1, yaw1, yr1 = self.odom_buf[-1]
-            return x1, y1, yaw1, yr1
+            _, x1, y1, yaw1 = self.odom_buf[-1]
+            return x1, y1, yaw1
 
-        t0, x0, y0, yaw0, yr0 = self.odom_buf[idx - 1]
-        t1, x1, y1, yaw1, yr1 = self.odom_buf[idx]
+        t0, x0, y0, yaw0 = self.odom_buf[idx - 1]
+        t1, x1, y1, yaw1 = self.odom_buf[idx]
 
         if t1 == t0:
-            return x0, y0, yaw0, yr0
+            return x0, y0, yaw0
 
         a = (t_query - t0) / (t1 - t0)
         x = x0 + a * (x1 - x0)
         y = y0 + a * (y1 - y0)
-
-        # interpolate yaw shortest-arc
         dyaw = ((yaw1 - yaw0 + math.pi) % (2 * math.pi)) - math.pi
         yaw = yaw0 + a * dyaw
+        return x, y, yaw
 
-        # linear interp yawrate
-        yr = yr0 + a * (yr1 - yr0)
-        return x, y, yaw, yr
+    def _effective_gate_sigma(self) -> float:
+        """
+        Sigma in metres for x,y, scaled up with yaw-rate.
+        """
+        base = self.gate_base_sigma
+        max_s = self.gate_max_sigma
+        yaw_ref = max(self.gate_yaw_ref, 1e-3)
+
+        yr = abs(self.car_yaw_rate)
+        f = min(1.0, yr / yaw_ref)
+        return base + f * (max_s - base)
 
     # ---------------------- Callbacks ----------------------
 
@@ -192,15 +203,12 @@ class VirtualWorldPlotter(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        # Try to get yawrate from twist; if missing, treat as 0
-        try:
-            yr = float(msg.twist.twist.angular.z)
-        except Exception:
-            yr = 0.0
+        # yaw-rate from twist if present
+        yaw_rate = float(msg.twist.twist.angular.z)
 
         with self.data_lock:
             # push into buffer
-            self.odom_buf.append((t, x, y, yaw, yr))
+            self.odom_buf.append((t, x, y, yaw))
             tmin = t - self.odom_buffer_sec
             while self.odom_buf and self.odom_buf[0][0] < tmin:
                 self.odom_buf.popleft()
@@ -209,7 +217,8 @@ class VirtualWorldPlotter(Node):
             self.car_x = x
             self.car_y = y
             self.car_yaw = yaw
-            self.car_yawrate = yr
+            self.car_yaw_rate = yaw_rate
+
             self.traj_x.append(x)
             self.traj_y.append(y)
             if len(self.traj_x) > self.trail_max_points:
@@ -217,7 +226,7 @@ class VirtualWorldPlotter(Node):
                 self.traj_y = self.traj_y[-self.trail_max_points:]
 
     def cb_cones(self, msg: PointCloud2):
-        # read cones in BASE frame
+        # read cones in base_link frame
         try:
             cones = list(
                 pc2.read_points(
@@ -235,79 +244,85 @@ class VirtualWorldPlotter(Node):
         if not cones:
             return
 
-        # get pose at cones timestamp
         t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
 
         with self.data_lock:
             pose = self._pose_at(t_c)
             if pose is None:
+                # No odom yet; can't transform
                 return
-            x_w, y_w, yaw, yawrate = pose
+
+            x_w, y_w, yaw = pose
             R = rot2d(yaw)
 
-            # group measurements by class_id, in MAP frame
-            meas_by_class: Dict[int, List[np.ndarray]] = {}
+            # Group current measurements by class_id
+            meas_by_class = {}
             for bx, by, bz, cls_id in cones:
                 pb = np.array([float(bx), float(by)], dtype=float)
                 pw = np.array([x_w, y_w], dtype=float) + R @ pb
                 cid = int(cls_id)
                 meas_by_class.setdefault(cid, []).append(pw)
 
-            # For each class, run Mahalanobis gating against existing landmarks
-            for cid, meas_list in meas_by_class.items():
-                if not meas_list:
+            if not meas_by_class:
+                return
+
+            # Setup gating for this frame
+            sigma_eff = self._effective_gate_sigma()
+            self.last_gate_radius = math.sqrt(self.gate_chi2) * sigma_eff
+
+            # Per-class Hungarian association in world coordinates
+            for cid, pts in meas_by_class.items():
+                meas_xy = np.vstack(pts)  # shape (M, 2)
+
+                old_pts = self.map_cones.get(cid, [])
+                if not old_pts:
+                    # No landmarks of this class yet -> all become new landmarks
+                    self.map_cones[cid] = [
+                        (float(p[0]), float(p[1])) for p in meas_xy
+                    ]
                     continue
 
-                lms = self.landmarks_by_class.get(cid, [])
+                landmarks_xy = np.asarray(old_pts, dtype=float).reshape(-1, 2)
 
-                # Gate: which meas are "existing" vs "new"
-                associated_idxs, new_idxs = gate_measurements(
-                    meas_list, lms, yaw, yawrate, self.gate_cfg
+                cost, valid = association.build_mahalanobis_cost_matrix(
+                    landmarks_xy=landmarks_xy,
+                    meas_xy=meas_xy,
+                    sigma_xy=sigma_eff,
+                    chi2_gate=self.gate_chi2,
+                    large_cost=self.large_cost,
                 )
 
-                # Very simple nudging for existing landmarks
-                if associated_idxs:
-                    S_meas = self._approx_meas_cov_cached(yaw, yawrate)
-                    for i_meas in associated_idxs:
-                        z = meas_list[i_meas]
-                        # Pick nearest lm (in Mahalanobis) and pull it slightly towards z
-                        best_j = None
-                        best_m2 = None
-                        for j, lm in enumerate(lms):
-                            innov = z - lm.mean
-                            try:
-                                Sinv = np.linalg.inv(lm.cov + S_meas)
-                            except np.linalg.LinAlgError:
-                                Sinv = np.linalg.pinv(lm.cov + S_meas)
-                            m2 = float(innov.T @ Sinv @ innov)
-                            if best_m2 is None or m2 < best_m2:
-                                best_m2 = m2
-                                best_j = j
-                        if best_j is not None:
-                            lm = lms[best_j]
-                            lm.mean = 0.8 * lm.mean + 0.2 * z
+                matches, unmatched_meas, unmatched_landmarks = association.hungarian_assign(
+                    cost=cost,
+                    valid_mask=valid,
+                    large_cost=self.large_cost,
+                )
 
-                # Birth new landmarks
-                if new_idxs:
-                    S_meas = self._approx_meas_cov_cached(yaw, yawrate)
-                    for i_meas in new_idxs:
-                        z = meas_list[i_meas]
-                        lm = GateLandmark(
-                            mean=z.copy(),
-                            cov=S_meas.copy(),
-                            class_id=cid,
-                        )
-                        lms.append(lm)
+                new_landmarks = []
 
-                self.landmarks_by_class[cid] = lms
+                # Matched pairs -> update landmark with EMA toward measurement
+                alpha = self.landmark_update_alpha
+                for mi, lj, d in matches:
+                    old = landmarks_xy[lj]
+                    meas = meas_xy[mi]
+                    upd = (1.0 - alpha) * old + alpha * meas
+                    new_landmarks.append((float(upd[0]), float(upd[1])))
 
-    def _approx_meas_cov_cached(self, yaw: float, yawrate: float) -> np.ndarray:
-        """
-        Wrapper to reuse the same logic as gating for local EKF-style updates.
-        We just rebuild it here; if you want you can cache per-frame.
-        """
-        from .slam_utils.gating import _build_meas_cov  # type: ignore
-        return _build_meas_cov(yaw, yawrate, self.gate_cfg)
+                # Unmatched old landmarks -> keep as-is
+                for lj in unmatched_landmarks:
+                    old = landmarks_xy[lj]
+                    new_landmarks.append((float(old[0]), float(old[1])))
+
+                # Unmatched measurements -> spawn new landmarks
+                for mi in unmatched_meas:
+                    meas = meas_xy[mi]
+                    new_landmarks.append((float(meas[0]), float(meas[1])))
+
+                # Limit count per class if desired
+                if len(new_landmarks) > self.cone_max_points:
+                    new_landmarks = new_landmarks[-self.cone_max_points:]
+
+                self.map_cones[cid] = new_landmarks
 
     # ---------------------- Plot update ----------------------
 
@@ -318,26 +333,15 @@ class VirtualWorldPlotter(Node):
             car_x = self.car_x
             car_y = self.car_y
             car_yaw = self.car_yaw
-            car_yawrate = self.car_yawrate
-
-            # flatten landmarks into per-class XY lists
-            cones_by_class: Dict[int, List[tuple]] = {}
-            for cid, lms in self.landmarks_by_class.items():
-                cones_by_class[cid] = [
-                    (float(lm.mean[0]), float(lm.mean[1])) for lm in lms
-                ]
-
-            # keep a copy of landmarks for gate drawing
-            lms_copy = {
-                cid: list(lms) for cid, lms in self.landmarks_by_class.items()
-            }
+            cones_copy = {cid: list(pts) for cid, pts in self.map_cones.items()}
+            gate_radius = self.last_gate_radius
 
         self.ax.clear()
         self.ax.set_aspect("equal", adjustable="datalim")
         self.ax.grid(True)
         self.ax.set_xlabel("X [m]")
         self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("Virtual World (odom + Mahalanobis-gated map)")
+        self.ax.set_title("Virtual World (odom + cones + Hungarian association)")
 
         all_x, all_y = [], []
 
@@ -369,9 +373,10 @@ class VirtualWorldPlotter(Node):
             1: ("gold", "yellow cones"),
             2: ("orange", "orange cones"),
             3: ("red", "big orange cones"),
+            4: ("gray", "unknown cones"),
         }
 
-        for cid, pts in cones_by_class.items():
+        for cid, pts in cones_copy.items():
             if not pts:
                 continue
             xs = [p[0] for p in pts]
@@ -386,53 +391,19 @@ class VirtualWorldPlotter(Node):
 
             self.ax.scatter(xs, ys, s=10.0, c=col, marker="o", label=label)
 
-        # ---- Gate visualisation (ellipses) ----
-        if self.show_gates and car_x is not None and car_y is not None:
-            try:
-                S_meas = self._approx_meas_cov_cached(car_yaw, car_yawrate)
-            except Exception:
-                S_meas = None
-
-            if S_meas is not None:
-                chi2 = self.gate_cfg.chi2_thr
-                for cid, lms in lms_copy.items():
-                    if cid in color_map:
-                        col, _ = color_map[cid]
-                    else:
-                        col = "gray"
-
-                    for lm in lms:
-                        # Effective gate covariance: landmark cov + measurement cov
-                        S_gate = lm.cov + S_meas
-                        try:
-                            w, V = np.linalg.eigh(S_gate)
-                        except np.linalg.LinAlgError:
-                            continue
-
-                        # eigenvalues -> axis lengths (1-σ), then scale by sqrt(chi2_thr)
-                        w = np.maximum(w, 1e-9)
-                        axis_len = np.sqrt(w * chi2)  # [a, b] in meters
-
-                        # convert to width/height for Ellipse (diameters)
-                        width = 2.0 * axis_len[0]
-                        height = 2.0 * axis_len[1]
-
-                        # angle from first eigenvector
-                        vx, vy = V[0, 0], V[1, 0]
-                        angle = math.degrees(math.atan2(vy, vx))
-
-                        e = Ellipse(
-                            xy=(lm.mean[0], lm.mean[1]),
-                            width=width,
-                            height=height,
-                            angle=angle,
-                            fill=False,
-                            linestyle="--",
-                            linewidth=0.7,
-                            edgecolor=col,
-                            alpha=0.7,
-                        )
-                        self.ax.add_patch(e)
+            # Draw gates as circles if enabled
+            if self.show_gates and gate_radius is not None and gate_radius > 0.0:
+                r = gate_radius
+                for (x, y) in pts:
+                    circ = Circle(
+                        (x, y),
+                        radius=r,
+                        fill=False,
+                        linestyle="--",
+                        linewidth=0.5,
+                        alpha=0.25,
+                    )
+                    self.ax.add_patch(circ)
 
         # Windowing
         if self.fixed_window and (car_x is not None and car_y is not None):
