@@ -3,6 +3,7 @@ import math
 import threading
 from collections import deque
 import bisect
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -23,9 +24,8 @@ from sensor_msgs_py import point_cloud2 as pc2
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 
-from .slam_utils import association   # <- NEW
+from .slam_utils.pf_slam import ParticleFilterSLAM, wrap
 
 
 def yaw_from_quat(qx, qy, qz, qw) -> float:
@@ -34,20 +34,18 @@ def yaw_from_quat(qx, qy, qz, qw) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def rot2d(th: float) -> np.ndarray:
-    c, s = math.cos(th), math.sin(th)
-    return np.array([[c, -s], [s, c]], dtype=float)
-
-
 class VirtualWorldPlotter(Node):
     """
-    'Dumb SLAM' visualiser with:
-      - Time-synchronised odom + cones
-      - Cones in base_link frame -> transformed to map
-      - Mahalanobis gating with yaw-rate-dependent sigma
-      - Hungarian association per colour (1-to-1)
-      - Landmark update (simple EMA) + new landmark creation
-      - Gate visualisation
+    PF-SLAM visualiser:
+
+      - Odom: /slam/odom_raw or /ground_truth/odom
+      - Cones: /perception/cones_fused (x,y,z,class_id) in BODY frame
+
+    SLAM logic:
+      - Interpolate odom pose at each cone stamp.
+      - Use odom increment between successive cone frames as motion input.
+      - Run ParticleFilterSLAM (motion + update).
+      - Plot best-particle pose + map, alongside raw odom path.
     """
 
     def __init__(self):
@@ -63,43 +61,19 @@ class VirtualWorldPlotter(Node):
 
         # Plot params
         self.declare_parameter("plot.trail_max_points", 20000)
-        self.declare_parameter("plot.cone_max_points_per_class", 20000)
         self.declare_parameter("plot.fixed_window", False)
         self.declare_parameter("plot.window_half_size", 60.0)
-        self.declare_parameter("plot.show_gates", True)
 
-        # Gating params (Mahalanobis in 2D, dynamic sigma on yaw-rate)
-        self.declare_parameter("gate.base_sigma", 0.4)   # m
-        self.declare_parameter("gate.max_sigma", 1.5)    # m
-        self.declare_parameter("gate.yaw_ref", 0.6)      # rad/s where we reach max_sigma
-        self.declare_parameter("gate.chi2", 9.21)        # ~99% 2D (chi-square with 2 dof)
+        gp = self.get_parameter
+        odom_topic = str(gp("topics.odom_in").value)
+        cones_topic = str(gp("topics.cones_in").value)
+        best_effort = bool(gp("qos.best_effort").value)
+        depth = int(gp("qos.depth").value)
+        self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
 
-        # Association params
-        self.declare_parameter("assoc.large_cost", 1e6)
-        self.declare_parameter("assoc.update_alpha", 0.2)  # EMA blend weight for measurement
-
-        P = lambda k: self.get_parameter(k).value
-
-        odom_topic = str(P("topics.odom_in"))
-        cones_topic = str(P("topics.cones_in"))
-
-        best_effort = bool(P("qos.best_effort"))
-        depth = int(P("qos.depth"))
-        self.odom_buffer_sec = float(P("odom_buffer_sec"))
-
-        self.trail_max_points = int(P("plot.trail_max_points"))
-        self.cone_max_points = int(P("plot.cone_max_points_per_class"))
-        self.fixed_window = bool(P("plot.fixed_window"))
-        self.window_half_size = float(P("plot.window_half_size"))
-        self.show_gates = bool(P("plot.show_gates"))
-
-        self.gate_base_sigma = float(P("gate.base_sigma"))
-        self.gate_max_sigma = float(P("gate.max_sigma"))
-        self.gate_yaw_ref = float(P("gate.yaw_ref"))
-        self.gate_chi2 = float(P("gate.chi2"))
-
-        self.large_cost = float(P("assoc.large_cost"))
-        self.landmark_update_alpha = float(P("assoc.update_alpha"))
+        self.trail_max_points = int(gp("plot.trail_max_points").value)
+        self.fixed_window = bool(gp("plot.fixed_window").value)
+        self.window_half_size = float(gp("plot.window_half_size").value)
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -122,20 +96,33 @@ class VirtualWorldPlotter(Node):
         # odom buffer: (t, x, y, yaw)
         self.odom_buf: deque = deque()
 
-        # car pose & trajectory (for drawing)
-        self.car_x = None
-        self.car_y = None
-        self.car_yaw = 0.0
-        self.car_yaw_rate = 0.0  # for dynamic gate
-        self.traj_x = []
-        self.traj_y = []
+        # raw odom path
+        self.odom_traj_x: List[float] = []
+        self.odom_traj_y: List[float] = []
+        self.odom_car_x: float = None
+        self.odom_car_y: float = None
+        self.odom_car_yaw: float = 0.0
 
-        # cones in map frame per class_id (landmarks)
-        # class_id -> list[(x, y)]
-        self.map_cones = {}
+        # SLAM: PF core
+        self.pf = ParticleFilterSLAM(
+            num_particles=80,
+            process_std_xy=0.03,
+            process_std_yaw=0.01,
+            meas_sigma_xy=0.20,
+            birth_sigma_xy=0.40,
+            gate_prob=0.997,
+            resample_neff_ratio=0.5,
+        )
 
-        # gating visualisation
-        self.last_gate_radius = None  # m
+        self.slam_initialised = False
+        self.last_cone_odom_pose: Tuple[float, float, float] = None
+
+        # SLAM best-particle trajectory
+        self.slam_traj_x: List[float] = []
+        self.slam_traj_y: List[float] = []
+
+        # SLAM landmarks from best particle (for plotting only)
+        self.slam_landmarks: List[Tuple[float, float, int]] = []
 
         # ---- Plot ----
         self.fig, self.ax = plt.subplots()
@@ -143,7 +130,7 @@ class VirtualWorldPlotter(Node):
         self.ax.grid(True)
         self.ax.set_xlabel("X [m]")
         self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("Virtual World (odom + cones + Hungarian association)")
+        self.ax.set_title("PF-SLAM: odom vs SLAM map")
 
         self.get_logger().info(
             f"[virtual_world_plotter] odom={odom_topic}, cones={cones_topic}"
@@ -153,7 +140,7 @@ class VirtualWorldPlotter(Node):
 
     def _pose_at(self, t_query: float):
         """
-        Interpolate pose (x,y,yaw) at time t_query using odom_buf.
+        Interpolate odom pose (x,y,yaw) at time t_query using odom_buf.
         Returns (x,y,yaw) or None if no odom yet.
         """
         if not self.odom_buf:
@@ -178,21 +165,9 @@ class VirtualWorldPlotter(Node):
         a = (t_query - t0) / (t1 - t0)
         x = x0 + a * (x1 - x0)
         y = y0 + a * (y1 - y0)
-        dyaw = ((yaw1 - yaw0 + math.pi) % (2 * math.pi)) - math.pi
+        dyaw = ((yaw1 - yaw0 + math.pi) % (2.0 * math.pi)) - math.pi
         yaw = yaw0 + a * dyaw
-        return x, y, yaw
-
-    def _effective_gate_sigma(self) -> float:
-        """
-        Sigma in metres for x,y, scaled up with yaw-rate.
-        """
-        base = self.gate_base_sigma
-        max_s = self.gate_max_sigma
-        yaw_ref = max(self.gate_yaw_ref, 1e-3)
-
-        yr = abs(self.car_yaw_rate)
-        f = min(1.0, yr / yaw_ref)
-        return base + f * (max_s - base)
+        return x, y, wrap(yaw)
 
     # ---------------------- Callbacks ----------------------
 
@@ -203,9 +178,6 @@ class VirtualWorldPlotter(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        # yaw-rate from twist if present
-        yaw_rate = float(msg.twist.twist.angular.z)
-
         with self.data_lock:
             # push into buffer
             self.odom_buf.append((t, x, y, yaw))
@@ -213,22 +185,20 @@ class VirtualWorldPlotter(Node):
             while self.odom_buf and self.odom_buf[0][0] < tmin:
                 self.odom_buf.popleft()
 
-            # for path we just trail the raw odom
-            self.car_x = x
-            self.car_y = y
-            self.car_yaw = yaw
-            self.car_yaw_rate = yaw_rate
-
-            self.traj_x.append(x)
-            self.traj_y.append(y)
-            if len(self.traj_x) > self.trail_max_points:
-                self.traj_x = self.traj_x[-self.trail_max_points:]
-                self.traj_y = self.traj_y[-self.trail_max_points:]
+            # track raw odom path
+            self.odom_car_x = x
+            self.odom_car_y = y
+            self.odom_car_yaw = yaw
+            self.odom_traj_x.append(x)
+            self.odom_traj_y.append(y)
+            if len(self.odom_traj_x) > self.trail_max_points:
+                self.odom_traj_x = self.odom_traj_x[-self.trail_max_points:]
+                self.odom_traj_y = self.odom_traj_y[-self.trail_max_points:]
 
     def cb_cones(self, msg: PointCloud2):
-        # read cones in base_link frame
+        # read cones in BODY frame
         try:
-            cones = list(
+            cones_body = list(
                 pc2.read_points(
                     msg,
                     field_names=("x", "y", "z", "class_id"),
@@ -241,175 +211,156 @@ class VirtualWorldPlotter(Node):
             )
             return
 
-        if not cones:
+        if not cones_body:
             return
 
         t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
 
         with self.data_lock:
-            pose = self._pose_at(t_c)
-            if pose is None:
-                # No odom yet; can't transform
+            pose_now = self._pose_at(t_c)
+            if pose_now is None:
+                # no odom yet
+                return
+            x_o, y_o, yaw_o = pose_now
+
+            # --------- PF motion: odom increment between cone frames ---------
+            if not self.slam_initialised or self.last_cone_odom_pose is None:
+                # first time: initialise PF at odom pose
+                self.pf.init_pose(x_o, y_o, yaw_o)
+                self.slam_initialised = True
+                self.last_cone_odom_pose = (x_o, y_o, yaw_o)
+            else:
+                x_prev, y_prev, yaw_prev = self.last_cone_odom_pose
+                dx = x_o - x_prev
+                dy = y_o - y_prev
+                dyaw = wrap(yaw_o - yaw_prev)
+                self.pf.predict((dx, dy, dyaw))
+                self.last_cone_odom_pose = (x_o, y_o, yaw_o)
+
+            # --------- PF measurement update ---------
+            meas_body = [
+                (float(bx), float(by), int(cls_id))
+                for (bx, by, _bz, cls_id) in cones_body
+            ]
+            self.pf.update(meas_body)
+
+            best = self.pf.get_best_particle()
+            if best is None:
                 return
 
-            x_w, y_w, yaw = pose
-            R = rot2d(yaw)
+            # SLAM trajectory
+            self.slam_traj_x.append(best.x)
+            self.slam_traj_y.append(best.y)
+            if len(self.slam_traj_x) > self.trail_max_points:
+                self.slam_traj_x = self.slam_traj_x[-self.trail_max_points:]
+                self.slam_traj_y = self.slam_traj_y[-self.trail_max_points:]
 
-            # Group current measurements by class_id
-            meas_by_class = {}
-            for bx, by, bz, cls_id in cones:
-                pb = np.array([float(bx), float(by)], dtype=float)
-                pw = np.array([x_w, y_w], dtype=float) + R @ pb
-                cid = int(cls_id)
-                meas_by_class.setdefault(cid, []).append(pw)
-
-            if not meas_by_class:
-                return
-
-            # Setup gating for this frame
-            sigma_eff = self._effective_gate_sigma()
-            self.last_gate_radius = math.sqrt(self.gate_chi2) * sigma_eff
-
-            # Per-class Hungarian association in world coordinates
-            for cid, pts in meas_by_class.items():
-                meas_xy = np.vstack(pts)  # shape (M, 2)
-
-                old_pts = self.map_cones.get(cid, [])
-                if not old_pts:
-                    # No landmarks of this class yet -> all become new landmarks
-                    self.map_cones[cid] = [
-                        (float(p[0]), float(p[1])) for p in meas_xy
-                    ]
-                    continue
-
-                landmarks_xy = np.asarray(old_pts, dtype=float).reshape(-1, 2)
-
-                cost, valid = association.build_mahalanobis_cost_matrix(
-                    landmarks_xy=landmarks_xy,
-                    meas_xy=meas_xy,
-                    sigma_xy=sigma_eff,
-                    chi2_gate=self.gate_chi2,
-                    large_cost=self.large_cost,
-                )
-
-                matches, unmatched_meas, unmatched_landmarks = association.hungarian_assign(
-                    cost=cost,
-                    valid_mask=valid,
-                    large_cost=self.large_cost,
-                )
-
-                new_landmarks = []
-
-                # Matched pairs -> update landmark with EMA toward measurement
-                alpha = self.landmark_update_alpha
-                for mi, lj, d in matches:
-                    old = landmarks_xy[lj]
-                    meas = meas_xy[mi]
-                    upd = (1.0 - alpha) * old + alpha * meas
-                    new_landmarks.append((float(upd[0]), float(upd[1])))
-
-                # Unmatched old landmarks -> keep as-is
-                for lj in unmatched_landmarks:
-                    old = landmarks_xy[lj]
-                    new_landmarks.append((float(old[0]), float(old[1])))
-
-                # Unmatched measurements -> spawn new landmarks
-                for mi in unmatched_meas:
-                    meas = meas_xy[mi]
-                    new_landmarks.append((float(meas[0]), float(meas[1])))
-
-                # Limit count per class if desired
-                if len(new_landmarks) > self.cone_max_points:
-                    new_landmarks = new_landmarks[-self.cone_max_points:]
-
-                self.map_cones[cid] = new_landmarks
+            # Landmarks for plotting (read-only copy)
+            self.slam_landmarks = [
+                (float(lm.mean[0]), float(lm.mean[1]), int(lm.cls))
+                for lm in best.landmarks
+            ]
 
     # ---------------------- Plot update ----------------------
 
     def update_plot(self):
         with self.data_lock:
-            traj_x = list(self.traj_x)
-            traj_y = list(self.traj_y)
-            car_x = self.car_x
-            car_y = self.car_y
-            car_yaw = self.car_yaw
-            cones_copy = {cid: list(pts) for cid, pts in self.map_cones.items()}
-            gate_radius = self.last_gate_radius
+            odom_traj_x = list(self.odom_traj_x)
+            odom_traj_y = list(self.odom_traj_y)
+            odom_x = self.odom_car_x
+            odom_y = self.odom_car_y
+            odom_yaw = self.odom_car_yaw
+
+            slam_traj_x = list(self.slam_traj_x)
+            slam_traj_y = list(self.slam_traj_y)
+
+            landmarks = list(self.slam_landmarks)
 
         self.ax.clear()
         self.ax.set_aspect("equal", adjustable="datalim")
         self.ax.grid(True)
         self.ax.set_xlabel("X [m]")
         self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("Virtual World (odom + cones + Hungarian association)")
+        self.ax.set_title("PF-SLAM: odom vs SLAM map")
 
-        all_x, all_y = [], []
+        all_x: List[float] = []
+        all_y: List[float] = []
 
-        # Trajectory
-        if traj_x and traj_y:
-            self.ax.plot(traj_x, traj_y, "-", linewidth=1.0,
-                         color="black", label="odom path")
-            all_x.extend(traj_x)
-            all_y.extend(traj_y)
-
-        # Car pose
-        if car_x is not None and car_y is not None:
-            self.ax.plot(car_x, car_y, "ko", markersize=5, label="car")
-            L = 2.0
-            hx = car_x + L * math.cos(car_yaw)
-            hy = car_y + L * math.sin(car_yaw)
-            self.ax.arrow(
-                car_x, car_y,
-                hx - car_x, hy - car_y,
-                head_width=0.7, head_length=1.0,
-                length_includes_head=True,
+        # Raw odom path (reference)
+        if odom_traj_x and odom_traj_y:
+            self.ax.plot(
+                odom_traj_x,
+                odom_traj_y,
+                "--",
+                linewidth=1.0,
+                color="0.6",
+                label="odom path",
             )
-            all_x.append(car_x)
-            all_y.append(car_y)
+            all_x.extend(odom_traj_x)
+            all_y.extend(odom_traj_y)
 
-        # Cones per class_id
-        color_map = {
-            0: ("blue", "blue cones"),
-            1: ("gold", "yellow cones"),
-            2: ("orange", "orange cones"),
-            3: ("red", "big orange cones"),
-            4: ("gray", "unknown cones"),
-        }
+        # SLAM path (best particle)
+        if slam_traj_x and slam_traj_y:
+            self.ax.plot(
+                slam_traj_x,
+                slam_traj_y,
+                "-",
+                linewidth=1.5,
+                color="tab:blue",
+                label="SLAM path",
+            )
+            all_x.extend(slam_traj_x)
+            all_y.extend(slam_traj_y)
 
-        for cid, pts in cones_copy.items():
-            if not pts:
-                continue
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            all_x.extend(xs)
-            all_y.extend(ys)
+        # Current odom pose (for reference)
+        if odom_x is not None and odom_y is not None:
+            self.ax.plot(odom_x, odom_y, "o", color="0.3", markersize=4, label="odom car")
+            L = 2.0
+            hx = odom_x + L * math.cos(odom_yaw)
+            hy = odom_y + L * math.sin(odom_yaw)
+            self.ax.arrow(
+                odom_x,
+                odom_y,
+                hx - odom_x,
+                hy - odom_y,
+                head_width=0.6,
+                head_length=0.9,
+                length_includes_head=True,
+                color="0.3",
+            )
+            all_x.append(odom_x)
+            all_y.append(odom_y)
 
-            if cid in color_map:
-                col, label = color_map[cid]
-            else:
-                col, label = ("gray", f"class {cid}")
+        # Landmarks from best particle
+        if landmarks:
+            color_map = {
+                0: ("blue", "blue cones"),
+                1: ("gold", "yellow cones"),
+                2: ("orange", "orange cones"),
+                3: ("red", "big orange cones"),
+            }
+            per_cls: Dict[int, List[Tuple[float, float]]] = {}
+            for lx, ly, cls_id in landmarks:
+                per_cls.setdefault(cls_id, []).append((lx, ly))
 
-            self.ax.scatter(xs, ys, s=10.0, c=col, marker="o", label=label)
-
-            # Draw gates as circles if enabled
-            if self.show_gates and gate_radius is not None and gate_radius > 0.0:
-                r = gate_radius
-                for (x, y) in pts:
-                    circ = Circle(
-                        (x, y),
-                        radius=r,
-                        fill=False,
-                        linestyle="--",
-                        linewidth=0.5,
-                        alpha=0.25,
-                    )
-                    self.ax.add_patch(circ)
+            for cls_id, pts in per_cls.items():
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                all_x.extend(xs)
+                all_y.extend(ys)
+                if cls_id in color_map:
+                    col, label = color_map[cls_id]
+                else:
+                    col, label = ("gray", f"class {cls_id}")
+                self.ax.scatter(xs, ys, s=12.0, c=col, marker="o", label=label)
 
         # Windowing
-        if self.fixed_window and (car_x is not None and car_y is not None):
+        if self.fixed_window and slam_traj_x and slam_traj_y:
+            cx = slam_traj_x[-1]
+            cy = slam_traj_y[-1]
             L = self.window_half_size
-            self.ax.set_xlim(car_x - L, car_x + L)
-            self.ax.set_ylim(car_y - L, car_y + L)
+            self.ax.set_xlim(cx - L, cx + L)
+            self.ax.set_ylim(cy - L, cy + L)
         else:
             if all_x and all_y:
                 xmin, xmax = min(all_x), max(all_x)
@@ -428,8 +379,12 @@ class VirtualWorldPlotter(Node):
         for h, l in zip(handles, labels):
             uniq[l] = h
         if uniq:
-            self.ax.legend(uniq.values(), uniq.keys(),
-                           loc="upper right", fontsize=8)
+            self.ax.legend(
+                uniq.values(),
+                uniq.keys(),
+                loc="upper right",
+                fontsize=8,
+            )
 
 
 def main():
