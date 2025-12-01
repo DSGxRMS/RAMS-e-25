@@ -1,6 +1,4 @@
 # slam_utils/pf_slam.py
-#
-# Minimal 2D particle-filter SLAM core for cone maps.
 
 import math
 from dataclasses import dataclass, field
