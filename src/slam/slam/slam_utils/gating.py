@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-# slam_utils/mahalanobis_gate.py
-#
-# Simple Mahalanobis gating with yaw-rate–dependent ellipse scaling.
-#
-# - Landmarks live in MAP frame: mean (2,), cov (2x2), class_id.
-# - Measurements z live in MAP frame: (2,) each.
-# - We inflate the "measurement covariance" based on |yawrate|:
-#       scale = clamp(1 + k_yawrate * |yawrate|, scale_min, scale_max)
-#   and build an anisotropic ellipse aligned with the car's heading.
+# Test code - gating is decent. Improved with dynamic
 
 import math
 from dataclasses import dataclass
