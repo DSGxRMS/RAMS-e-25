@@ -98,6 +98,10 @@ class ImuWheelEKF(Node):
         # Publish yaw deadband (publish-only)
         self.declare_parameter("pub.yaw_deadband", 0.01)       # rad
 
+        # NEW: yaw fusion with IMU orientation (complementary)
+        self.declare_parameter("yawfusion.enable", True)
+        self.declare_parameter("yawfusion.gain", 0.05)         # fraction of yaw error per update
+
         P = lambda k: self.get_parameter(k).value
         self.topic_imu = str(P("topics.imu"))
         self.topic_out = str(P("topics.out_odom"))
@@ -124,6 +128,9 @@ class ImuWheelEKF(Node):
         self.k_window_s = float(P("yawscale.window_s"))
         self.k_step_max = float(P("yawscale.step_max"))
         self.yaw_deadband = float(P("pub.yaw_deadband"))
+
+        self.yawfusion_enable = bool(P("yawfusion.enable"))
+        self.yawfusion_gain = float(P("yawfusion.gain"))
 
         # --- State x=[x, y, yaw, vx, vy] ---
         self.x = np.zeros(5, float)
@@ -397,16 +404,22 @@ class ImuWheelEKF(Node):
             if dt <= 0.0:
                 continue
 
-            # yaw
-            self.x[2] = wrap(self.x[2] + gz_used * dt)
+            # --- Yaw integration with complementary fusion ---
+            yaw_pred = wrap(self.x[2] + gz_used * dt)
+            if self.yawfusion_enable:
+                yaw_err = wrap(yaw_q - yaw_pred)
+                yaw_corr = yaw_pred + self.yawfusion_gain * yaw_err
+                self.x[2] = wrap(yaw_corr)
+            else:
+                self.x[2] = yaw_pred
 
-            # velocity (world frame)
+            # --- Velocity integration (exactly your original) ---
             vx_prev, vy_prev = self.x[3], self.x[4]
             lk = leak(dt)
             self.x[3] = lk * (vx_prev + ax_avg * dt)
             self.x[4] = lk * (vy_prev + ay_avg * dt)
 
-            # position
+            # --- Position integration ---
             self.x[0] += self.x[3] * dt
             self.x[1] += self.x[4] * dt
 
@@ -418,7 +431,7 @@ class ImuWheelEKF(Node):
         # Publish
         self._publish_output(t)
 
-    # ---------- CLI logging (no error metrics) ----------
+    # ---------- CLI logging ----------
     def on_cli_timer(self):
         if not self.log_enable:
             return
@@ -454,9 +467,16 @@ class ImuWheelEKF(Node):
         x, y, yaw = self.x[0], self.x[1], self.x[2]
         v = float(math.hypot(self.x[3], self.x[4]))
 
-        # publish-only yaw deadband
         yaw_wrapped = wrap(yaw)
-        yaw_pub = 0.0 if abs(yaw_wrapped) < self.yaw_deadband else yaw_wrapped
+
+        # Use full yaw for velocity direction
+        yaw_for_vel = yaw_wrapped
+
+        # publish-only yaw deadband for pose orientation
+        if abs(yaw_wrapped) < self.yaw_deadband:
+            yaw_pub = 0.0
+        else:
+            yaw_pub = yaw_wrapped
 
         od = Odometry()
         od.header.stamp = rclpy.time.Time(seconds=t).to_msg()
@@ -473,8 +493,8 @@ class ImuWheelEKF(Node):
 
         od.twist.twist = Twist(
             linear=Vector3(
-                x=v * math.cos(yaw_pub),
-                y=v * math.sin(yaw_pub),
+                x=v * math.cos(yaw_for_vel),
+                y=v * math.sin(yaw_for_vel),
                 z=0.0,
             ),
             angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate),

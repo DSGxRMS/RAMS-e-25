@@ -39,7 +39,7 @@ class VirtualWorldPlotter(Node):
     PF-SLAM visualiser:
 
       - Odom: /slam/odom_raw or /ground_truth/odom
-      - Cones: /perception/cones_fused (x,y,z,class_id) in BODY frame
+      - Cones: /perception/cones_fused (x,y,z,class_id) in BASE/BODY frame
 
     SLAM logic:
       - Interpolate odom pose at each cone stamp.
@@ -112,6 +112,7 @@ class VirtualWorldPlotter(Node):
             birth_sigma_xy=0.40,
             gate_prob=0.997,
             resample_neff_ratio=0.5,
+            # persistence defaults are fine for now; tune later if needed
         )
 
         self.slam_initialised = False
@@ -196,7 +197,7 @@ class VirtualWorldPlotter(Node):
                 self.odom_traj_y = self.odom_traj_y[-self.trail_max_points:]
 
     def cb_cones(self, msg: PointCloud2):
-        # read cones in BODY frame
+        # read cones in BASE/BODY frame (aligned with odom base)
         try:
             cones_body = list(
                 pc2.read_points(
