@@ -79,7 +79,7 @@ class ImuWheelEKF(Node):
         self.declare_parameter("log.cli_hz", 1.0)
 
         self.declare_parameter("input.imu_use_rate_hz", 0.0)  # 0 => use all IMU samples
-        self.declare_parameter("vel_leak_hz", 0.0)            # keep 0.0 while debugging
+        self.declare_parameter("vel_leak_hz", 0.0)            # keep 0.0 (no leak)
         self.declare_parameter("gravity.sign", 1.0)           # world g = [0,0,sign*G]
 
         # Yaw-scale (centripetal), deterministic updates
@@ -98,7 +98,7 @@ class ImuWheelEKF(Node):
         # Publish yaw deadband (publish-only)
         self.declare_parameter("pub.yaw_deadband", 0.01)       # rad
 
-        # NEW: yaw fusion with IMU orientation (complementary)
+        # yaw fusion with IMU orientation (complementary)
         self.declare_parameter("yawfusion.enable", True)
         self.declare_parameter("yawfusion.gain", 0.05)         # fraction of yaw error per update
 
@@ -140,13 +140,14 @@ class ImuWheelEKF(Node):
         self.bias_t0 = None
         self.acc_b = np.zeros(3)     # accel bias (body)
         self.gz_b = 0.0
-        self._bias_samp_count = 0
 
-        # Robust bias buffers
-        self._acc_all = []    # list of (a_raw - Rbw*g_world)
+        # Bias buffers
+        # (keep these, but only use _acc_still/_gz_still for bias)
+        self._acc_all = []
         self._gz_all = []
         self._acc_still = []
         self._gz_still = []
+        self._bias_samp_count = 0
 
         self.last_imu_t = None
         self._last_imu_proc_t = None
@@ -182,7 +183,7 @@ class ImuWheelEKF(Node):
         if self.log_enable:
             self.get_logger().info(
                 f"[IMU-PRED] imu={self.topic_imu} | out={self.topic_out}\n"
-                f"           bias_window={self.bias_window_s}s (min_samples={self.bias_min_samples}) | publish=IMU rate"
+                f"           bias_window={self.bias_window_s}s (min_still_samples={self.bias_min_samples}) | publish=IMU rate"
             )
 
     # ---------- Utils ----------
@@ -297,46 +298,39 @@ class ImuWheelEKF(Node):
 
         g_world = np.array([0.0, 0.0, self.gravity_sign * G], float)
 
-        # -------- Bias lock --------
+        # -------- Bias lock (STILL ONLY) --------
         if not self.bias_locked:
             a_raw = np.array([ax, ay, az], float)
             g_body = Rbw @ g_world
             spec_plus_bias = a_raw - g_body  # specific force + bias (in body)
-            self._acc_all.append(spec_plus_bias.tolist())
-            self._gz_all.append(gz)
-            self._bias_samp_count += 1
 
             # "still" gating
             w_norm = math.sqrt(gx * gx + gy * gy + gz * gz)
-            if (abs(gz) < 0.05) and (w_norm < 0.2) and (
-                abs(np.linalg.norm(a_raw) - G) < 0.6
-            ):
+            is_still = (
+                (abs(gz) < 0.05)
+                and (w_norm < 0.2)
+                and (abs(np.linalg.norm(a_raw) - G) < 0.6)
+            )
+            if is_still:
                 self._acc_still.append(spec_plus_bias.tolist())
                 self._gz_still.append(gz)
 
-            # lock condition
-            if ((t - self.bias_t0) >= self.bias_window_s) and (
-                self._bias_samp_count >= self.bias_min_samples
-            ):
-                use_still = len(self._acc_still) >= self.bias_min_samples // 2
-                if use_still:
-                    self.acc_b = np.mean(np.asarray(self._acc_still, float), axis=0)
-                    self.gz_b = float(
-                        np.mean(np.asarray(self._gz_still, float))
-                    )
-                    src = "STILL"
-                else:
-                    acc_tm = self._trimmed_mean_vec(self._acc_all, trim=0.10)
-                    gz_tm = self._trimmed_mean_scalar(self._gz_all, trim=0.10)
-                    self.acc_b = acc_tm if acc_tm is not None else np.zeros(3)
-                    self.gz_b = gz_tm if gz_tm is not None else 0.0
-                    src = "FALLBACK"
+            self._bias_samp_count += 1  # for logging / debug
 
+            # lock condition: time + enough STILL samples
+            if ((t - self.bias_t0) >= self.bias_window_s) and (
+                len(self._acc_still) >= self.bias_min_samples
+            ):
+                acc_tm = self._trimmed_mean_vec(self._acc_still, trim=0.10)
+                gz_tm = self._trimmed_mean_scalar(self._gz_still, trim=0.10)
+                self.acc_b = acc_tm if acc_tm is not None else np.zeros(3)
+                self.gz_b = gz_tm if gz_tm is not None else 0.0
                 self.bias_locked = True
+
                 if self.log_enable:
                     self.get_logger().info(
-                        f"[IMU-PRED] Bias locked [{src}] (N_total={self._bias_samp_count}, "
-                        f"N_still={len(self._acc_still)}): "
+                        f"[IMU-PRED] Bias locked [STILL ONLY] "
+                        f"(dt={t - self.bias_t0:.2f}s, N_still={len(self._acc_still)}): "
                         f"acc_bias_b={self.acc_b.round(4).tolist()} m/s², gyro_bz={self.gz_b:.5f} rad/s"
                     )
 
@@ -354,6 +348,8 @@ class ImuWheelEKF(Node):
                 self.x[2] = yaw_q
                 self._publish_output(t)
                 return
+
+        # -------- After bias lock --------
 
         # Optional downsampling of IMU
         if self.imu_use_rate_hz > 0.0 and self._last_imu_proc_t is not None:
@@ -390,7 +386,7 @@ class ImuWheelEKF(Node):
         self._maybe_update_k_yaw(t, v_prev, gz_avg, ax_avg, ay_avg)
         gz_used = (self.k_yaw * gz_avg) if self.yawscale_enable else gz_avg
 
-        # Velocity leak (optional)
+        # Velocity leak (optional) – here effectively off, vel_leak_hz=0
         def leak(dt):
             return (
                 math.exp(-self.vel_leak_hz * dt)
@@ -413,7 +409,7 @@ class ImuWheelEKF(Node):
             else:
                 self.x[2] = yaw_pred
 
-            # --- Velocity integration (exactly your original) ---
+            # --- Velocity integration (your original) ---
             vx_prev, vy_prev = self.x[3], self.x[4]
             lk = leak(dt)
             self.x[3] = lk * (vx_prev + ax_avg * dt)
