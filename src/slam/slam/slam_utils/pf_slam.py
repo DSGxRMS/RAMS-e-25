@@ -54,7 +54,7 @@ class ParticleFilterSLAM:
     """
     Very simple PF-SLAM engine (SE(2) + per-particle 2D landmarks).
 
-    Interface you care about from the visualiser:
+    Interface:
       - init_pose(x0,y0,yaw0)
       - predict(delta=(dx,dy,dyaw))
       - update(meas_body)
@@ -94,6 +94,11 @@ class ParticleFilterSLAM:
         self.min_hits_keep = int(min_hits_keep)
         self.max_misses_drop = int(max_misses_drop)
 
+        # Corridor NN birth-limiting (heuristic)
+        self.corridor_length = 10.0  # [m] ahead of car
+        self.corridor_width = 4.0    # [m] total width (±2 m lateral)
+        self.nn_max_dist = 1.0       # [m] max distance for NN reuse in corridor
+
         self.particles: List[Particle] = []
         self.initialised = False
 
@@ -117,6 +122,27 @@ class ParticleFilterSLAM:
             for _ in range(self.N)
         ]
         self.initialised = True
+
+    def _in_corridor(self, car_x: float, car_y: float, car_yaw: float,
+                     px: float, py: float) -> bool:
+        """
+        Check if world point (px,py) is in a rectangular corridor
+        [0, corridor_length] x [-corridor_width/2, +corridor_width/2]
+        in the car frame.
+        """
+        dx = px - car_x
+        dy = py - car_y
+
+        c = math.cos(-car_yaw)
+        s = math.sin(-car_yaw)
+        x_local = c * dx - s * dy
+        y_local = s * dx + c * dy
+
+        if x_local < 0.0 or x_local > self.corridor_length:
+            return False
+        if abs(y_local) > 0.5 * self.corridor_width:
+            return False
+        return True
 
     # ------------- API -------------
 
@@ -162,7 +188,8 @@ class ParticleFilterSLAM:
           - convert to world -> z_w
           - per-class Mahalanobis gating + Hungarian association
           - EKF landmark update
-          - births via candidate mechanism (proto landmarks)
+          - corridor-based NN reuse + capped births
+          - births via candidate mechanism outside corridor
           - landmark pruning / merging
           - weight update from Gaussian log-likelihood
         """
@@ -184,9 +211,9 @@ class ParticleFilterSLAM:
 
         for idx, p in enumerate(self.particles):
             # car pose
-            xw, yw, yaw = p.x, p.y, p.yaw
-            c = math.cos(yaw)
-            s = math.sin(yaw)
+            car_x, car_y, car_yaw = p.x, p.y, p.yaw
+            c = math.cos(car_yaw)
+            s = math.sin(car_yaw)
             R = np.array([[c, -s], [s, c]], float)
 
             # Sum of Gaussian terms (m^2 + log|S|) for all associated measurements
@@ -200,31 +227,35 @@ class ParticleFilterSLAM:
             # Global set of landmarks matched this frame (indices in p.landmarks)
             matched_lm_global: Set[int] = set()
 
-            # ------ per class association ------
+            # ------ per class association + corridor NN reuse ------
             for cls, obs_b in meas_by_cls.items():
-                # world coords of measurements under this particle
                 if not obs_b:
                     continue
+
+                # world coords of measurements under this particle
                 obs_w = []
                 for bx, by in obs_b:
                     pb = np.array([bx, by], float)
-                    pw = np.array([xw, yw], float) + R @ pb
+                    pw = np.array([car_x, car_y], float) + R @ pb
                     obs_w.append(pw)
                 obs_w = np.asarray(obs_w, float)  # (N_c,2)
+                Nc = obs_w.shape[0]
 
                 lm_indices = lms_by_cls.get(cls, [])
+
+                # measurement noise
+                R_meas = np.diag([self.meas_sigma**2, self.meas_sigma**2])
+
+                # no landmarks of this class yet -> normal births (no corridor magic)
                 if not lm_indices:
-                    # no landmarks of this class yet -> handled via candidate births
                     for z in obs_w:
                         self._handle_unmatched_measurement(p, z, cls)
                     continue
 
-                lm_means = np.stack([p.landmarks[j].mean for j in lm_indices], axis=0)
-                lm_covs = np.stack([p.landmarks[j].cov for j in lm_indices], axis=0)
-
+                # normal Mahalanobis-gated + Hungarian association
                 cost, valid = build_mahalanobis_cost_matrix(
-                    lm_means,
-                    lm_covs,
+                    np.stack([p.landmarks[j].mean for j in lm_indices], axis=0),
+                    np.stack([p.landmarks[j].cov for j in lm_indices], axis=0),
                     obs_w,
                     meas_sigma_xy=self.meas_sigma,
                     gate_chi2=self.gate_chi2,
@@ -232,19 +263,15 @@ class ParticleFilterSLAM:
 
                 pairs = hungarian_assign(cost, valid)
 
-                # mark all measurements as unmatched initially
-                matched_meas = set()
+                matched_meas: Set[int] = set()
 
-                # EKF updates
-                R_meas = np.diag([self.meas_sigma**2, self.meas_sigma**2])
-
+                # primary EKF updates for gated pairs
                 for (mi, li_local, m2) in pairs:
                     matched_meas.add(mi)
                     lm_idx = lm_indices[li_local]
                     matched_lm_global.add(lm_idx)
 
                     lm = p.landmarks[lm_idx]
-
                     mu = lm.mean
                     P = lm.cov
                     z = obs_w[mi]
@@ -255,7 +282,6 @@ class ParticleFilterSLAM:
                     except np.linalg.LinAlgError:
                         Sinv = np.linalg.pinv(S)
 
-                    # log-det for likelihood (guards against bias toward huge P)
                     sign, logdet = np.linalg.slogdet(S)
                     if sign <= 0.0 or not math.isfinite(logdet):
                         logdet = 0.0
@@ -268,13 +294,119 @@ class ParticleFilterSLAM:
                     lm.hits += 1
                     lm.misses = 0
 
-                    # contribution to log-likelihood
                     ll_sum += m2 + logdet
 
-                # births / candidate updates for measurements with no assignment
-                for mi, z in enumerate(obs_w):
-                    if mi not in matched_meas:
-                        self._handle_unmatched_measurement(p, z, cls)
+                # ---- Corridor-based NN reuse + capped births ----
+
+                # 1) Unmatched measurements (global indices) and landmarks of this class
+                unmatched_meas_all: List[Tuple[int, np.ndarray]] = [
+                    (mi, obs_w[mi]) for mi in range(Nc) if mi not in matched_meas
+                ]
+                unmatched_lm_all: List[int] = [
+                    lm_idx for lm_idx in lm_indices if lm_idx not in matched_lm_global
+                ]
+
+                # Split into corridor vs outside (for both meas and landmarks)
+                unmatched_meas_corr: List[Tuple[int, np.ndarray]] = []
+                unmatched_meas_outside: List[Tuple[int, np.ndarray]] = []
+
+                for mi, z in unmatched_meas_all:
+                    if self._in_corridor(car_x, car_y, car_yaw, z[0], z[1]):
+                        unmatched_meas_corr.append((mi, z))
+                    else:
+                        unmatched_meas_outside.append((mi, z))
+
+                unmatched_lm_corr: List[int] = []
+                unmatched_lm_outside: List[int] = []
+                for lm_idx in unmatched_lm_all:
+                    lm = p.landmarks[lm_idx]
+                    if self._in_corridor(car_x, car_y, car_yaw,
+                                         float(lm.mean[0]), float(lm.mean[1])):
+                        unmatched_lm_corr.append(lm_idx)
+                    else:
+                        unmatched_lm_outside.append(lm_idx)
+
+                # 2) NN within corridor (ignoring gates), updating landmarks instead of birthing
+                unmatched_meas_corr_left: List[Tuple[int, np.ndarray]] = unmatched_meas_corr
+                unmatched_lm_corr_left: List[int] = unmatched_lm_corr
+
+                if unmatched_meas_corr and unmatched_lm_corr:
+                    used_lm: Set[int] = set()
+                    max_d2 = self.nn_max_dist ** 2
+
+                    new_unmatched_meas_corr: List[Tuple[int, np.ndarray]] = []
+
+                    for mi, z in unmatched_meas_corr:
+                        best_lm = -1
+                        best_d2 = max_d2
+                        for lm_idx in unmatched_lm_corr:
+                            if lm_idx in used_lm:
+                                continue
+                            lm = p.landmarks[lm_idx]
+                            d2 = float(np.sum((z - lm.mean) ** 2))
+                            if d2 < best_d2:
+                                best_d2 = d2
+                                best_lm = lm_idx
+
+                        if best_lm >= 0:
+                            # Treat as an extra match: EKF update without gating
+                            lm = p.landmarks[best_lm]
+                            mu = lm.mean
+                            P = lm.cov
+
+                            S = P + R_meas
+                            try:
+                                Sinv = np.linalg.inv(S)
+                            except np.linalg.LinAlgError:
+                                Sinv = np.linalg.pinv(S)
+
+                            innov = z - mu
+                            m2_nn = float(innov.T @ Sinv @ innov)
+                            sign, logdet = np.linalg.slogdet(S)
+                            if sign <= 0.0 or not math.isfinite(logdet):
+                                logdet = 0.0
+
+                            K = P @ Sinv
+                            lm.mean = mu + K @ innov
+                            lm.cov = (np.eye(2) - K) @ P
+                            lm.hits += 1
+                            lm.misses = 0
+
+                            matched_meas.add(mi)
+                            matched_lm_global.add(best_lm)
+                            used_lm.add(best_lm)
+
+                            ll_sum += m2_nn + logdet
+                        else:
+                            # still unmatched in corridor after NN
+                            new_unmatched_meas_corr.append((mi, z))
+
+                    unmatched_meas_corr_left = new_unmatched_meas_corr
+                    unmatched_lm_corr_left = [
+                        lm_idx for lm_idx in unmatched_lm_corr
+                        if lm_idx not in used_lm
+                    ]
+
+                # 3) Births:
+                #    - In corridor: cap births at max(0, m_corr - n_corr)
+                #    - Outside: behave as before
+
+                n_corr = len(unmatched_lm_corr_left)
+                m_corr = len(unmatched_meas_corr_left)
+                births_allowed_corr = max(0, m_corr - n_corr)
+
+                # corridor measurements to birth (at most births_allowed_corr)
+                meas_for_birth_corr = [
+                    z for (_mi, z) in unmatched_meas_corr_left[:births_allowed_corr]
+                ]
+
+                # outside corridor: all unmatched measurements are eligible for birth
+                meas_for_birth_outside = [z for (_mi, z) in unmatched_meas_outside]
+
+                for z in meas_for_birth_corr:
+                    self._handle_unmatched_measurement(p, z, cls)
+                for z in meas_for_birth_outside:
+                    self._handle_unmatched_measurement(p, z, cls)
 
             # landmark miss counters + pruning + merging
             self._update_landmark_miss_counters(p, matched_lm_global)
@@ -383,7 +515,6 @@ class ParticleFilterSLAM:
             c for c in p.candidates if c.last_seen_frame >= cutoff
         ]
 
-
     def _update_landmark_miss_counters(self, p: Particle, matched_lm_global: Set[int]):
         for idx, lm in enumerate(p.landmarks):
             if idx in matched_lm_global:
@@ -400,7 +531,6 @@ class ParticleFilterSLAM:
             for lm in p.landmarks
             if not (lm.hits < self.min_hits_keep and lm.misses > self.max_misses_drop)
         ]
-
 
     def _merge_close_landmarks(self, p: Particle):
         """

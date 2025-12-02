@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import math
-import threading
 from collections import deque
 import bisect
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -21,9 +20,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
+from eufs_msgs.msg import ConeArrayWithCovariance, ConeWithCovariance
 
 from .slam_utils.pf_slam import ParticleFilterSLAM, wrap
 
@@ -34,46 +31,48 @@ def yaw_from_quat(qx, qy, qz, qw) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-class VirtualWorldPlotter(Node):
+class PFSlamNode(Node):
     """
-    PF-SLAM visualiser:
+    PF-SLAM node (no visualisation).
 
-      - Odom: /slam/odom_raw or /ground_truth/odom
-      - Cones: /perception/cones_fused (x,y,z,class_id) in BASE/BODY frame
+      - Input odom: /slam/odom_raw (or param topics.odom_in)
+      - Input cones: /perception/cones_fused (BASE/BODY frame, x,y,z,class_id)
 
-    SLAM logic:
-      - Interpolate odom pose at each cone stamp.
-      - Use odom increment between successive cone frames as motion input.
-      - Run ParticleFilterSLAM (motion + update).
-      - Plot best-particle pose + map, alongside raw odom path.
+      - Output SLAM odom: /slam/odom         (nav_msgs/Odometry)
+      - Output map cones: /slam/map_cones    (eufs_msgs/ConeArrayWithCovariance)
+
+    Logic:
+      - Buffer odom poses with timestamps.
+      - For each cones msg at time t_c:
+          * interpolate odom pose (x_o, y_o, yaw_o) at t_c
+          * use odom increment since last cones frame as PF motion
+          * PF update with cones in body frame
+          * publish best-particle pose as /slam/odom
+          * publish best-particle landmarks as /slam/map_cones
     """
 
     def __init__(self):
-        super().__init__("virtual_world_plotter")
+        super().__init__("pf_slam_node")
 
         # ---- Parameters ----
         self.declare_parameter("topics.odom_in", "/slam/odom_raw")
         self.declare_parameter("topics.cones_in", "/perception/cones_fused")
+        self.declare_parameter("topics.slam_odom_out", "/slam/odom")
+        self.declare_parameter("topics.map_cones_out", "/slam/map_cones")
 
         self.declare_parameter("qos.best_effort", True)
         self.declare_parameter("qos.depth", 200)
         self.declare_parameter("odom_buffer_sec", 5.0)
 
-        # Plot params
-        self.declare_parameter("plot.trail_max_points", 20000)
-        self.declare_parameter("plot.fixed_window", False)
-        self.declare_parameter("plot.window_half_size", 60.0)
-
         gp = self.get_parameter
         odom_topic = str(gp("topics.odom_in").value)
         cones_topic = str(gp("topics.cones_in").value)
+        slam_odom_topic = str(gp("topics.slam_odom_out").value)
+        map_cones_topic = str(gp("topics.map_cones_out").value)
+
         best_effort = bool(gp("qos.best_effort").value)
         depth = int(gp("qos.depth").value)
         self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
-
-        self.trail_max_points = int(gp("plot.trail_max_points").value)
-        self.fixed_window = bool(gp("plot.fixed_window").value)
-        self.window_half_size = float(gp("plot.window_half_size").value)
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -90,18 +89,20 @@ class VirtualWorldPlotter(Node):
         self.create_subscription(Odometry, odom_topic, self.cb_odom, qos)
         self.create_subscription(PointCloud2, cones_topic, self.cb_cones, qos)
 
+        # ---- Publishers ----
+        self.pub_slam_odom = self.create_publisher(Odometry, slam_odom_topic, 10)
+        self.pub_map_cones = self.create_publisher(
+            ConeArrayWithCovariance, map_cones_topic, 10
+        )
+
         # ---- State ----
-        self.data_lock = threading.Lock()
 
         # odom buffer: (t, x, y, yaw)
         self.odom_buf: deque = deque()
 
-        # raw odom path
-        self.odom_traj_x: List[float] = []
-        self.odom_traj_y: List[float] = []
-        self.odom_car_x: float = None
-        self.odom_car_y: float = None
-        self.odom_car_yaw: float = 0.0
+        # last interpolated odom pose at a cones frame
+        self.slam_initialised = False
+        self.last_cone_odom_pose: Tuple[float, float, float] = None
 
         # SLAM: PF core
         self.pf = ParticleFilterSLAM(
@@ -112,29 +113,11 @@ class VirtualWorldPlotter(Node):
             birth_sigma_xy=0.40,
             gate_prob=0.997,
             resample_neff_ratio=0.5,
-            # persistence defaults are fine for now; tune later if needed
         )
 
-        self.slam_initialised = False
-        self.last_cone_odom_pose: Tuple[float, float, float] = None
-
-        # SLAM best-particle trajectory
-        self.slam_traj_x: List[float] = []
-        self.slam_traj_y: List[float] = []
-
-        # SLAM landmarks from best particle (for plotting only)
-        self.slam_landmarks: List[Tuple[float, float, int]] = []
-
-        # ---- Plot ----
-        self.fig, self.ax = plt.subplots()
-        self.ax.set_aspect("equal", adjustable="datalim")
-        self.ax.grid(True)
-        self.ax.set_xlabel("X [m]")
-        self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("PF-SLAM: odom vs SLAM map")
-
         self.get_logger().info(
-            f"[virtual_world_plotter] odom={odom_topic}, cones={cones_topic}"
+            f"[pf_slam] odom_in={odom_topic}, cones_in={cones_topic}, "
+            f"slam_odom_out={slam_odom_topic}, map_cones_out={map_cones_topic}"
         )
 
     # ---------------------- Odom buffer helper ----------------------
@@ -179,22 +162,11 @@ class VirtualWorldPlotter(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        with self.data_lock:
-            # push into buffer
-            self.odom_buf.append((t, x, y, yaw))
-            tmin = t - self.odom_buffer_sec
-            while self.odom_buf and self.odom_buf[0][0] < tmin:
-                self.odom_buf.popleft()
-
-            # track raw odom path
-            self.odom_car_x = x
-            self.odom_car_y = y
-            self.odom_car_yaw = yaw
-            self.odom_traj_x.append(x)
-            self.odom_traj_y.append(y)
-            if len(self.odom_traj_x) > self.trail_max_points:
-                self.odom_traj_x = self.odom_traj_x[-self.trail_max_points:]
-                self.odom_traj_y = self.odom_traj_y[-self.trail_max_points:]
+        # push into buffer
+        self.odom_buf.append((t, x, y, yaw))
+        tmin = t - self.odom_buffer_sec
+        while self.odom_buf and self.odom_buf[0][0] < tmin:
+            self.odom_buf.popleft()
 
     def cb_cones(self, msg: PointCloud2):
         # read cones in BASE/BODY frame (aligned with odom base)
@@ -207,9 +179,7 @@ class VirtualWorldPlotter(Node):
                 )
             )
         except Exception as e:
-            self.get_logger().warn(
-                f"[virtual_world_plotter] Error parsing cones PointCloud2: {e}"
-            )
+            self.get_logger().warn(f"[pf_slam] Error parsing cones PointCloud2: {e}")
             return
 
         if not cones_body:
@@ -217,186 +187,113 @@ class VirtualWorldPlotter(Node):
 
         t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
 
-        with self.data_lock:
-            pose_now = self._pose_at(t_c)
-            if pose_now is None:
-                # no odom yet
-                return
-            x_o, y_o, yaw_o = pose_now
+        pose_now = self._pose_at(t_c)
+        if pose_now is None:
+            # no odom yet
+            return
 
-            # --------- PF motion: odom increment between cone frames ---------
-            if not self.slam_initialised or self.last_cone_odom_pose is None:
-                # first time: initialise PF at odom pose
-                self.pf.init_pose(x_o, y_o, yaw_o)
-                self.slam_initialised = True
-                self.last_cone_odom_pose = (x_o, y_o, yaw_o)
-            else:
-                x_prev, y_prev, yaw_prev = self.last_cone_odom_pose
-                dx = x_o - x_prev
-                dy = y_o - y_prev
-                dyaw = wrap(yaw_o - yaw_prev)
-                self.pf.predict((dx, dy, dyaw))
-                self.last_cone_odom_pose = (x_o, y_o, yaw_o)
+        x_o, y_o, yaw_o = pose_now
 
-            # --------- PF measurement update ---------
-            meas_body = [
-                (float(bx), float(by), int(cls_id))
-                for (bx, by, _bz, cls_id) in cones_body
-            ]
-            self.pf.update(meas_body)
-
-            best = self.pf.get_best_particle()
-            if best is None:
-                return
-
-            # SLAM trajectory
-            self.slam_traj_x.append(best.x)
-            self.slam_traj_y.append(best.y)
-            if len(self.slam_traj_x) > self.trail_max_points:
-                self.slam_traj_x = self.slam_traj_x[-self.trail_max_points:]
-                self.slam_traj_y = self.slam_traj_y[-self.trail_max_points:]
-
-            # Landmarks for plotting (read-only copy)
-            self.slam_landmarks = [
-                (float(lm.mean[0]), float(lm.mean[1]), int(lm.cls))
-                for lm in best.landmarks
-            ]
-
-    # ---------------------- Plot update ----------------------
-
-    def update_plot(self):
-        with self.data_lock:
-            odom_traj_x = list(self.odom_traj_x)
-            odom_traj_y = list(self.odom_traj_y)
-            odom_x = self.odom_car_x
-            odom_y = self.odom_car_y
-            odom_yaw = self.odom_car_yaw
-
-            slam_traj_x = list(self.slam_traj_x)
-            slam_traj_y = list(self.slam_traj_y)
-
-            landmarks = list(self.slam_landmarks)
-
-        self.ax.clear()
-        self.ax.set_aspect("equal", adjustable="datalim")
-        self.ax.grid(True)
-        self.ax.set_xlabel("X [m]")
-        self.ax.set_ylabel("Y [m]")
-        self.ax.set_title("PF-SLAM: odom vs SLAM map")
-
-        all_x: List[float] = []
-        all_y: List[float] = []
-
-        # Raw odom path (reference)
-        if odom_traj_x and odom_traj_y:
-            self.ax.plot(
-                odom_traj_x,
-                odom_traj_y,
-                "--",
-                linewidth=1.0,
-                color="0.6",
-                label="odom path",
-            )
-            all_x.extend(odom_traj_x)
-            all_y.extend(odom_traj_y)
-
-        # SLAM path (best particle)
-        if slam_traj_x and slam_traj_y:
-            self.ax.plot(
-                slam_traj_x,
-                slam_traj_y,
-                "-",
-                linewidth=1.5,
-                color="tab:blue",
-                label="SLAM path",
-            )
-            all_x.extend(slam_traj_x)
-            all_y.extend(slam_traj_y)
-
-        # Current odom pose (for reference)
-        if odom_x is not None and odom_y is not None:
-            self.ax.plot(odom_x, odom_y, "o", color="0.3", markersize=4, label="odom car")
-            L = 2.0
-            hx = odom_x + L * math.cos(odom_yaw)
-            hy = odom_y + L * math.sin(odom_yaw)
-            self.ax.arrow(
-                odom_x,
-                odom_y,
-                hx - odom_x,
-                hy - odom_y,
-                head_width=0.6,
-                head_length=0.9,
-                length_includes_head=True,
-                color="0.3",
-            )
-            all_x.append(odom_x)
-            all_y.append(odom_y)
-
-        # Landmarks from best particle
-        if landmarks:
-            color_map = {
-                0: ("blue", "blue cones"),
-                1: ("gold", "yellow cones"),
-                2: ("orange", "orange cones"),
-                3: ("red", "big orange cones"),
-            }
-            per_cls: Dict[int, List[Tuple[float, float]]] = {}
-            for lx, ly, cls_id in landmarks:
-                per_cls.setdefault(cls_id, []).append((lx, ly))
-
-            for cls_id, pts in per_cls.items():
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                all_x.extend(xs)
-                all_y.extend(ys)
-                if cls_id in color_map:
-                    col, label = color_map[cls_id]
-                else:
-                    col, label = ("gray", f"class {cls_id}")
-                self.ax.scatter(xs, ys, s=12.0, c=col, marker="o", label=label)
-
-        # Windowing
-        if self.fixed_window and slam_traj_x and slam_traj_y:
-            cx = slam_traj_x[-1]
-            cy = slam_traj_y[-1]
-            L = self.window_half_size
-            self.ax.set_xlim(cx - L, cx + L)
-            self.ax.set_ylim(cy - L, cy + L)
+        # --------- PF motion: odom increment between cone frames ---------
+        if not self.slam_initialised or self.last_cone_odom_pose is None:
+            # first time: initialise PF at odom pose
+            self.pf.init_pose(x_o, y_o, yaw_o)
+            self.slam_initialised = True
+            self.last_cone_odom_pose = (x_o, y_o, yaw_o)
         else:
-            if all_x and all_y:
-                xmin, xmax = min(all_x), max(all_x)
-                ymin, ymax = min(all_y), max(all_y)
-                pad = 3.0
-                if xmax - xmin < 1e-3:
-                    xmax = xmin + 1.0
-                if ymax - ymin < 1e-3:
-                    ymax = ymin + 1.0
-                self.ax.set_xlim(xmin - pad, xmax + pad)
-                self.ax.set_ylim(ymin - pad, ymax + pad)
+            x_prev, y_prev, yaw_prev = self.last_cone_odom_pose
+            dx = x_o - x_prev
+            dy = y_o - y_prev
+            dyaw = wrap(yaw_o - yaw_prev)
+            self.pf.predict((dx, dy, dyaw))
+            self.last_cone_odom_pose = (x_o, y_o, yaw_o)
 
-        # De-duplicate legend
-        handles, labels = self.ax.get_legend_handles_labels()
-        uniq = {}
-        for h, l in zip(handles, labels):
-            uniq[l] = h
-        if uniq:
-            self.ax.legend(
-                uniq.values(),
-                uniq.keys(),
-                loc="upper right",
-                fontsize=8,
-            )
+        # --------- PF measurement update ---------
+        meas_body = [
+            (float(bx), float(by), int(cls_id))
+            for (bx, by, _bz, cls_id) in cones_body
+        ]
+        self.pf.update(meas_body)
+
+        best = self.pf.get_best_particle()
+        if best is None:
+            return
+
+        # Publish outputs
+        self._publish_slam_odom(t_c, best)
+        self._publish_map_cones(t_c, best)
+
+    # ---------------------- Publishers ----------------------
+
+    def _publish_slam_odom(self, t: float, best_particle):
+        """
+        Publish best-particle pose as nav_msgs/Odometry on topics.slam_odom_out.
+        Twist is left zeroed for now.
+        """
+        od = Odometry()
+        od.header.stamp = rclpy.time.Time(seconds=t).to_msg()
+        od.header.frame_id = "map"
+        od.child_frame_id = "base_link"
+
+        od.pose.pose.position.x = float(best_particle.x)
+        od.pose.pose.position.y = float(best_particle.y)
+        od.pose.pose.position.z = 0.0
+
+        half_yaw = 0.5 * float(best_particle.yaw)
+        od.pose.pose.orientation.x = 0.0
+        od.pose.pose.orientation.y = 0.0
+        od.pose.pose.orientation.z = math.sin(half_yaw)
+        od.pose.pose.orientation.w = math.cos(half_yaw)
+
+        # Covariances / twist left at defaults (zero) for now
+        self.pub_slam_odom.publish(od)
+
+    def _publish_map_cones(self, t: float, best_particle):
+        """
+        Publish landmarks from best particle as ConeArrayWithCovariance in 'map' frame.
+        Only 2D coordinates + colour are used; covariance left at defaults.
+        cls mapping:
+          0 -> blue_cones
+          1 -> yellow_cones
+          2 -> orange_cones
+          3 -> big_orange_cones
+        """
+        msg = ConeArrayWithCovariance()
+        msg.header.stamp = rclpy.time.Time(seconds=t).to_msg()
+        msg.header.frame_id = "map"
+
+        for lm in best_particle.landmarks:
+            x = float(lm.mean[0])
+            y = float(lm.mean[1])
+            cls_id = int(lm.cls)
+
+            cone = ConeWithCovariance()
+            cone.point.x = x
+            cone.point.y = y
+            cone.point.z = 0.0
+            # cone.covariance: leave default; we don't use it anywhere
+
+            if cls_id == 0:
+                msg.blue_cones.append(cone)
+            elif cls_id == 1:
+                msg.yellow_cones.append(cone)
+            elif cls_id == 2:
+                msg.orange_cones.append(cone)
+            elif cls_id == 3:
+                msg.big_orange_cones.append(cone)
+            else:
+                # If ConeArrayWithCovariance has unknown_color_cones, you can push here.
+                # If not, just ignore or treat as blue.
+                msg.unknown_color_cones.append(cone)
+
+        self.pub_map_cones.publish(msg)
 
 
 def main():
     rclpy.init()
-    node = VirtualWorldPlotter()
-    plt.ion()
+    node = PFSlamNode()
     try:
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.01)
-            node.update_plot()
-            plt.pause(0.01)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
