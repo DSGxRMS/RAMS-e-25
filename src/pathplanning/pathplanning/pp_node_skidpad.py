@@ -5,13 +5,13 @@
 #   - Subscribes to /slam/odom (nav_msgs/Odometry)
 #   - Subscribes to /slam/map_cones (eufs_msgs/ConeArrayWithCovariance)
 #   - Loads a CSV reference path (x,y) in map frame
-#   - Tracks a *sequential* index along the CSV (forward-only, like PathPublisher)
+#   - Tracks a *sequential* index along the CSV (forward-only, but with a
+#     forward band and "lost" re-localisation)
 #   - Builds FOV sector around the car and Delaunay/k-NN edges between cones
 #   - Computes centroids of valid edges (black X’s)
 #   - For CSV points in a limited window [cur_idx, cur_idx+N_window],
 #       finds nearest centroid within 1 m and marks those centroids as red dots
-#   - Draws a red polyline from the car through the matched centroids
-#   - Everything else stays as in the original sector visualiser.
+#   - Draws a red polyline from the car through the matched centroids.
 
 import math
 import threading
@@ -82,8 +82,15 @@ class SlamPathCsvVisualizer(Node):
         # CSV reference path + sequential tracking behaviour
         self.declare_parameter("path_file", CSVPATH.as_posix())
         self.declare_parameter("ref.loop", False)
-        self.declare_parameter("ref.search_window", 200)   # how far ahead in CSV to look
-        self.declare_parameter("match.radius_m", 1.0)      # max distance cone↔CSV
+        # How far ahead along CSV we search each frame for best index
+        self.declare_parameter("ref.forward_band", 50)
+        # How far ahead in CSV to look when matching centroids
+        self.declare_parameter("ref.search_window", 200)
+        # If even the best point in the forward band is farther than this,
+        # treat as "lost" and do a one-shot global re-localisation.
+        self.declare_parameter("ref.lost_threshold_m", 5.0)
+        # Max distance cone↔CSV for a match
+        self.declare_parameter("match.radius_m", 1.0)
 
         # Centroid filters
         self.declare_parameter("centroid.min_car_dist_m", 2.0)   # reject < 2 m from car
@@ -102,7 +109,9 @@ class SlamPathCsvVisualizer(Node):
         self.fov_half_rad = math.radians(self.fov_angle_deg * 0.5)
 
         self.ref_loop = bool(gp("ref.loop").value)
+        self.ref_forward_band = int(gp("ref.forward_band").value)
         self.ref_search_window = int(gp("ref.search_window").value)
+        self.ref_lost_threshold = float(gp("ref.lost_threshold_m").value)
         self.match_radius = float(gp("match.radius_m").value)
 
         self.centroid_min_car_dist = float(gp("centroid.min_car_dist_m").value)
@@ -190,9 +199,16 @@ class SlamPathCsvVisualizer(Node):
 
     def _update_reference_progress(self, cx: float, cy: float):
         """
-        Forward-only index tracking along CSV:
-          - First call: global search for nearest CSV point.
-          - Later: only walk forward while next point is closer.
+        Forward-only index tracking along CSV with a forward band and
+        "lost" re-localisation.
+
+        - First call: global nearest search.
+        - Subsequent calls:
+            * look in [cur_idx, cur_idx + ref_forward_band] (wrapped if loop)
+            * pick index with minimum distance to car
+            * never go backwards on non-loop path
+        - If best in that band is farther than ref.lost_threshold_m:
+            * run a global search to re-localise once
         """
         if not self._has_reference():
             return
@@ -201,6 +217,7 @@ class SlamPathCsvVisualizer(Node):
         if n == 0:
             return
 
+        # --- First initialisation: global nearest search ---
         if not self.path_initialized:
             best_idx = 0
             min_d2 = float("inf")
@@ -213,20 +230,52 @@ class SlamPathCsvVisualizer(Node):
             self.path_initialized = True
             return
 
-        search_window = min(self.ref_search_window, n - 1)
-        for _ in range(search_window):
-            cur_d2 = self._dist_sq_to_ref(self.cur_idx, cx, cy)
-            next_idx = self.cur_idx + 1
-            if self.ref_loop:
-                next_idx %= n
-            elif next_idx >= n:
-                break
+        # --- Normal forward-band search ---
+        forward_band = max(1, min(self.ref_forward_band, n - 1))
+        best_idx = None
+        best_d2 = float("inf")
 
-            next_d2 = self._dist_sq_to_ref(next_idx, cx, cy)
-            if next_d2 < cur_d2:
-                self.cur_idx = next_idx
+        if self.ref_loop:
+            # Wrap-around band
+            for step in range(forward_band + 1):
+                idx = (self.cur_idx + step) % n
+                d2 = self._dist_sq_to_ref(idx, cx, cy)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_idx = idx
+        else:
+            # Clamp at end, no backwards
+            start = self.cur_idx
+            end = min(n - 1, self.cur_idx + forward_band)
+            for idx in range(start, end + 1):
+                d2 = self._dist_sq_to_ref(idx, cx, cy)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_idx = idx
+
+        if best_idx is not None:
+            # For non-loop: ensure we never go backwards
+            if self.ref_loop:
+                self.cur_idx = best_idx
             else:
-                break
+                self.cur_idx = max(self.cur_idx, best_idx)
+
+        # --- Lost detection + global re-localisation ---
+        if self.ref_lost_threshold > 0.0:
+            lost_thresh2 = self.ref_lost_threshold * self.ref_lost_threshold
+            if best_d2 > lost_thresh2:
+                # Re-localise globally
+                global_best_idx = self.cur_idx
+                global_best_d2 = float("inf")
+                for i in range(n):
+                    d2 = self._dist_sq_to_ref(i, cx, cy)
+                    if d2 < global_best_d2:
+                        global_best_d2 = d2
+                        global_best_idx = i
+
+                # Only accept if global search actually finds a closer point
+                if global_best_d2 < best_d2:
+                    self.cur_idx = global_best_idx
 
     # --------------------- Callbacks ---------------------
 
