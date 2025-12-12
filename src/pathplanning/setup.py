@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'pp_node_skidpad = pathplanning.pp_node_skidpad:main',
+            'pp_debug = pathplanning.pp_debug.skidpad_debug:main',
         ],
     },
 )
