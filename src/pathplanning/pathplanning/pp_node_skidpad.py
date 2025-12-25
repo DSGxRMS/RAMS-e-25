@@ -9,6 +9,7 @@
 
 import math
 import threading
+from enum import Enum, auto
 from typing import List, Tuple, Optional
 
 import numpy as np
@@ -24,17 +25,19 @@ from rclpy.qos import (
 )
 
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseArray, Pose
 from eufs_msgs.msg import ConeArrayWithCovariance
 
 from pathlib import Path as SysPath
 
-# Optional SciPy-based Delaunay
+# Optional SciPy-based Delaunay and Interpolation
 try:
     from scipy.spatial import Delaunay
+    from scipy import interpolate
     _HAS_SCIPY = True
 except ImportError:
     Delaunay = None
+    interpolate = None
     _HAS_SCIPY = False
 
 
@@ -46,6 +49,15 @@ def yaw_from_quat(qx, qy, qz, qw) -> float:
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+
+class SkidpadState(Enum):
+    ENTRY = auto()
+    RIGHT_CIRCLE = auto()
+    LEFT_CIRCLE = auto()
+    EXIT = auto()
+    STOP = auto()
 
 
 def quat_from_yaw(yaw: float):
@@ -63,6 +75,7 @@ class SlamPathPointsPublisher(Node):
         self.declare_parameter("topics.odom_in", "/slam/odom")
         self.declare_parameter("topics.map_in", "/slam/map_cones")
         self.declare_parameter("topics.path_out", "/path_points")
+        self.declare_parameter("topics.spline_out", "/spline_control_points")
 
         # Publish rate (Hz)
         self.declare_parameter("publish_hz", 20.0)
@@ -92,6 +105,7 @@ class SlamPathPointsPublisher(Node):
         odom_topic = str(gp("topics.odom_in").value)
         map_topic = str(gp("topics.map_in").value)
         path_topic = str(gp("topics.path_out").value)
+        spline_topic = str(gp("topics.spline_out").value)
 
         best_effort = bool(gp("qos.best_effort").value)
         depth = int(gp("qos.depth").value)
@@ -152,13 +166,21 @@ class SlamPathPointsPublisher(Node):
         self.create_subscription(ConeArrayWithCovariance, map_topic, self.cb_map, qos)
 
         # ---- Publisher ----
+        # ---- Publisher ----
         self.path_pub = self.create_publisher(Path, path_topic, qos)
+        self.spline_pub = self.create_publisher(PoseArray, spline_topic, qos)
 
         # ---- State ----
         self.car_x: Optional[float] = None
         self.car_y: Optional[float] = None
         self.car_yaw: Optional[float] = None  # radians
         self.last_frame_id: str = "map"
+
+        # Skidpad State Machine
+        self.state = SkidpadState.ENTRY
+        self.lap_start_idx = 0
+        self.laps_completed = 0
+        self.state_start_time = self.get_clock().now()
 
         # Global map cones in map frame
         self.blue_global: List[Tuple[float, float]] = []
@@ -500,6 +522,40 @@ class SlamPathPointsPublisher(Node):
 
         return matched
 
+    def _generate_spline_control_points(self, points: List[Tuple[float, float]], num_points: int = 35) -> List[Tuple[float, float]]:
+        """
+        Fit a B-spline to the points and sample 'num_points' control points.
+        """
+        if not _HAS_SCIPY or len(points) < 4:
+            return points
+
+        try:
+            x = [p[0] for p in points]
+            y = [p[1] for p in points]
+
+            # Fit B-spline (k=3 for cubic)
+            # s=0 forces the spline to go through all points (interpolation)
+            # or use s=len(points) for smoothing
+            tck, u = interpolate.splprep([x, y], s=0.5, k=min(3, len(points)-1))
+
+            # Generate new points
+            u_new = np.linspace(0, 1, num_points)
+            x_new, y_new = interpolate.splev(u_new, tck)
+
+            return list(zip(x_new, y_new))
+        except Exception as e:
+            self.get_logger().warn(f"Spline fitting failed: {e}")
+            return points
+
+    def _update_state_machine(self, car_x: float, car_y: float):
+        """
+        Simple state machine to handle skidpad progression.
+        Assumes standard figure-8: Entry -> Right Circle (2 laps) -> Left Circle (2 laps) -> Exit -> Stop
+        """
+        # This is a placeholder logic. Real logic needs robust lap counting.
+        # For now, we just ensure we have a state to check against.
+        pass
+
     # --------------------- Publishing loop ---------------------
 
     def timer_cb(self):
@@ -549,6 +605,14 @@ class SlamPathPointsPublisher(Node):
         # Sequential match in CSV order (this was your red polyline)
         matched = self._match_centroids_to_csv_window(centroids)
 
+        # --- State Machine Logic (Simplified) ---
+        # If we are in STOP state, we clear the path
+        if self.state == SkidpadState.STOP:
+            matched = []
+
+        # Generate Spline Control Points
+        control_points = self._generate_spline_control_points(matched, num_points=35)
+
         # Build and publish nav_msgs/Path: [car pose] + matched points
         now = self.get_clock().now().to_msg()
         path_msg = Path()
@@ -582,6 +646,18 @@ class SlamPathPointsPublisher(Node):
             path_msg.poses.append(ps)
 
         self.path_pub.publish(path_msg)
+
+        # Publish Spline Control Points
+        if control_points:
+            pose_array = PoseArray()
+            pose_array.header = path_msg.header
+            for (cx, cy) in control_points:
+                p = Pose()
+                p.position.x = float(cx)
+                p.position.y = float(cy)
+                p.orientation.w = 1.0
+                pose_array.poses.append(p)
+            self.spline_pub.publish(pose_array)
 
 
 def main():
