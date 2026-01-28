@@ -1,138 +1,518 @@
 #!/usr/bin/env python3
-# gt_cones_to_fused_pc.py
-#
-# Minimal adapter:
-#   /ground_truth/cones (EUFS ConeArray[WithCovariance])
-#     -> /perception/cones_fused (PointCloud2: x,y,z,class_id)
-#
-# Only coloured cones are kept by default:
-#   0: blue, 1: yellow, 2: orange, 3: big_orange
-#   (unknown_color_cones are dropped unless include_unknown=true)
-#
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import cv2
+import onnxruntime as ort
+from pathlib import Path
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from sensor_msgs.msg import PointCloud2, PointField
-from sensor_msgs_py import point_cloud2 as pc2
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from cv_bridge import CvBridge
+from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 
-def _import_cones_msg():
-    """Prefer ConeArrayWithCovariance; fall back to ConeArray."""
-    try:
-        from eufs_msgs.msg import ConeArrayWithCovariance as ConesMsg
-        return ConesMsg
-    except Exception:
-        from eufs_msgs.msg import ConeArray as ConesMsg
-        return ConesMsg
+# ----------------------------
+# YOLO PATH
+# ----------------------------
+YOLO_PATH = Path(__file__).parent / "yolov11" / "weights" / "best.onnx"
 
 
-def _xyz_from_cone(cone):
+# ----------------------------
+# YOLO helpers
+# ----------------------------
+def letterbox(im_bgr, new_shape=736, color=(114, 114, 114)):
+    h, w = im_bgr.shape[:2]
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+
+    r = min(new_shape[0] / h, new_shape[1] / w)
+    new_unpad = (int(round(w * r)), int(round(h * r)))
+    dw = new_shape[1] - new_unpad[0]
+    dh = new_shape[0] - new_unpad[1]
+    dw /= 2
+    dh /= 2
+
+    if (w, h) != new_unpad:
+        im_bgr = cv2.resize(im_bgr, new_unpad, interpolation=cv2.INTER_LINEAR)
+
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    im_bgr = cv2.copyMakeBorder(im_bgr, top, bottom, left, right,
+                                cv2.BORDER_CONSTANT, value=color)
+    return im_bgr, r, (left, top)
+
+
+def nms_xyxy(boxes, scores, iou_thresh=0.7):
+    if boxes.shape[0] == 0:
+        return np.array([], dtype=np.int64)
+
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1 + 1e-6) * (y2 - y1 + 1e-6)
+
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(iou <= iou_thresh)[0]
+        order = order[inds + 1]
+
+    return np.array(keep, dtype=np.int64)
+
+
+class YoloOnnxRunner:
     """
-    Extract (x,y,z) from different EUFS cone message variants.
+    Ultralytics YOLO ONNX export output assumed: [x,y,w,h, class_scores...]
+    Handles shapes: (1,N,4+nc) or (1,4+nc,N)
     """
-    for attr in ("point", "position", "location"):
-        if hasattr(cone, attr):
-            p = getattr(cone, attr)
-            return float(getattr(p, "x", 0.0)), float(getattr(p, "y", 0.0)), float(getattr(p, "z", 0.0))
-    if hasattr(cone, "x") and hasattr(cone, "y"):
-        return float(cone.x), float(cone.y), float(getattr(cone, "z", 0.0))
-    return 0.0, 0.0, 0.0
+    def __init__(self, onnx_path, imgsz=736, conf=0.65, iou=0.7,
+                 class_names=None, use_cuda=True):
+        self.imgsz = int(imgsz)
+        self.conf = float(conf)
+        self.iou = float(iou)
+        self.class_names = class_names or ["yellow", "blue", "orange", "large_orange"]
+        self.nc = len(self.class_names)
+
+        providers = ["CPUExecutionProvider"]
+        if use_cuda:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.sess = ort.InferenceSession(str(onnx_path), sess_options=so, providers=providers)
+
+        self.input_name = self.sess.get_inputs()[0].name
+        self.output_name = self.sess.get_outputs()[0].name
+
+    def infer(self, bgr):
+        orig_h, orig_w = bgr.shape[:2]
+
+        lb, r, (padx, pady) = letterbox(bgr, self.imgsz)
+        rgb = cv2.cvtColor(lb, cv2.COLOR_BGR2RGB)
+
+        x = rgb.astype(np.float32) / 255.0
+        x = np.transpose(x, (2, 0, 1))[None, ...]  # 1x3xHxW
+
+        y = self.sess.run([self.output_name], {self.input_name: x})[0]
+        y = np.asarray(y)
+        if y.ndim == 3:
+            y = y[0]
+
+        # Normalize to (N, 4+nc)
+        if y.shape[0] == (4 + self.nc) and y.shape[1] > 10:
+            y = y.transpose(1, 0)
+        elif y.shape[-1] == (4 + self.nc):
+            pass
+        else:
+            raise RuntimeError(f"Unexpected ONNX output shape: {y.shape}")
+
+        boxes_xywh = y[:, :4]
+        cls_scores = y[:, 4:4 + self.nc]
+
+        cls_id = np.argmax(cls_scores, axis=1)
+        scores = cls_scores[np.arange(cls_scores.shape[0]), cls_id]
+
+        keep = scores >= self.conf
+        boxes_xywh = boxes_xywh[keep]
+        cls_id = cls_id[keep]
+        scores = scores[keep]
+
+        if boxes_xywh.shape[0] == 0:
+            return []
+
+        cx, cy, w, h = boxes_xywh[:, 0], boxes_xywh[:, 1], boxes_xywh[:, 2], boxes_xywh[:, 3]
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+        # unletterbox to original coords
+        boxes[:, [0, 2]] -= padx
+        boxes[:, [1, 3]] -= pady
+        boxes /= r
+
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w - 1)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h - 1)
+
+        # per-class NMS
+        dets = []
+        for c in range(self.nc):
+            idx = np.where(cls_id == c)[0]
+            if idx.size == 0:
+                continue
+            b = boxes[idx]
+            s = scores[idx]
+            k = nms_xyxy(b, s, self.iou)
+            for j in k:
+                x1, y1, x2, y2 = b[j]
+                dets.append((int(c), float(s[j]), int(x1), int(y1), int(x2), int(y2)))
+        return dets
 
 
-class GTConesToFusedPC(Node):
-    """
-    Subscribe: /ground_truth/cones (EUFS)
-    Publish : /perception/cones_fused (PointCloud2 with x,y,z,class_id)
-
-    Colour → class_id:
-      0: blue_cones
-      1: yellow_cones
-      2: orange_cones
-      3: big_orange_cones
-    unknown_color_cones are dropped by default.
-    """
-
+# ----------------------------
+# Depth MAP
+# ----------------------------
+class StereoYoloDepthBBox(Node):
     def __init__(self):
-        super().__init__("gt_cones_to_fused_pc")
+        super().__init__("stereo_yolo_depth_bbox")
+        self.bridge = CvBridge()
 
-        # Parameters
-        self.declare_parameter("input_topic", "/ground_truth/cones")
-        self.declare_parameter("output_topic", "/perception/cones_fused")
-        self.declare_parameter("include_unknown", False)  # drop unknowns by default
+        # Topics
+        self.declare_parameter("left_image", "/zed/left/image_rect_color")
+        self.declare_parameter("right_image", "/zed/right/image_rect_color")
+        self.declare_parameter("left_info", "/zed/left/camera_info")
+        self.declare_parameter("right_info", "/zed/right/camera_info")
+        self.declare_parameter("output_topic", "/perception/cones_stereo")
 
-        input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
-        output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
-        self.include_unknown = bool(self.get_parameter("include_unknown").value)
+        # YOLO params
+        self.declare_parameter("imgsz", 736)
+        self.declare_parameter("conf", 0.65)
+        self.declare_parameter("iou_nms", 0.7)
+        self.declare_parameter("use_cuda", True)
+        self.declare_parameter("class_names", ["yellow", "blue", "orange", "large_orange"])
 
-        ConesMsg = _import_cones_msg()
+        # Stereo params
+        self.declare_parameter("num_disparities", 128)  # multiple of 16
+        self.declare_parameter("block_size", 7)         # odd
+        self.declare_parameter("min_disparity", 0)
+        self.declare_parameter("disp_min_valid", 0.5)
+        self.declare_parameter("depth_patch", 7)        # median patch size
+        self.declare_parameter("max_depth_m", 40.0)
 
-        # Sub / Pub
-        self.sub = self.create_subscription(
-            ConesMsg,
-            input_topic,
-            self.cb_cones,
-            qos_profile_sensor_data,
+        # Performance
+        self.declare_parameter("disparity_downscale", 1)  # 1 or 2 (2 = faster, lower detail)
+
+        # Output frame mode
+        # "optical": X right, Y down, Z forward
+        # "ros":     x forward, y left, z up
+        self.declare_parameter("output_frame_mode", "optical")
+
+        # Internal calibration
+        self.P_left = None
+        self.P_right = None
+        self.fx = self.fy = self.cx = self.cy = None
+        self.baseline = None
+
+        # Subscribe cam infos
+        self.create_subscription(CameraInfo, self.get_parameter("left_info").value,
+                                 self.cb_left_info, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, self.get_parameter("right_info").value,
+                                 self.cb_right_info, qos_profile_sensor_data)
+
+        # YOLO runner
+        self.class_names = list(self.get_parameter("class_names").value)
+        self.yolo = YoloOnnxRunner(
+            onnx_path=YOLO_PATH,
+            imgsz=int(self.get_parameter("imgsz").value),
+            conf=float(self.get_parameter("conf").value),
+            iou=float(self.get_parameter("iou_nms").value),
+            class_names=self.class_names,
+            use_cuda=bool(self.get_parameter("use_cuda").value),
         )
 
-        self.pub = self.create_publisher(
-            PointCloud2,
-            output_topic,
-            qos_profile_sensor_data,
-        )
+        # Sync stereo images
+        self.sub_l = Subscriber(self, Image, self.get_parameter("left_image").value,
+                                qos_profile=qos_profile_sensor_data)
+        self.sub_r = Subscriber(self, Image, self.get_parameter("right_image").value,
+                                qos_profile=qos_profile_sensor_data)
 
-        # Predefine PointCloud2 fields
+        self.sync = ApproximateTimeSynchronizer([self.sub_l, self.sub_r], queue_size=10, slop=0.05)
+        self.sync.registerCallback(self.cb_stereo)
+
+        # Publisher (x,y,z,class_id)
+        self.pub = self.create_publisher(PointCloud2, self.get_parameter("output_topic").value,
+                                         qos_profile_sensor_data)
+
         self.fields = [
-            PointField(name="x",        offset=0,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="y",        offset=4,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="z",        offset=8,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="class_id", offset=12, datatype=PointField.UINT32,  count=1),
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="class_id", offset=12, datatype=PointField.UINT32, count=1),
         ]
 
-        self.get_logger().info(
-            f"[GTConesToFusedPC] input={input_topic} -> output={output_topic}, "
-            f"include_unknown={self.include_unknown}"
-        )
+        cv2.namedWindow("BBox Depth View", cv2.WINDOW_NORMAL)
+        self.get_logger().info(f"[StereoYoloDepthBBox] YOLO={YOLO_PATH}")
+        self.get_logger().info("[StereoYoloDepthBBox] Waiting for CameraInfo...")
 
-    def cb_cones(self, msg):
-        fused_points = []
+    def cb_left_info(self, msg: CameraInfo):
+        self.P_left = np.array(msg.p, dtype=np.float64).reshape(3, 4)
+        self._try_init_calib()
 
-        # Color→id mapping
-        # 0: blue, 1: yellow, 2: orange, 3: big_orange
-        def add_cones(cones, cls_id):
-            for c in cones:
-                x, y, z = _xyz_from_cone(c)
-                fused_points.append((float(x), float(y), float(z), int(cls_id)))
+    def cb_right_info(self, msg: CameraInfo):
+        self.P_right = np.array(msg.p, dtype=np.float64).reshape(3, 4)
+        self._try_init_calib()
 
-        # EUFS standard fields (if some are missing, getattr returns empty list)
-        add_cones(getattr(msg, "blue_cones", []),       0)
-        add_cones(getattr(msg, "yellow_cones", []),     1)
-        add_cones(getattr(msg, "orange_cones", []),     2)
-        add_cones(getattr(msg, "big_orange_cones", []), 3)
-
-        # Unknown colour cones are OPTIONAL, dropped by default
-        if self.include_unknown:
-            unknown = getattr(msg, "unknown_color_cones", [])
-            for c in unknown:
-                x, y, z = _xyz_from_cone(c)
-                fused_points.append((float(x), float(y), float(z), 4))
-
-        if not fused_points:
+    def _try_init_calib(self):
+        if self.P_left is None or self.P_right is None:
             return
 
-        cloud = pc2.create_cloud(msg.header, self.fields, fused_points)
+        self.fx = float(self.P_left[0, 0])
+        self.fy = float(self.P_left[1, 1])
+        self.cx = float(self.P_left[0, 2])
+        self.cy = float(self.P_left[1, 2])
+
+        # Robust baseline:
+        # Preferred: B = |(Pr03 - Pl03)/fx|
+        # Fallback (if both infos are weird/identical): B = max(|Pr03|,|Pl03|)/fx
+        pl03 = float(self.P_left[0, 3])
+        pr03 = float(self.P_right[0, 3])
+        diff = abs(pr03 - pl03)
+
+        if diff > 1e-6:
+            self.baseline = diff / self.fx
+        else:
+            self.baseline = max(abs(pr03), abs(pl03)) / self.fx
+
+        self.get_logger().info(
+            f"[StereoYoloDepthBBox] fx={self.fx:.3f} fy={self.fy:.3f} "
+            f"cx={self.cx:.3f} cy={self.cy:.3f} "
+            f"P_left[0,3]={pl03:.3f} P_right[0,3]={pr03:.3f} "
+            f"baseline={self.baseline:.4f} m"
+        )
+
+    def _build_sgbm(self, num_disp, block, min_disp):
+        return cv2.StereoSGBM_create(
+            minDisparity=min_disp,
+            numDisparities=num_disp,
+            blockSize=block,
+            P1=8 * 1 * block * block,
+            P2=32 * 1 * block * block,
+            disp12MaxDiff=1,
+            uniquenessRatio=10,
+            speckleWindowSize=100,
+            speckleRange=2,
+            preFilterCap=31,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+        )
+
+    def _depth_at(self, disp, u, v, patch, fx_eff, baseline):
+        """Median disparity in patch -> depth (m)."""
+        H, W = disp.shape[:2]
+        r = patch // 2
+        u0, u1 = max(0, u - r), min(W, u + r + 1)
+        v0, v1 = max(0, v - r), min(H, v + r + 1)
+        d = disp[v0:v1, u0:u1].reshape(-1)
+
+        dmin = float(self.get_parameter("disp_min_valid").value)
+        d = d[d > dmin]
+        if d.size == 0:
+            return None
+
+        d_med = float(np.median(d))
+        Z = (fx_eff * baseline) / d_med
+        maxZ = float(self.get_parameter("max_depth_m").value)
+        if not np.isfinite(Z) or Z <= 0.0 or Z > maxZ:
+            return None
+        return Z
+
+    def _make_cloud(self, header_in, frame_id, pts):
+        point_step = 16
+        data = bytearray(point_step * len(pts))
+        for i, (x, y, z, cls_id) in enumerate(pts):
+            base = i * point_step
+            data[base + 0: base + 4] = np.float32(x).tobytes()
+            data[base + 4: base + 8] = np.float32(y).tobytes()
+            data[base + 8: base + 12] = np.float32(z).tobytes()
+            data[base + 12: base + 16] = np.uint32(cls_id).tobytes()
+
+        msg = PointCloud2()
+        msg.header = header_in
+        msg.header.frame_id = frame_id
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = self.fields
+        msg.is_bigendian = False
+        msg.point_step = point_step
+        msg.row_step = point_step * len(pts)
+        msg.is_dense = True
+        msg.data = bytes(data)
+        return msg
+
+    def cb_stereo(self, left_msg: Image, right_msg: Image):
+        if self.fx is None or self.baseline is None:
+            return
+
+        left_bgr = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding="bgr8")
+        right_bgr = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding="bgr8")
+
+        H0, W0 = left_bgr.shape[:2]
+
+        # Optional downscale for disparity speed
+        ds = int(self.get_parameter("disparity_downscale").value)
+        ds = 1 if ds not in (1, 2) else ds
+
+        if ds == 2:
+            left_small = cv2.resize(left_bgr, (W0 // 2, H0 // 2), interpolation=cv2.INTER_AREA)
+            right_small = cv2.resize(right_bgr, (W0 // 2, H0 // 2), interpolation=cv2.INTER_AREA)
+            left_g = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
+            right_g = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
+
+            fx_eff = self.fx / 2.0
+            fy_eff = self.fy / 2.0
+            cx_eff = self.cx / 2.0
+            cy_eff = self.cy / 2.0
+        else:
+            left_g = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
+            right_g = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2GRAY)
+
+            fx_eff = self.fx
+            fy_eff = self.fy
+            cx_eff = self.cx
+            cy_eff = self.cy
+
+        # Build SGBM
+        num_disp = int(self.get_parameter("num_disparities").value)
+        num_disp = max(16, (num_disp // 16) * 16)
+        block = int(self.get_parameter("block_size").value)
+        if block % 2 == 0:
+            block += 1
+        block = max(3, block)
+        min_disp = int(self.get_parameter("min_disparity").value)
+
+        sgbm = self._build_sgbm(num_disp, block, min_disp)
+
+        # Compute disparity ONCE
+        disp = sgbm.compute(left_g, right_g).astype(np.float32) / 16.0  # px
+
+        # YOLO on FULL left image (not downscaled)
+        dets = self.yolo.infer(left_bgr)
+
+        # Viewer: only show depth inside bboxes !!!
+        view = np.zeros_like(left_bgr)
+
+        # Publish points
+        pts = []
+        patch = int(self.get_parameter("depth_patch").value)
+        if patch % 2 == 0:
+            patch += 1
+
+        # Your class mapping
+        YOLO_TO_CLASSID = {0: 0, 1: 1, 2: 2, 3: 3}
+        out_mode = str(self.get_parameter("output_frame_mode").value).lower()
+
+        # For depth visualization (convert disparity->depth per ROI and colormap)
+        # We’ll compute a depth patch image from disparity using Z = fx*B/d
+        for (cid, score, x1, y1, x2, y2) in dets:
+            # bbox clamp
+            x1 = int(np.clip(x1, 0, W0 - 1))
+            x2 = int(np.clip(x2, 0, W0 - 1))
+            y1 = int(np.clip(y1, 0, H0 - 1))
+            y2 = int(np.clip(y2, 0, H0 - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Pixel to sample depth: bottom-center
+            u0 = int(0.5 * (x1 + x2))
+            v0 = int(y2 - 2)
+            u0 = int(np.clip(u0, 0, W0 - 1))
+            v0 = int(np.clip(v0, 0, H0 - 1))
+
+            # Map pixel to disparity resolution if downscaled
+            u = u0 // ds
+            v = v0 // ds
+
+            Z = self._depth_at(disp, u, v, patch, fx_eff, self.baseline)
+            if Z is None:
+                # still draw bbox outline for debugging
+                cv2.rectangle(view, (x1, y1), (x2, y2), (0, 80, 0), 2)
+                continue
+
+            # Back-project in optical frame
+            X = (u0 - self.cx) * Z / self.fx
+            Y = (v0 - self.cy) * Z / self.fy
+
+            if out_mode == "ros":
+                # optical -> ROS camera
+                x_out = Z
+                y_out = -X
+                z_out = -Y
+                frame_id = "zed_left_camera_frame"  # adjust if you have a specific frame
+            else:
+                x_out, y_out, z_out = X, Y, Z
+                frame_id = "zed_left_camera_optical_frame"
+
+            cls_id = YOLO_TO_CLASSID.get(int(cid), 4)
+            pts.append((float(x_out), float(y_out), float(z_out), int(cls_id)))
+
+            # ---- Depth-only bbox view ----
+            # Convert disparity ROI -> depth ROI (use disparity image resolution!)
+            rx1, ry1, rx2, ry2 = x1 // ds, y1 // ds, x2 // ds, y2 // ds
+            rx2 = max(rx2, rx1 + 1)
+            ry2 = max(ry2, ry1 + 1)
+            roi_disp = disp[ry1:ry2, rx1:rx2].copy()
+
+            # disparity -> depth (invalid -> 0)
+            roi_depth = np.zeros_like(roi_disp, dtype=np.float32)
+            valid = roi_disp > float(self.get_parameter("disp_min_valid").value)
+            roi_depth[valid] = (fx_eff * self.baseline) / roi_disp[valid]
+
+            # clip depth for visualization
+            maxZ = float(self.get_parameter("max_depth_m").value)
+            roi_depth = np.clip(roi_depth, 0.0, maxZ)
+
+            # normalize 0..255 (invert so near is bright)
+            if np.any(valid):
+                norm = (1.0 - (roi_depth / maxZ)) * 255.0
+                norm[~valid] = 0.0
+            else:
+                norm = roi_depth * 0.0
+
+            norm_u8 = norm.astype(np.uint8)
+            color = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+
+            # Resize back to full-res ROI if downscaled
+            if ds == 2:
+                color = cv2.resize(color, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+
+            view[y1:y2, x1:x2] = color
+
+            # Draw bbox + text
+            cv2.rectangle(view, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(view, (u0, v0), 4, (255, 255, 255), -1)
+            cv2.putText(view, f"{self.class_names[cid]} Z={Z:.2f}m",
+                        (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Publish cloud
+        cloud = self._make_cloud(left_msg.header, frame_id, pts)
         self.pub.publish(cloud)
-        # kept silent on purpose
+
+        cv2.putText(view, f"pts={len(pts)}  baseline={self.baseline:.3f}m  ds={ds}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.imshow("BBox Depth View", view)
+        if (cv2.waitKey(1) & 0xFF) == ord('q'):
+            rclpy.shutdown()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GTConesToFusedPC()
+    node = StereoYoloDepthBBox()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
 
