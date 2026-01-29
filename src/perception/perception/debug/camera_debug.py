@@ -14,7 +14,7 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 
-# Class → color mapping (same convention as before)
+# Class → color mapping
 COLORS = {
     0: "gold",        # yellow cone
     1: "blue",        # blue cone
@@ -23,75 +23,113 @@ COLORS = {
     4: "gray",        # other/unknown
 }
 
+CLASS_NAMES = {
+    0: "yellow",
+    1: "blue",
+    2: "orange",
+    3: "big_orange",
+    4: "unknown",
+}
+
 
 class ConesColourPlotter(Node):
     def __init__(self):
         super().__init__("cones_colour_plotter")
 
+        self.declare_parameter("topic", "/perception/cones_stereo")
+        self.declare_parameter("frame_mode", "auto")  # auto | optical | ros
+        self.declare_parameter("xlim", 8.0)
+        self.declare_parameter("ylim_forward", 25.0)
+
+        self.topic = self.get_parameter("topic").value
+        self.frame_mode = str(self.get_parameter("frame_mode").value).lower()
+        self.xlim = float(self.get_parameter("xlim").value)
+        self.ylim_forward = float(self.get_parameter("ylim_forward").value)
+
         self.sub = self.create_subscription(
             PointCloud2,
-            "/perception/cones_colour",
+            self.topic,
             self.cb_cones,
             qos_profile_sensor_data,
         )
 
-        self.get_logger().info("[ConesColourPlotter] Subscribed to /cones_colour")
+        self.get_logger().info(f"[ConesColourPlotter] Subscribed to {self.topic}")
 
-        # Shared state: last received cones [(x, y, class_id), ...]
         self._lock = threading.Lock()
-        self._cones = []
+        self._cones = []      # raw tuples: (x, y, z, class_id)
+        self._frame_id = ""   # last frame_id
 
-        # Matplotlib figure
+        # Matplotlib
         self.fig, self.ax = plt.subplots(figsize=(6, 8))
         self.fig.canvas.manager.set_window_title("Cones Colour Map")
 
-        # Plot update timer (10 Hz)
         self.timer = self.create_timer(0.1, self.update_plot)
 
-    # --------- ROS callback ---------
     def cb_cones(self, msg: PointCloud2):
         cones = []
         try:
-            # Expect fields: x, y, z, class_id
-            for x, y, _, cls_id in pc2.read_points(
-                msg,
-                field_names=("x", "y", "z", "class_id"),
-                skip_nans=True,
+            for x, y, z, cls_id in pc2.read_points(
+                msg, field_names=("x", "y", "z", "class_id"), skip_nans=True
             ):
-                cones.append((float(x), float(y), int(cls_id)))
+                cones.append((float(x), float(y), float(z), int(cls_id)))
         except Exception as e:
             self.get_logger().warn(f"[ConesColourPlotter] Error parsing PointCloud2: {e}")
             return
 
         with self._lock:
             self._cones = cones
+            self._frame_id = msg.header.frame_id
 
-    # --------- Plot update ---------
+    def _resolve_mode(self, frame_id: str) -> str:
+        if self.frame_mode in ("optical", "ros"):
+            return self.frame_mode
+        # auto
+        if "optical" in frame_id:
+            return "optical"
+        return "ros"
+
     def update_plot(self):
         with self._lock:
             cones = list(self._cones)
+            frame_id = self._frame_id
+
+        mode = self._resolve_mode(frame_id)
 
         self.ax.cla()
-        self.ax.set_title(f"Cones (N={len(cones)})")
-        self.ax.set_xlabel("Lateral (m)")   # y (left/right)
-        self.ax.set_ylabel("Forward (m)")   # x (forward)
+        self.ax.set_title(f"Cones (N={len(cones)})  frame={frame_id}  mode={mode}")
 
-        # Same orientation as earlier: forward up, left/right horizontal
-        # Flip x-limits so left is positive to the right on the plot if you want:
-        self.ax.set_xlim(8, -8)     # lateral: left/right
-        self.ax.set_ylim(-2, 25)    # forward range
+        # We always plot: x-axis = lateral (left +), y-axis = forward (up)
+        self.ax.set_xlabel("Lateral (m)  (left +)")
+        self.ax.set_ylabel("Forward (m)")
 
+        self.ax.set_xlim(self.xlim, -self.xlim)
+        self.ax.set_ylim(-2, self.ylim_forward)
         self.ax.grid(True, alpha=0.3)
 
-        # Ego vehicle at origin
+        # Ego marker at origin
         self.ax.plot(0.0, 0.0, '^', color='lime', markersize=10, label='Ego')
 
-        for x, y, cls_id in cones:
-            color = COLORS.get(cls_id, "black")
-            # Plot as (y, x) to keep forward on vertical axis
-            self.ax.plot(y, x, 'o', color=color, markersize=6)
+        # Plot points
+        # mode=optical means incoming is camera optical: X right, Y down, Z forward
+        # So: forward = Z, lateral(left+) = -X
+        # mode=ros means incoming is x forward, y left, z up
+        # So: forward = x, lateral = y
+        for x, y, z, cls_id in cones:
+            if mode == "optical":
+                forward = z
+                lateral = -x
+            else:
+                forward = x
+                lateral = y
 
-        # Simple legend stub (just ego)
+            color = COLORS.get(cls_id, "black")
+            self.ax.plot(lateral, forward, 'o', color=color, markersize=6)
+
+        # Add a compact legend for classes actually present
+        present = sorted({c[3] for c in cones})
+        for cid in present:
+            self.ax.plot([], [], 'o', color=COLORS.get(cid, "black"), label=CLASS_NAMES.get(cid, str(cid)))
+
         self.ax.legend(loc="upper right")
         self.fig.canvas.draw_idle()
         plt.pause(0.001)
@@ -100,7 +138,6 @@ class ConesColourPlotter(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ConesColourPlotter()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
