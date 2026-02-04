@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
-# slam_path_points_publisher.py
+# slam_path_sector_visualiser.py
 #
-# Publishes a sequential path to /path_points (nav_msgs/Path):
-#   [current car pose] -> [matched centroid 1] -> [matched centroid 2] -> ...
+# Sector-FOV path generator for SLAM cone map (NO PLOTTER).
+#   - Subscribes to /slam/odom (nav_msgs/Odometry)
+#   - Subscribes to /slam/map_cones (eufs_msgs/ConeArrayWithCovariance)
+#   - Inside the FOV:
+#       * Build Delaunay (or k-NN) edges on cones
+#       * Apply constraints:
+#           - edge length < 6 m
+#           - drop blue-blue and yellow-yellow edges
+#           - drop any orange-like ↔ (blue or yellow) edges
+#           - keep orange-like ↔ orange-like and blue-yellow
+#       * For each allowed edge (EXCEPT big-big), compute midpoint as candidate
+#       * BIG ORANGE SPECIAL:
+#           - If exactly 2 big-orange cones in FOV: output ONLY their midpoint (as a special candidate)
+#           - If >= 3 big-orange cones in FOV: output centroid of ALL big-orange cones (as a special candidate)
+#       * Enforce ≥ 1 m spacing between candidates, keeping farther-first
+#       * Drop any candidate within min_car_dist (default 2.0 m) of the car pose
+#       * Build a greedy NN path from car through kept candidates,
+#         limited by max hop distance (default 7 m)
+#   - Publishes greedy path to /path_points (nav_msgs/Path) BEST_EFFORT QoS
 #
-# Logic is adapted from slam_path_csv_visualiser.py, but WITHOUT matplotlib.
-# It keeps the same sequential constraints used for plotting the red polyline.
-
 import math
 import threading
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import numpy as np
-import pandas as pd
 
 import rclpy
 from rclpy.node import Node
@@ -27,8 +40,6 @@ from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
 from eufs_msgs.msg import ConeArrayWithCovariance
 
-from pathlib import Path as SysPath
-
 # Optional SciPy-based Delaunay
 try:
     from scipy.spatial import Delaunay
@@ -38,55 +49,38 @@ except ImportError:
     _HAS_SCIPY = False
 
 
-# Default CSV under the package dir
-CSVPATH = SysPath(__file__).parent / "pp_utils" / "skidpad_path.csv"
-
-
 def yaw_from_quat(qx, qy, qz, qw) -> float:
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def quat_from_yaw(yaw: float):
-    # geometry_msgs Quaternion fields: x,y,z,w
-    half = 0.5 * yaw
-    return (0.0, 0.0, math.sin(half), math.cos(half))
-
-
-class SlamPathPointsPublisher(Node):
+class SlamPathSectorVisualizer(Node):
     def __init__(self):
-        super().__init__("slam_path_points_publisher")
+        super().__init__("slam_path_sector_visualiser")
 
         # ---- Parameters ----
-        # Topics
         self.declare_parameter("topics.odom_in", "/slam/odom")
         self.declare_parameter("topics.map_in", "/slam/map_cones")
         self.declare_parameter("topics.path_out", "/path_points")
 
-        # Publish rate (Hz)
-        self.declare_parameter("publish_hz", 20.0)
-
-        # Sector FOV parameters
-        self.declare_parameter("fov.vertex_offset_m", -5.0)   # vertex 5 m behind car
-        self.declare_parameter("fov.radius_m", 30.0)          # reaches ~25 m ahead
-        self.declare_parameter("fov.angle_deg", 60.0)         # ±30° around heading
-
-        # QoS
         self.declare_parameter("qos.best_effort", True)
         self.declare_parameter("qos.depth", 50)
 
-        # CSV reference path + sequential tracking behaviour
-        self.declare_parameter("path_file", CSVPATH.as_posix())
-        self.declare_parameter("ref.loop", False)
-        self.declare_parameter("ref.forward_band", 50)
-        self.declare_parameter("ref.search_window", 200)
-        self.declare_parameter("ref.lost_threshold_m", 5.0)
-        self.declare_parameter("match.radius_m", 1.0)
+        # Sector FOV parameters
+        self.declare_parameter("fov.vertex_offset_m", -5.0)
+        self.declare_parameter("fov.radius_m", 30.0)
+        self.declare_parameter("fov.angle_deg", 60.0)
 
-        # Centroid filters
-        self.declare_parameter("centroid.min_car_dist_m", 2.0)
-        self.declare_parameter("centroid.min_spacing_m", 1.0)
+        # Candidate filtering
+        self.declare_parameter("candidates.min_spacing_m", 1.0)
+        self.declare_parameter("candidates.min_car_dist_m", 2.0)
+
+        # Greedy path
+        self.declare_parameter("greedy.max_hop_m", 7.0)
+
+        # Publish rate (Hz)
+        self.declare_parameter("publish.rate_hz", 20.0)
 
         gp = self.get_parameter
         odom_topic = str(gp("topics.odom_in").value)
@@ -96,29 +90,19 @@ class SlamPathPointsPublisher(Node):
         best_effort = bool(gp("qos.best_effort").value)
         depth = int(gp("qos.depth").value)
 
-        self.publish_hz = float(gp("publish_hz").value)
-        self.publish_period = 1.0 / max(1e-6, self.publish_hz)
-
         self.vertex_offset = float(gp("fov.vertex_offset_m").value)
         self.fov_radius = float(gp("fov.radius_m").value)
         self.fov_angle_deg = float(gp("fov.angle_deg").value)
         self.fov_half_rad = math.radians(self.fov_angle_deg * 0.5)
 
-        self.ref_loop = bool(gp("ref.loop").value)
-        self.ref_forward_band = int(gp("ref.forward_band").value)
-        self.ref_search_window = int(gp("ref.search_window").value)
-        self.ref_lost_threshold = float(gp("ref.lost_threshold_m").value)
-        self.match_radius = float(gp("match.radius_m").value)
+        self.min_spacing = float(gp("candidates.min_spacing_m").value)
+        self.min_car_dist = float(gp("candidates.min_car_dist_m").value)
 
-        self.centroid_min_car_dist = float(gp("centroid.min_car_dist_m").value)
-        self.centroid_min_spacing = float(gp("centroid.min_spacing_m").value)
+        self.max_hop = float(gp("greedy.max_hop_m").value)
+        self.publish_rate_hz = float(gp("publish.rate_hz").value)
 
-        # Resolve CSV path via pathlib
-        path_param = SysPath(str(gp("path_file").value))
-        if not path_param.is_absolute():
-            path_param = SysPath(__file__).parent / path_param
-
-        qos = QoSProfile(
+        # Subscriber QoS
+        sub_qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=depth,
             reliability=(
@@ -129,135 +113,47 @@ class SlamPathPointsPublisher(Node):
             durability=QoSDurabilityPolicy.VOLATILE,
         )
 
-        # ---- Load CSV reference path ----
-        try:
-            df = pd.read_csv(path_param)
-            self.global_rx = df["x"].to_numpy(dtype=float)
-            self.global_ry = df["y"].to_numpy(dtype=float)
-            self.get_logger().info(
-                f"[path_pub] Loaded reference path {path_param.as_posix()} "
-                f"with {len(self.global_rx)} points"
-            )
-        except Exception as e:
-            self.get_logger().error(f"[path_pub] Failed to load path {path_param}: {e}")
-            self.global_rx = np.array([], dtype=float)
-            self.global_ry = np.array([], dtype=float)
-
-        # Reference path tracking state (forward-only)
-        self.cur_idx = 0
-        self.path_initialized = False
+        # Publisher QoS (FORCED BEST_EFFORT)
+        pub_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=depth,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
 
         # ---- Subscriptions ----
-        self.create_subscription(Odometry, odom_topic, self.cb_odom, qos)
-        self.create_subscription(ConeArrayWithCovariance, map_topic, self.cb_map, qos)
+        self.create_subscription(Odometry, odom_topic, self.cb_odom, sub_qos)
+        self.create_subscription(ConeArrayWithCovariance, map_topic, self.cb_map, sub_qos)
 
         # ---- Publisher ----
-        self.path_pub = self.create_publisher(Path, path_topic, qos)
+        self.path_pub = self.create_publisher(Path, path_topic, pub_qos)
 
         # ---- State ----
-        self.car_x: Optional[float] = None
-        self.car_y: Optional[float] = None
-        self.car_yaw: Optional[float] = None  # radians
-        self.last_frame_id: str = "map"
+        self.data_lock = threading.Lock()
 
-        # Global map cones in map frame
+        self.car_x = None
+        self.car_y = None
+        self.car_yaw = None  # radians
+
         self.blue_global: List[Tuple[float, float]] = []
         self.yellow_global: List[Tuple[float, float]] = []
         self.orange_global: List[Tuple[float, float]] = []
         self.big_global: List[Tuple[float, float]] = []
 
-        self.data_lock = threading.Lock()
-
         if not _HAS_SCIPY:
             self.get_logger().warn(
-                "[path_pub] SciPy not found; using k-NN graph instead of true Delaunay."
+                "[slam_path_sector_visualiser] SciPy not found; falling back to k-NN graph instead of Delaunay."
             )
 
         self.get_logger().info(
-            f"[path_pub] odom={odom_topic}, map={map_topic}, out={path_topic}, "
-            f"publish_hz={self.publish_hz}, "
-            f"vertex_offset={self.vertex_offset}m, radius={self.fov_radius}m, "
-            f"angle={self.fov_angle_deg}°"
+            f"[slam_path_sector_visualiser] odom={odom_topic}, map={map_topic}, path_out={path_topic} | "
+            f"vertex_offset={self.vertex_offset}m radius={self.fov_radius}m angle={self.fov_angle_deg}deg | "
+            f"min_spacing={self.min_spacing}m min_car_dist={self.min_car_dist}m max_hop={self.max_hop}m"
         )
 
-        # Timer loop for publishing
-        self.create_timer(self.publish_period, self.timer_cb)
-
-    # --------------------- Core helpers ---------------------
-
-    def _has_reference(self) -> bool:
-        return self.global_rx.size > 0
-
-    def _dist_sq_to_ref(self, idx: int, cx: float, cy: float) -> float:
-        dx = cx - self.global_rx[idx]
-        dy = cy - self.global_ry[idx]
-        return dx * dx + dy * dy
-
-    def _update_reference_progress(self, cx: float, cy: float):
-        """
-        Forward-only index tracking along CSV with a forward band and
-        "lost" re-localisation.
-        """
-        if not self._has_reference():
-            return
-
-        n = len(self.global_rx)
-        if n == 0:
-            return
-
-        # --- First initialisation: global nearest search ---
-        if not self.path_initialized:
-            best_idx = 0
-            min_d2 = float("inf")
-            for i in range(n):
-                d2 = self._dist_sq_to_ref(i, cx, cy)
-                if d2 < min_d2:
-                    min_d2 = d2
-                    best_idx = i
-            self.cur_idx = best_idx
-            self.path_initialized = True
-            return
-
-        # --- Normal forward-band search ---
-        forward_band = max(1, min(self.ref_forward_band, n - 1))
-        best_idx = None
-        best_d2 = float("inf")
-
-        if self.ref_loop:
-            for step in range(forward_band + 1):
-                idx = (self.cur_idx + step) % n
-                d2 = self._dist_sq_to_ref(idx, cx, cy)
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_idx = idx
-        else:
-            start = self.cur_idx
-            end = min(n - 1, self.cur_idx + forward_band)
-            for idx in range(start, end + 1):
-                d2 = self._dist_sq_to_ref(idx, cx, cy)
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_idx = idx
-
-        if best_idx is not None:
-            if self.ref_loop:
-                self.cur_idx = best_idx
-            else:
-                self.cur_idx = max(self.cur_idx, best_idx)
-
-        # --- Lost detection + global re-localisation ---
-        if self.ref_lost_threshold > 0.0 and math.isfinite(best_d2):
-            lost_thresh2 = self.ref_lost_threshold * self.ref_lost_threshold
-            if best_d2 > lost_thresh2:
-                global_best_idx = self.cur_idx
-                global_best_d2 = float("inf")
-                for i in range(n):
-                    d2 = self._dist_sq_to_ref(i, cx, cy)
-                    if d2 < global_best_d2:
-                        global_best_d2 = d2
-                        global_best_idx = i
-                if global_best_d2 < best_d2:
-                    self.cur_idx = global_best_idx
+        # ---- Timer loop ----
+        period = 1.0 / max(self.publish_rate_hz, 1e-6)
+        self.timer = self.create_timer(period, self._tick)
 
     # --------------------- Callbacks ---------------------
 
@@ -267,13 +163,10 @@ class SlamPathPointsPublisher(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        frame_id = msg.header.frame_id.strip() or "map"
-
         with self.data_lock:
             self.car_x = x
             self.car_y = y
             self.car_yaw = yaw
-            self.last_frame_id = frame_id
 
     def cb_map(self, msg: ConeArrayWithCovariance):
         blue, yellow, orange, big = [], [], [], []
@@ -293,7 +186,7 @@ class SlamPathPointsPublisher(Node):
             self.orange_global = orange
             self.big_global = big
 
-    # --------------------- FOV / graph helpers ---------------------
+    # --------------------- Helpers ---------------------
 
     def _world_to_local(self, car_x, car_y, car_yaw, px, py):
         """Transform world -> car frame (x forward, y left)."""
@@ -307,7 +200,8 @@ class SlamPathPointsPublisher(Node):
 
     def _compute_fov_points(self, car_x, car_y, car_yaw):
         """
-        Select cones within the circular sector FOV, and in front of the car (local x >= 0).
+        Select cones within the circular sector FOV.
+        Returns (points_window, classes_window).
         """
         vertex_offset = self.vertex_offset
         R = self.fov_radius
@@ -320,12 +214,6 @@ class SlamPathPointsPublisher(Node):
             nonlocal points_window, classes_window
             for (px, py) in cones:
                 lx, ly = self._world_to_local(car_x, car_y, car_yaw, px, py)
-
-                # ignore behind-car points
-                if lx < 0.0:
-                    continue
-
-                # relative to vertex in local frame
                 vx = lx - vertex_offset
                 vy = ly
                 r = math.hypot(vx, vy)
@@ -345,14 +233,7 @@ class SlamPathPointsPublisher(Node):
 
     def _build_edges(self, points_window, classes_window):
         """
-        Build graph edges using Delaunay (if available) or k-NN.
-
-        Constraints:
-          - edge length < 6 m
-          - Drop blue-blue edges
-          - Drop yellow-yellow edges
-          - Drop orange-like ↔ (blue or yellow)
-          - Keep orange-like ↔ orange-like and blue-yellow
+        Build graph edges using Delaunay (if available) or k-NN, then apply constraints.
         """
         N = len(points_window)
         if N < 2:
@@ -408,16 +289,48 @@ class SlamPathPointsPublisher(Node):
 
         return edges
 
-    def _filter_centroids(
+    def _big_cone_candidate(self, points_window, classes_window):
+        """
+        BIG ORANGE SPECIAL:
+          - If exactly 2 big cones in FOV: return their midpoint (single candidate)
+          - If >= 3 big cones in FOV: return centroid of all big cones (single candidate)
+        Returns: List[(x, y, is_big_special)]
+        """
+        big_pts = [
+            points_window[i]
+            for i, cls in enumerate(classes_window)
+            if cls == "big"
+        ]
+        n = len(big_pts)
+        if n < 2:
+            return []
+
+        if n == 2:
+            (x1, y1), (x2, y2) = big_pts
+            mx = 0.5 * (x1 + x2)
+            my = 0.5 * (y1 + y2)
+            return [(mx, my, True)]
+
+        # n >= 3
+        xs = [p[0] for p in big_pts]
+        ys = [p[1] for p in big_pts]
+        cx = sum(xs) / n
+        cy = sum(ys) / n
+        return [(cx, cy, True)]
+
+    def _filter_centroids_min_spacing(
         self,
         centroids_raw: List[Tuple[float, float, bool]],
         car_x: float,
         car_y: float,
+        min_dist: float,
     ) -> List[Tuple[float, float, bool]]:
         """
-        Enforce:
-          - no centroid within centroid_min_car_dist of car
-          - no two centroids closer than centroid_min_spacing
+        Strategy:
+          - sort candidates by distance from car DESC (farthest-first)
+          - keep if:
+              * >= min_car_dist from car
+              * >= min_dist from all already kept
         """
         if not centroids_raw:
             return []
@@ -425,8 +338,7 @@ class SlamPathPointsPublisher(Node):
         pts = np.array([[c[0], c[1]] for c in centroids_raw], dtype=float)
         car = np.array([car_x, car_y], dtype=float)
         d2_car = np.sum((pts - car) ** 2, axis=1)
-
-        order = np.argsort(-d2_car)  # farthest first
+        order = np.argsort(-d2_car)
 
         kept_pts = []
         kept = []
@@ -434,7 +346,7 @@ class SlamPathPointsPublisher(Node):
         for idx in order:
             p = pts[idx]
 
-            if np.linalg.norm(p - car) < self.centroid_min_car_dist:
+            if np.linalg.norm(p - car) < self.min_car_dist:
                 continue
 
             if not kept_pts:
@@ -444,7 +356,7 @@ class SlamPathPointsPublisher(Node):
 
             too_close = False
             for kp in kept_pts:
-                if np.linalg.norm(p - kp) < self.centroid_min_spacing:
+                if np.linalg.norm(p - kp) < min_dist:
                     too_close = True
                     break
             if too_close:
@@ -455,59 +367,71 @@ class SlamPathPointsPublisher(Node):
 
         return kept
 
-    def _match_centroids_to_csv_window(
-        self,
-        centroids: List[Tuple[float, float, bool]],
-    ) -> List[Tuple[float, float]]:
-        """
-        For CSV indices in [cur_idx, cur_idx+ref_search_window], in order,
-        match nearest centroid within match_radius (unused after matched).
-        """
-        if not self._has_reference() or not centroids:
+    def _build_greedy_path(self, car_x, car_y, candidate_points: List[Tuple[float, float]]):
+        """Greedy NN chain with max hop length self.max_hop."""
+        if not candidate_points:
             return []
 
-        n_ref = len(self.global_rx)
-        if n_ref == 0:
-            return []
+        pts = np.asarray(candidate_points, dtype=float)
+        N = pts.shape[0]
+        used = np.zeros(N, dtype=bool)
 
-        pts = np.array([[c[0], c[1]] for c in centroids], dtype=float)
-        used = np.zeros(len(centroids), dtype=bool)
+        current = np.array([car_x, car_y], dtype=float)
+        max_step2 = self.max_hop * self.max_hop
 
-        matched: List[Tuple[float, float]] = []
-        max_r2 = self.match_radius * self.match_radius
+        order: List[int] = []
 
-        max_steps = min(self.ref_search_window, n_ref)
-        for step in range(max_steps + 1):
-            idx = self.cur_idx + step
-            if self.ref_loop:
-                idx %= n_ref
-            elif idx >= n_ref:
-                break
-
-            px = self.global_rx[idx]
-            py = self.global_ry[idx]
-
-            diff = pts - np.array([px, py])
+        for _ in range(N):
+            diff = pts - current
             d2 = np.sum(diff * diff, axis=1)
             d2[used] = float("inf")
+            d2[d2 > max_step2] = float("inf")
 
-            j = int(np.argmin(d2))
-            if not math.isfinite(d2[j]) or d2[j] > max_r2:
-                continue
+            idx = int(np.argmin(d2))
+            if not math.isfinite(float(d2[idx])) or float(d2[idx]) == float("inf"):
+                break
 
-            used[j] = True
-            matched.append((float(pts[j, 0]), float(pts[j, 1])))
+            used[idx] = True
+            order.append(idx)
+            current = pts[idx]
 
-        return matched
+        return [tuple(pts[i]) for i in order]
 
-    # --------------------- Publishing loop ---------------------
+    def _publish_path(self, car_x: float, car_y: float, path_points: List[Tuple[float, float]]):
+        """Publish nav_msgs/Path (car pose first, then greedy points)."""
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"  # adjust if needed
 
-    def timer_cb(self):
+        poses: List[PoseStamped] = []
+
+        car_ps = PoseStamped()
+        car_ps.header = msg.header
+        car_ps.pose.position.x = float(car_x)
+        car_ps.pose.position.y = float(car_y)
+        car_ps.pose.position.z = 0.0
+        car_ps.pose.orientation.w = 1.0
+        poses.append(car_ps)
+
+        for (x, y) in path_points:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.w = 1.0
+            poses.append(ps)
+
+        msg.poses = poses
+        self.path_pub.publish(msg)
+
+    # --------------------- Main loop tick ---------------------
+
+    def _tick(self):
         with self.data_lock:
             car_x = self.car_x
             car_y = self.car_y
             car_yaw = self.car_yaw
-            frame_id = self.last_frame_id
 
             blue_global = list(self.blue_global)
             yellow_global = list(self.yellow_global)
@@ -517,76 +441,62 @@ class SlamPathPointsPublisher(Node):
         if car_x is None or car_y is None or car_yaw is None:
             return
 
-        # Update cone lists locally (avoid lock usage deeper)
-        self.blue_global = blue_global
-        self.yellow_global = yellow_global
-        self.orange_global = orange_global
-        self.big_global = big_global
+        # stash into class fields for FOV helper usage (so we reuse your exact logic style)
+        with self.data_lock:
+            self.blue_global = blue_global
+            self.yellow_global = yellow_global
+            self.orange_global = orange_global
+            self.big_global = big_global
 
-        # Preserve sequential progression along CSV
-        self._update_reference_progress(car_x, car_y)
-
-        # Find centroids from FOV graph
         points_window, classes_window = self._compute_fov_points(car_x, car_y, car_yaw)
+
+        if len(points_window) < 2:
+            self._publish_path(car_x, car_y, [])
+            return
+
         edges = self._build_edges(points_window, classes_window)
 
         orange_like = {"orange", "big"}
+
+        # BIG ORANGE SPECIAL candidate
+        big_special = self._big_cone_candidate(points_window, classes_window)
+
+        # Collect candidates from edges (midpoints), excluding big-big edges
         centroids_raw: List[Tuple[float, float, bool]] = []
 
         for (i, j) in edges:
-            (x1e, y1e) = points_window[i]
-            (x2e, y2e) = points_window[j]
+            (x1, y1) = points_window[i]
+            (x2, y2) = points_window[j]
             ci = classes_window[i]
             cj = classes_window[j]
-            is_big_big = (ci == "big" and cj == "big")
 
-            mx = 0.5 * (x1e + x2e)
-            my = 0.5 * (y1e + y2e)
-            centroids_raw.append((mx, my, is_big_big))
+            # skip big-big midpoint; handled by special logic instead
+            if ci == "big" and cj == "big":
+                continue
 
-        centroids = self._filter_centroids(centroids_raw, car_x, car_y)
+            mx = 0.5 * (x1 + x2)
+            my = 0.5 * (y1 + y2)
+            centroids_raw.append((mx, my, False))
 
-        # Sequential match in CSV order (this was your red polyline)
-        matched = self._match_centroids_to_csv_window(centroids)
+        # Add the big special point (if present)
+        for (bx, by, _) in big_special:
+            centroids_raw.append((bx, by, True))
 
-        # Build and publish nav_msgs/Path: [car pose] + matched points
-        now = self.get_clock().now().to_msg()
-        path_msg = Path()
-        path_msg.header.stamp = now
-        path_msg.header.frame_id = frame_id if frame_id else "map"
+        # Spacing + car-distance filtering
+        centroids = self._filter_centroids_min_spacing(
+            centroids_raw, car_x, car_y, min_dist=self.min_spacing
+        )
 
-        # First pose: current car pose
-        car_pose = PoseStamped()
-        car_pose.header.stamp = now
-        car_pose.header.frame_id = path_msg.header.frame_id
-        car_pose.pose.position.x = float(car_x)
-        car_pose.pose.position.y = float(car_y)
-        car_pose.pose.position.z = 0.0
-        qx, qy, qz, qw = quat_from_yaw(float(car_yaw))
-        car_pose.pose.orientation.x = qx
-        car_pose.pose.orientation.y = qy
-        car_pose.pose.orientation.z = qz
-        car_pose.pose.orientation.w = qw
-        path_msg.poses.append(car_pose)
+        candidate_points = [(x, y) for (x, y, _) in centroids]
 
-        # Subsequent poses: matched points in order
-        for (mx, my) in matched:
-            ps = PoseStamped()
-            ps.header.stamp = now
-            ps.header.frame_id = path_msg.header.frame_id
-            ps.pose.position.x = float(mx)
-            ps.pose.position.y = float(my)
-            ps.pose.position.z = 0.0
-            # Waypoint orientation not essential; set identity.
-            ps.pose.orientation.w = 1.0
-            path_msg.poses.append(ps)
+        path_points = self._build_greedy_path(car_x, car_y, candidate_points)
 
-        self.path_pub.publish(path_msg)
+        self._publish_path(car_x, car_y, path_points)
 
 
 def main():
     rclpy.init()
-    node = SlamPathPointsPublisher()
+    node = SlamPathSectorVisualizer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

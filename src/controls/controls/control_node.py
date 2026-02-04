@@ -22,11 +22,11 @@ from .utils.control_utils import (
     pure_pursuit_steer,
 )
 
-MAX_VELOCITY = 2.0
+MAX_VELOCITY = 1.0
 VEL_LIMIT_FACTOR = 0.3
 LOOK_AHEAD_UPDATE_INTERVAL = 1.2
 ROUTE_IS_LOOP = False
-STOP_SPEED_THRESHOLD = 0.1
+STOP_SPEED_THRESHOLD = -10
 WHEELBASE_M = 1.5
 MAX_STEER_RAD = math.pi / 2
 

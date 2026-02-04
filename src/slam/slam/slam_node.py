@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import math
-from collections import deque
 import bisect
-from typing import List, Tuple
+import random
+from collections import deque
+from typing import List, Tuple, Optional
 
 import numpy as np
 
@@ -31,24 +32,16 @@ def yaw_from_quat(qx, qy, qz, qw) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def stamp_from_float_seconds(t: float):
+    """Safe float seconds -> builtin_interfaces/Time"""
+    sec = int(math.floor(t))
+    nanosec = int((t - sec) * 1e9)
+    return rclpy.time.Time(seconds=sec, nanoseconds=nanosec).to_msg()
+
+
 class PFSlamNode(Node):
     """
-    PF-SLAM node (no visualisation).
-
-      - Input odom: /slam/odom_raw (or param topics.odom_in)
-      - Input cones: /perception/cones_fused (BASE/BODY frame, x,y,z,class_id)
-
-      - Output SLAM odom: /slam/odom         (nav_msgs/Odometry)
-      - Output map cones: /slam/map_cones    (eufs_msgs/ConeArrayWithCovariance)
-
-    Logic:
-      - Buffer odom poses with timestamps.
-      - For each cones msg at time t_c:
-          * interpolate odom pose (x_o, y_o, yaw_o) at t_c
-          * use odom increment since last cones frame as PF motion
-          * PF update with cones in body frame
-          * publish best-particle pose as /slam/odom
-          * publish best-particle landmarks as /slam/map_cones
+    PF-SLAM node + snap-back correction for yaw/pose drift.
     """
 
     def __init__(self):
@@ -60,19 +53,47 @@ class PFSlamNode(Node):
         self.declare_parameter("topics.slam_odom_out", "/slam/odom")
         self.declare_parameter("topics.map_cones_out", "/slam/map_cones")
 
+        # QoS (200 is a mistake for sensor streams)
         self.declare_parameter("qos.best_effort", True)
-        self.declare_parameter("qos.depth", 200)
+        self.declare_parameter("qos.depth", 3)
         self.declare_parameter("odom_buffer_sec", 5.0)
 
+        # Drop stale cone frames (sim lag / low RTF protection)
+        self.declare_parameter("cones.max_age_sec", 0.20)
+
+        # Snap-back loop closure
+        self.declare_parameter("lc.enable", True)
+        self.declare_parameter("lc.rate_hz", 3.0)
+        self.declare_parameter("lc.inlier_dist_m", 0.8)
+        self.declare_parameter("lc.min_inliers", 10)
+        self.declare_parameter("lc.min_inlier_ratio", 0.35)
+        self.declare_parameter("lc.ransac_iters", 80)
+        self.declare_parameter("lc.max_yaw_deg", 12.0)
+        self.declare_parameter("lc.max_trans_m", 2.0)
+        self.declare_parameter("lc.min_map_cones", 60)
+        self.declare_parameter("lc.min_obs_cones", 8)
+
         gp = self.get_parameter
-        odom_topic = str(gp("topics.odom_in").value)
-        cones_topic = str(gp("topics.cones_in").value)
-        slam_odom_topic = str(gp("topics.slam_odom_out").value)
-        map_cones_topic = str(gp("topics.map_cones_out").value)
+        self.odom_topic = str(gp("topics.odom_in").value)
+        self.cones_topic = str(gp("topics.cones_in").value)
+        self.slam_odom_topic = str(gp("topics.slam_odom_out").value)
+        self.map_cones_topic = str(gp("topics.map_cones_out").value)
 
         best_effort = bool(gp("qos.best_effort").value)
         depth = int(gp("qos.depth").value)
         self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
+        self.cones_max_age = float(gp("cones.max_age_sec").value)
+
+        self.lc_enable = bool(gp("lc.enable").value)
+        self.lc_rate_hz = float(gp("lc.rate_hz").value)
+        self.lc_inlier_dist = float(gp("lc.inlier_dist_m").value)
+        self.lc_min_inliers = int(gp("lc.min_inliers").value)
+        self.lc_min_ratio = float(gp("lc.min_inlier_ratio").value)
+        self.lc_ransac_iters = int(gp("lc.ransac_iters").value)
+        self.lc_max_yaw = math.radians(float(gp("lc.max_yaw_deg").value))
+        self.lc_max_trans = float(gp("lc.max_trans_m").value)
+        self.lc_min_map_cones = int(gp("lc.min_map_cones").value)
+        self.lc_min_obs_cones = int(gp("lc.min_obs_cones").value)
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -86,47 +107,44 @@ class PFSlamNode(Node):
         )
 
         # ---- Subscriptions ----
-        self.create_subscription(Odometry, odom_topic, self.cb_odom, qos)
-        self.create_subscription(PointCloud2, cones_topic, self.cb_cones, qos)
+        self.create_subscription(Odometry, self.odom_topic, self.cb_odom, qos)
+        self.create_subscription(PointCloud2, self.cones_topic, self.cb_cones, qos)
 
         # ---- Publishers ----
-        self.pub_slam_odom = self.create_publisher(Odometry, slam_odom_topic, 10)
-        self.pub_map_cones = self.create_publisher(
-            ConeArrayWithCovariance, map_cones_topic, 10
-        )
+        self.pub_slam_odom = self.create_publisher(Odometry, self.slam_odom_topic, 5)
+        self.pub_map_cones = self.create_publisher(ConeArrayWithCovariance, self.map_cones_topic, 5)
 
         # ---- State ----
-
-        # odom buffer: (t, x, y, yaw)
         self.odom_buf: deque = deque()
-
-        # last interpolated odom pose at a cones frame
         self.slam_initialised = False
-        self.last_cone_odom_pose: Tuple[float, float, float] = None
+        self.last_cone_odom_pose: Optional[Tuple[float, float, float]] = None
 
-        # SLAM: PF core
+        # PF core
         self.pf = ParticleFilterSLAM(
             num_particles=80,
             process_std_xy=0.03,
             process_std_yaw=0.01,
-            meas_sigma_xy=0.20,
-            birth_sigma_xy=0.40,
+            meas_sigma_xy=0.18,
+            birth_sigma_xy=0.35,
             gate_prob=0.997,
             resample_neff_ratio=0.5,
         )
 
+        # Cumulative correction (applied to outputs): p' = R p + t
+        self.corr_R = np.eye(2, dtype=np.float64)
+        self.corr_t = np.zeros((2,), dtype=np.float64)
+
+        # loop closure scheduling
+        self.last_lc_time = -1e9
+
         self.get_logger().info(
-            f"[pf_slam] odom_in={odom_topic}, cones_in={cones_topic}, "
-            f"slam_odom_out={slam_odom_topic}, map_cones_out={map_cones_topic}"
+            f"[pf_slam] odom_in={self.odom_topic}, cones_in={self.cones_topic}, "
+            f"slam_odom_out={self.slam_odom_topic}, map_cones_out={self.map_cones_topic}"
         )
 
     # ---------------------- Odom buffer helper ----------------------
 
     def _pose_at(self, t_query: float):
-        """
-        Interpolate odom pose (x,y,yaw) at time t_query using odom_buf.
-        Returns (x,y,yaw) or None if no odom yet.
-        """
         if not self.odom_buf:
             return None
 
@@ -153,6 +171,192 @@ class PFSlamNode(Node):
         yaw = yaw0 + a * dyaw
         return x, y, wrap(yaw)
 
+    # ---------------------- Correction helpers ----------------------
+
+    def _apply_corr_to_point(self, x: float, y: float) -> Tuple[float, float]:
+        p = np.array([x, y], dtype=np.float64)
+        p2 = self.corr_R @ p + self.corr_t
+        return float(p2[0]), float(p2[1])
+
+    def _apply_corr_to_pose(self, x: float, y: float, yaw: float) -> Tuple[float, float, float]:
+        x2, y2 = self._apply_corr_to_point(x, y)
+        dyaw = math.atan2(self.corr_R[1, 0], self.corr_R[0, 0])
+        return x2, y2, wrap(yaw + dyaw)
+
+    def _compose_corr(self, R_new: np.ndarray, t_new: np.ndarray):
+        # corr <- new ∘ corr
+        self.corr_t = (R_new @ self.corr_t) + t_new
+        self.corr_R = R_new @ self.corr_R
+
+    # ---------------------- Loop closure / snap-back ----------------------
+
+    def _build_map_points(self):
+        # Use PF best-particle landmarks as the "map" for snap-back.
+        best = self.pf.get_best_particle()
+        if best is None:
+            return {}
+
+        pts_by_cls = {}
+        for lm in best.landmarks:
+            cls_id = int(lm.cls)
+            x = float(lm.mean[0])
+            y = float(lm.mean[1])
+            x, y = self._apply_corr_to_point(x, y)
+            pts_by_cls.setdefault(cls_id, []).append((x, y))
+        return pts_by_cls
+
+    def _obs_body_to_map(self, x: float, y: float, yaw: float, meas_body):
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        out = []
+        for bx, by, cls_id in meas_body:
+            mx = x + cy * bx - sy * by
+            my = y + sy * bx + cy * by
+            mx, my = self._apply_corr_to_point(mx, my)
+            out.append((mx, my, cls_id))
+        return out
+
+    def _nn_inliers(self, obs_map, map_by_cls, dist_thr: float) -> int:
+        thr2 = dist_thr * dist_thr
+        inl = 0
+        for ox, oy, cls_id in obs_map:
+            cand = map_by_cls.get(cls_id, [])
+            if not cand:
+                continue
+            best2 = None
+            for mx, my in cand:
+                dx = mx - ox
+                dy = my - oy
+                d2 = dx * dx + dy * dy
+                if best2 is None or d2 < best2:
+                    best2 = d2
+            if best2 is not None and best2 <= thr2:
+                inl += 1
+        return inl
+
+    def _estimate_se2_from_pairs(self, p1, p2, q1, q2):
+        p1 = np.array(p1, dtype=np.float64)
+        p2 = np.array(p2, dtype=np.float64)
+        q1 = np.array(q1, dtype=np.float64)
+        q2 = np.array(q2, dtype=np.float64)
+        vp = p2 - p1
+        vq = q2 - q1
+        nvp = np.linalg.norm(vp)
+        nvq = np.linalg.norm(vq)
+        if nvp < 1e-6 or nvq < 1e-6:
+            return None
+        ap = math.atan2(vp[1], vp[0])
+        aq = math.atan2(vq[1], vq[0])
+        dth = wrap(aq - ap)
+        c = math.cos(dth)
+        s = math.sin(dth)
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        t = q1 - (R @ p1)
+        return R, t, dth
+
+    def _try_snap_back(self, t_now: float, pose_x: float, pose_y: float, pose_yaw: float, meas_body):
+        if not self.lc_enable:
+            return
+        if (t_now - self.last_lc_time) < (1.0 / max(self.lc_rate_hz, 1e-6)):
+            return
+
+        map_by_cls = self._build_map_points()
+        map_count = sum(len(v) for v in map_by_cls.values())
+        if map_count < self.lc_min_map_cones:
+            return
+        if len(meas_body) < self.lc_min_obs_cones:
+            return
+
+        obs_map = self._obs_body_to_map(pose_x, pose_y, pose_yaw, meas_body)
+
+        base_inliers = self._nn_inliers(obs_map, map_by_cls, self.lc_inlier_dist)
+
+        # bucket obs by class for sampling
+        obs_by_cls = {}
+        for ox, oy, cls_id in obs_map:
+            obs_by_cls.setdefault(cls_id, []).append((ox, oy))
+        valid_classes = [c for c in obs_by_cls if len(obs_by_cls[c]) >= 2 and len(map_by_cls.get(c, [])) >= 2]
+        if not valid_classes:
+            return
+
+        best = None  # (inliers, R, t, dth)
+        thr2 = self.lc_inlier_dist * self.lc_inlier_dist
+
+        def nn(pt, candidates):
+            px, py = pt
+            best_i = None
+            best_d2 = None
+            for i, (cx, cy) in enumerate(candidates):
+                dx = cx - px
+                dy = cy - py
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best_i = i
+            return candidates[best_i]
+
+        for _ in range(self.lc_ransac_iters):
+            cls = random.choice(valid_classes)
+
+            p1, p2 = random.sample(obs_by_cls[cls], 2)
+            q1 = nn(p1, map_by_cls[cls])
+            q2 = nn(p2, map_by_cls[cls])
+            if q1 == q2:
+                continue
+
+            est = self._estimate_se2_from_pairs(p1, p2, q1, q2)
+            if est is None:
+                continue
+            R, t, dth = est
+
+            if abs(dth) > self.lc_max_yaw:
+                continue
+            if float(np.linalg.norm(t)) > self.lc_max_trans:
+                continue
+
+            # score
+            inl = 0
+            for ox, oy, cls_id in obs_map:
+                p = np.array([ox, oy], dtype=np.float64)
+                p2t = R @ p + t
+                cand = map_by_cls.get(cls_id, [])
+                if not cand:
+                    continue
+                best2 = None
+                for mx, my in cand:
+                    dx = mx - p2t[0]
+                    dy = my - p2t[1]
+                    d2 = dx * dx + dy * dy
+                    if best2 is None or d2 < best2:
+                        best2 = d2
+                if best2 is not None and best2 <= thr2:
+                    inl += 1
+
+            if best is None or inl > best[0]:
+                best = (inl, R, t, dth)
+
+        if best is None:
+            return
+
+        inliers, R_best, t_best, dth_best = best
+        ratio = inliers / max(len(obs_map), 1)
+
+        # acceptance
+        if inliers < self.lc_min_inliers:
+            return
+        if ratio < self.lc_min_ratio:
+            return
+        if inliers < (base_inliers + 2):
+            return
+
+        self._compose_corr(R_best, t_best)
+        self.last_lc_time = t_now
+        self.get_logger().info(
+            f"[lc] snap-back: inliers={inliers}/{len(obs_map)} ({ratio:.2f}) "
+            f"dYaw={math.degrees(dth_best):.2f}deg |t|={float(np.linalg.norm(t_best)):.2f}m",
+            throttle_duration_sec=0.5
+        )
+
     # ---------------------- Callbacks ----------------------
 
     def cb_odom(self, msg: Odometry):
@@ -162,116 +366,120 @@ class PFSlamNode(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        # push into buffer
         self.odom_buf.append((t, x, y, yaw))
         tmin = t - self.odom_buffer_sec
         while self.odom_buf and self.odom_buf[0][0] < tmin:
             self.odom_buf.popleft()
 
     def cb_cones(self, msg: PointCloud2):
-        # read cones in BASE/BODY frame (aligned with odom base)
+        # drop stale frames if sim is lagging
+        t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        t_now = self.get_clock().now().nanoseconds * 1e-9
+        
+        if (t_now - t_c) > 0.2:
+            return
+        if (t_now - t_c) > self.cones_max_age:
+            return
+
+        # parse cones
         try:
-            cones_body = list(
-                pc2.read_points(
-                    msg,
-                    field_names=("x", "y", "z", "class_id"),
-                    skip_nans=True,
-                )
-            )
+            meas_body = [(float(bx), float(by), int(cls_id))
+                         for (bx, by, _bz, cls_id) in pc2.read_points(
+                             msg, field_names=("x", "y", "z", "class_id"), skip_nans=True)]
         except Exception as e:
             self.get_logger().warn(f"[pf_slam] Error parsing cones PointCloud2: {e}")
             return
 
-        if not cones_body:
+        if not meas_body:
             return
-
-        t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
 
         pose_now = self._pose_at(t_c)
         if pose_now is None:
-            # no odom yet
             return
-
         x_o, y_o, yaw_o = pose_now
 
-        # --------- PF motion: odom increment between cone frames ---------
+        # --------- PF motion (IMPORTANT: use BODY-FRAME increments) ---------
         if not self.slam_initialised or self.last_cone_odom_pose is None:
-            # first time: initialise PF at odom pose
             self.pf.init_pose(x_o, y_o, yaw_o)
             self.slam_initialised = True
             self.last_cone_odom_pose = (x_o, y_o, yaw_o)
         else:
             x_prev, y_prev, yaw_prev = self.last_cone_odom_pose
-            dx = x_o - x_prev
-            dy = y_o - y_prev
+
+            dx_map = x_o - x_prev
+            dy_map = y_o - y_prev
             dyaw = wrap(yaw_o - yaw_prev)
-            self.pf.predict((dx, dy, dyaw))
+
+            # map -> body using previous yaw
+            c = math.cos(-yaw_prev)
+            s = math.sin(-yaw_prev)
+            dx_body = c * dx_map - s * dy_map
+            dy_body = s * dx_map + c * dy_map
+
+            self.pf.predict((dx_body, dy_body, dyaw))
             self.last_cone_odom_pose = (x_o, y_o, yaw_o)
 
         # --------- PF measurement update ---------
-        meas_body = [
-            (float(bx), float(by), int(cls_id))
-            for (bx, by, _bz, cls_id) in cones_body
-        ]
         self.pf.update(meas_body)
 
         best = self.pf.get_best_particle()
         if best is None:
             return
 
-        # Publish outputs
-        self._publish_slam_odom(t_c, best)
-        self._publish_map_cones(t_c, best)
+        # corrected pose BEFORE snap-back attempt
+        x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
+
+        # snap-back: tries to fix yaw/pose drift by aligning obs to map landmarks
+        self._try_snap_back(t_c, x_pub, y_pub, yaw_pub, meas_body)
+
+        # corrected pose AFTER snap-back (corr may have changed)
+        x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
+
+        # publish corrected odom + corrected map
+        self._publish_slam_odom(t_c, x_pub, y_pub, yaw_pub)
+        self._publish_map_cones(t_c)
 
     # ---------------------- Publishers ----------------------
 
-    def _publish_slam_odom(self, t: float, best_particle):
-        """
-        Publish best-particle pose as nav_msgs/Odometry on topics.slam_odom_out.
-        Twist is left zeroed for now.
-        """
+    def _publish_slam_odom(self, t: float, x: float, y: float, yaw: float):
         od = Odometry()
-        od.header.stamp = rclpy.time.Time(seconds=t).to_msg()
+        od.header.stamp = stamp_from_float_seconds(t)
         od.header.frame_id = "map"
         od.child_frame_id = "base_link"
 
-        od.pose.pose.position.x = float(best_particle.x)
-        od.pose.pose.position.y = float(best_particle.y)
+        od.pose.pose.position.x = float(x)
+        od.pose.pose.position.y = float(y)
         od.pose.pose.position.z = 0.0
 
-        half_yaw = 0.5 * float(best_particle.yaw)
+        half_yaw = 0.5 * float(yaw)
         od.pose.pose.orientation.x = 0.0
         od.pose.pose.orientation.y = 0.0
         od.pose.pose.orientation.z = math.sin(half_yaw)
         od.pose.pose.orientation.w = math.cos(half_yaw)
 
-        # Covariances / twist left at defaults (zero) for now
         self.pub_slam_odom.publish(od)
 
-    def _publish_map_cones(self, t: float, best_particle):
-        """
-        Publish landmarks from best particle as ConeArrayWithCovariance in 'map' frame.
-        Only 2D coordinates + colour are used; covariance left at defaults.
-        cls mapping:
-          0 -> blue_cones
-          1 -> yellow_cones
-          2 -> orange_cones
-          3 -> big_orange_cones
-        """
+    def _publish_map_cones(self, t: float):
+        best = self.pf.get_best_particle()
+        if best is None:
+            return
+
         msg = ConeArrayWithCovariance()
-        msg.header.stamp = rclpy.time.Time(seconds=t).to_msg()
+        msg.header.stamp = stamp_from_float_seconds(t)
         msg.header.frame_id = "map"
 
-        for lm in best_particle.landmarks:
+        for lm in best.landmarks:
             x = float(lm.mean[0])
             y = float(lm.mean[1])
             cls_id = int(lm.cls)
+
+            # apply output correction to landmarks too
+            x, y = self._apply_corr_to_point(x, y)
 
             cone = ConeWithCovariance()
             cone.point.x = x
             cone.point.y = y
             cone.point.z = 0.0
-            # cone.covariance: leave default; we don't use it anywhere
 
             if cls_id == 0:
                 msg.blue_cones.append(cone)
@@ -282,9 +490,10 @@ class PFSlamNode(Node):
             elif cls_id == 3:
                 msg.big_orange_cones.append(cone)
             else:
-                # If ConeArrayWithCovariance has unknown_color_cones, you can push here.
-                # If not, just ignore or treat as blue.
-                msg.unknown_color_cones.append(cone)
+                try:
+                    msg.unknown_color_cones.append(cone)
+                except AttributeError:
+                    pass
 
         self.pub_map_cones.publish(msg)
 

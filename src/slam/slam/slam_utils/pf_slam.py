@@ -156,12 +156,13 @@ class ParticleFilterSLAM:
 
     def predict(self, delta: Tuple[float, float, float]):
         """
-        Apply odom increment (dx,dy,dyaw) in world frame + process noise.
+        Apply odom increment (dx,dy,dyaw) in the CAR/BODY frame + process noise.
+        Converts (dx,dy) into world frame using each particle yaw.
         """
         if not self.initialised:
             return
 
-        dx, dy, dyaw = delta
+        dx_b, dy_b, dyaw = delta
 
         if self.proc_xy > 0.0:
             noise_xy = np.random.normal(0.0, self.proc_xy, size=(self.N, 2))
@@ -174,9 +175,17 @@ class ParticleFilterSLAM:
             noise_y = np.zeros((self.N,))
 
         for i, p in enumerate(self.particles):
-            p.x += dx + noise_xy[i, 0]
-            p.y += dy + noise_xy[i, 1]
+            # body -> world using particle yaw
+            c = math.cos(p.yaw)
+            s = math.sin(p.yaw)
+            dx_w = c * dx_b - s * dy_b
+            dy_w = s * dx_b + c * dy_b
+
+            p.x += dx_w + noise_xy[i, 0]
+            p.y += dy_w + noise_xy[i, 1]
             p.yaw = wrap(p.yaw + dyaw + noise_y[i])
+
+
 
     def update(self, meas_body: List[Tuple[float, float, int]]):
         """
