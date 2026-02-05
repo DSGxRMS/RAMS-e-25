@@ -1,183 +1,235 @@
 #!/usr/bin/env python3
-# controls_node.py
-
-import time
-import math
-import numpy as np
-
 import rclpy
-from rclpy.node import Node
+from rclpy.time import Time
+import threading, time, math
+import numpy as np
+import matplotlib.pyplot as plt
 
-from nav_msgs.msg import Odometry, Path
-from ackermann_msgs.msg import AckermannDriveStamped
+# Import your custom modules
+from control_v2.ros_connect import ROSInterface
+from control_v2.control_utils import *
+from control_v2.telemetryplot import TelemetryVisualizer, generate_turning_arc
 
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-
-from .utils.control_utils import (
-    PID,
-    compute_signed_curvature,
-    local_closest_index,
-    preprocess_path,
-    calc_lookahead_point,
-    pure_pursuit_steer,
-)
-
-MAX_VELOCITY = 1.0
-VEL_LIMIT_FACTOR = 0.3
-LOOK_AHEAD_UPDATE_INTERVAL = 1.2
+# ================================
+# Control Constants
+# ================================
+MAX_VELOCITY = 1.5
+VEL_LIMIT_FACTOR = 0.6   # Slow down more in corners to prevent overshoot
 ROUTE_IS_LOOP = False
-STOP_SPEED_THRESHOLD = -10
-WHEELBASE_M = 1.5
-MAX_STEER_RAD = math.pi / 2
+STOP_SPEED_THRESHOLD = -10.1
+WHEELBASE_M = 1.5 
+MAX_STEER_RAD = 0.7 
 
+# Optimization Constants
+PREDICTION_DT = 0.4      # Reduced to 0.4s for tighter reaction on circles
+SEARCH_START_IDX = 2    
+SEARCH_END_IDX = 12      # Reduced search horizon to prevent cutting corners too early
+STEP_SIZE = 1            # Check every point for maximum smoothness
 
-def yaw_from_quat(q):
-    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
+# Stability Constants
+STEER_ALPHA = 0.3        # Low Pass Filter: 0.2 = Smooth/Slow, 1.0 = Instant/Jittery
+CONTINUITY_WEIGHT = 0.5  # Cost penalty per index jump (prevents teleporting)
+SATURATION_WEIGHT = 15.0 # Cost penalty for exceeding steering limits
 
+# ================================
+# Visualization Constants
+# ================================
+VIZ_UPDATE_HZ = 20
 
-class ControlsNode(Node):
-    def __init__(self):
-        super().__init__("controls_node")
+def main():
+    rclpy.init()
+    node = ROSInterface()
+    
+    # CRITICAL: Sync with Simulator Clock
+    node.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
-        self.odom_topic = "/slam/odom"
-        self.path_topic = "/path_points"
-        self.cmd_topic = "/cmd"
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+    threading.Thread(target=executor.spin, daemon=True).start()
 
-        # ---- Best-effort QoS for subscriptions ----
-        sub_qos = QoSProfile(
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            durability=QoSDurabilityPolicy.VOLATILE,
-        )
+    th_pid = PID(3.2, 0, 0)
+    
+    print("⏳ Waiting for first odometry message...")
+    while True:
+        cx, cy, yaw, speed, have_odom = node.get_state()
+        if have_odom:
+            print(f"✅ First position received.")
+            break
+        time.sleep(0.1)
 
-        # ---- State ----
-        self.cx = 0.0
-        self.cy = 0.0
-        self.yaw = 0.0
-        self.speed = 0.0
-        self.have_odom = False
-        self.latest_path = None
+    input("Press Enter to start control loop...")
 
-        # ---- Sub / Pub ----
-        self.create_subscription(Odometry, self.odom_topic, self._odom_cb, sub_qos)
-        self.create_subscription(Path, self.path_topic, self._path_cb, sub_qos)
+    # ---------------------------------------------------------
+    # STATE INITIALIZATION
+    # ---------------------------------------------------------
+    # Time Tracking
+    last_ros_time = node.get_clock().now()
+    last_viz_update_real = time.perf_counter() 
+    
+    # "Memory" variables for stability (The Hysteresis)
+    prev_best_idx = 0       
+    filtered_steer = 0.0    
+    
+    cur_idx = 0
+    viz = None
+    path_yaws = [] 
 
-        # Keep publisher default unless your /cmd expects best-effort too
-        self.cmd_pub = self.create_publisher(AckermannDriveStamped, self.cmd_topic, 10)
+    plt.ion()
 
-        self.th_pid = PID(3.2, 0, 0)
+    while rclpy.ok():
+        # 1. Time Management (Simulator Clock)
+        current_ros_time = node.get_clock().now()
+        dt_nano = (current_ros_time - last_ros_time).nanoseconds
+        dt = dt_nano / 1e9 
+        last_ros_time = current_ros_time
+        
+        # Skip small steps to protect PID/save CPU
+        if dt < 0.001: 
+            time.sleep(0.001)
+            continue
 
-        self.last_lookahead_update = 0.0
-        self.last_control_time = time.perf_counter()
-        self.cur_idx = 0
+        # 2. Perception & Path
+        new_path = node.get_path()
+        if not new_path:
+            time.sleep(0.05)
+            continue
+            
+        path_points = np.array(new_path)
+        route_x, route_y = path_points[:, 0], path_points[:, 1]
+        
+        # Calculate Path Headings (Cache)
+        if len(path_yaws) != len(route_x):
+            if len(route_x) > 1:
+                dx = np.gradient(route_x)
+                dy = np.gradient(route_y)
+                path_yaws = np.arctan2(dy, dx)
+            else:
+                path_yaws = np.zeros(len(route_x))
 
-        self.look_ahead_x = None
-        self.look_ahead_y = None
-        self.look_ahead_dist = 0.0
-        self.look_ahead_idx = 0
+        if viz is None:
+            viz = TelemetryVisualizer(route_x, route_y, np.full_like(route_x, MAX_VELOCITY))
+            plt.show()
 
-        self.timer = self.create_timer(0.05, self._step)
-
-    def _odom_cb(self, msg: Odometry):
-        self.cx = float(msg.pose.pose.position.x)
-        self.cy = float(msg.pose.pose.position.y)
-        self.yaw = yaw_from_quat(msg.pose.pose.orientation)
-
-        vx = float(msg.twist.twist.linear.x)
-        vy = float(msg.twist.twist.linear.y)
-        self.speed = math.sqrt(vx * vx + vy * vy)
-
-        self.have_odom = True
-
-    def _path_cb(self, msg: Path):
-        self.latest_path = msg
-
-    def _get_path_points(self):
-        if self.latest_path is None:
-            return np.array([]), np.array([])
-        pts = self.latest_path.poses
-        if len(pts) == 0:
-            return np.array([]), np.array([])
-
-        route_x = np.array([p.pose.position.x for p in pts], dtype=float)
-        route_y = np.array([p.pose.position.y for p in pts], dtype=float)
-        return route_x, route_y
-
-    def _publish_cmd(self, steering_rad, target_speed, accel_cmd):
-        msg = AckermannDriveStamped()
-        msg.drive.steering_angle = float(steering_rad)
-        msg.drive.speed = float(target_speed)
-        msg.drive.acceleration = float(accel_cmd)
-        self.cmd_pub.publish(msg)
-
-    def _step(self):
-        if not self.have_odom:
-            return
-
-        route_x, route_y = self._get_path_points()
-        if route_x.size < 3:
-            return
-
-        now = time.perf_counter()
-        dt = now - self.last_control_time
-        self.last_control_time = now
-
+        # 3. Localization
         curve = compute_signed_curvature(route_x, route_y)
+        cx, cy, yaw, speed, have_odom = node.get_state()
+        cur_idx = local_closest_index((cx, cy), route_x, route_y, cur_idx, loop=ROUTE_IS_LOOP)
+        
+        # ---------------------------------------------------------
+        # 4. OPTIMIZATION LOOP (Run EVERY Frame)
+        # ---------------------------------------------------------
+        best_cost = float('inf')
+        
+        # Default fallback: stick to previous plan or look slightly ahead
+        best_idx = max(cur_idx, prev_best_idx)
+        best_steer_req = filtered_steer # Default to keeping wheel steady
+        best_pred_xy = (cx, cy)
+        
+        # DYNAMIC SEARCH WINDOW:
+        # Prevent looking backwards. Search starts from where we were last time, 
+        # or the car's current position, whichever is further along.
+        start_search = max(cur_idx + SEARCH_START_IDX, prev_best_idx)
+        end_search = min(len(route_x)-1, cur_idx + SEARCH_END_IDX)
+        
+        # Reset previous index if the car has looped or we reset the path
+        if start_search >= end_search:
+            start_search = cur_idx + SEARCH_START_IDX
+            prev_best_idx = cur_idx # Reset memory
+        
+        for i in range(start_search, end_search, STEP_SIZE):
+            tx, ty = route_x[i], route_y[i]
+            
+            # A. Inverse Kinematics (Geometric Steering)
+            steer_req = get_steering_to_point(cx, cy, yaw, tx, ty, WHEELBASE_M)
+            
+            # Clamp for physics prediction (simulating reality)
+            valid_steer = max(-MAX_STEER_RAD, min(MAX_STEER_RAD, steer_req))
 
-        self.cur_idx = local_closest_index((self.cx, self.cy), route_x, route_y, self.cur_idx, loop=ROUTE_IS_LOOP)
-        if np.ndim(self.cur_idx) > 0:
-            self.cur_idx = self.cur_idx[0]
-        self.cur_idx = int(self.cur_idx)
+            # B. Forward Prediction
+            approx_arc_curve = math.tan(valid_steer) / WHEELBASE_M
+            # Predict using a conservative speed (don't assume we can drift)
+            pred_v = min(max(speed, 1.0), 3.0) 
+            px, py, pyaw = predict_bicycle_state(cx, cy, yaw, pred_v, valid_steer, WHEELBASE_M, PREDICTION_DT)
+            
+            # C. Trajectory Cost
+            cost, _ = calculate_trajectory_cost(px, py, pyaw, route_x, route_y, path_yaws, i)
+            
+            # --- STABILITY TERM 1: Saturation Penalty ---
+            # Penalize points that require impossible steering angles
+            if abs(steer_req) > MAX_STEER_RAD:
+                cost += (abs(steer_req) - MAX_STEER_RAD) * SATURATION_WEIGHT
 
-        if now - self.last_lookahead_update >= LOOK_AHEAD_UPDATE_INTERVAL:
-            self.last_lookahead_update = now
-            _, _, s, route_len = preprocess_path(route_x, route_y, loop=ROUTE_IS_LOOP)
-            self.look_ahead_x, self.look_ahead_y, self.look_ahead_dist, self.look_ahead_idx = calc_lookahead_point(
-                self.speed, route_x, route_y, self.cur_idx, s, route_len, loop=ROUTE_IS_LOOP
+            # --- STABILITY TERM 2: Continuity (Hysteresis) ---
+            # Penalize jumping far from the previous index
+            dist_from_prev = abs(i - prev_best_idx)
+            cost += dist_from_prev * CONTINUITY_WEIGHT
+
+            if cost < best_cost:
+                best_cost = cost
+                best_idx = i
+                best_steer_req = steer_req
+                best_pred_xy = (px, py)
+
+        # Update Memory
+        prev_best_idx = best_idx 
+
+        # ---------------------------------------------------------
+        # 5. CONTROL OUTPUT & SMOOTHING
+        # ---------------------------------------------------------
+        
+        # Clamp the requested steering to limits
+        raw_target_steer = max(-MAX_STEER_RAD, min(MAX_STEER_RAD, best_steer_req))
+        
+        # --- STABILITY TERM 3: Low Pass Filter ---
+        # Smooth out the high-frequency jitter
+        # Formula: New = (Alpha * Target) + ((1-Alpha) * Old)
+        filtered_steer = (STEER_ALPHA * raw_target_steer) + ((1.0 - STEER_ALPHA) * filtered_steer)
+        
+        steering_norm = filtered_steer / MAX_STEER_RAD
+
+        # 6. Speed Control (Longitudinal)
+        # Slow down based on the *actual filtered* steering being applied
+        safe_idx = min(best_idx, len(curve) - 1)
+        
+        # Calculate speed limit based on steering angle (heavier steering = slower speed)
+        target_speed = MAX_VELOCITY * (1.0 - (VEL_LIMIT_FACTOR * abs(steering_norm)))
+        target_speed = max(1.0, min(MAX_VELOCITY, target_speed))
+
+        accel_cmd = th_pid.update(target_speed - speed, dt=dt)
+        accel_cmd = max(-3.0, min(3.0, accel_cmd))
+
+        # 7. Visualization (Wall Time)
+        if viz is not None:
+            viz.update_path_data(route_x, route_y, np.full_like(route_x, MAX_VELOCITY))
+            arc_pts = generate_turning_arc(cx, cy, yaw, filtered_steer, WHEELBASE_M)
+            
+            viz.log_state(
+                x=cx, y=cy, yaw=yaw, speed=speed,
+                steering_cmd=steering_norm,
+                lookahead_pt=(route_x[best_idx], route_y[best_idx]),
+                future_pts=[best_pred_xy], 
+                arc_pts=arc_pts,
+                target_speed=target_speed
             )
 
-        if self.look_ahead_x is not None:
-            steering_norm = pure_pursuit_steer(
-                (self.cx, self.cy), self.yaw, self.look_ahead_x, self.look_ahead_y, self.look_ahead_dist
-            )
-        else:
-            steering_norm = 0.0
+            if time.perf_counter() - last_viz_update_real >= (1.0 / VIZ_UPDATE_HZ):
+                viz.update_plot_manual()
+                plt.pause(0.001)
+                last_viz_update_real = time.perf_counter()
 
-        actual_steering_rad = steering_norm * MAX_STEER_RAD
+        # 8. Actuation
+        node.send_command(steering=filtered_steer, speed=target_speed, accel=accel_cmd)
 
-        safe_idx = min(self.cur_idx, len(curve) - 1)
-        target_speed = MAX_VELOCITY * (1 - VEL_LIMIT_FACTOR * abs(curve[safe_idx]))
+        # 9. Stop Condition
+        if (not ROUTE_IS_LOOP) and cur_idx >= len(route_x) - 5 and speed < STOP_SPEED_THRESHOLD:
+            print("✅ End of route.")
+            break
+        
+        time.sleep(0.05) 
 
-        speed_error = target_speed - self.speed
-        accel_cmd = self.th_pid.update(speed_error, dt=dt)
-        accel_cmd = max(-3.0, min(2.0, accel_cmd))
+    rclpy.shutdown()
+    plt.ioff()
+    plt.show()
 
-        self._publish_cmd(actual_steering_rad, target_speed, accel_cmd)
-
-        if (not ROUTE_IS_LOOP) and self.cur_idx >= len(route_x) - 1 and self.speed < STOP_SPEED_THRESHOLD:
-            rclpy.shutdown()
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = ControlsNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
