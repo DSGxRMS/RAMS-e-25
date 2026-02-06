@@ -57,7 +57,7 @@ def main():
             break
         time.sleep(0.1)
 
-    input("Press Enter to start control loop...")
+    # input("Press Enter to start control loop...")
 
     # ---------------------------------------------------------
     # STATE INITIALIZATION
