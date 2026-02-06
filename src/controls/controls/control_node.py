@@ -6,9 +6,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Import your custom modules
-from control_v2.ros_connect import ROSInterface
-from control_v2.control_utils import *
-from control_v2.telemetryplot import TelemetryVisualizer, generate_turning_arc
+from controls.ros_connect import ROSInterface
+from controls.control_utils import *
+from controls.telemetryplot import TelemetryVisualizer, generate_turning_arc
 
 # ================================
 # Control Constants
