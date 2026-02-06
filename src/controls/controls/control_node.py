@@ -71,7 +71,7 @@ def main():
     filtered_steer = 0.0    
     
     cur_idx = 0
-    viz = None
+    viz = 0
     path_yaws = [] 
 
     plt.ion()
