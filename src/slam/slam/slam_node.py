@@ -2,6 +2,7 @@
 import math
 import bisect
 import random
+from dataclasses import dataclass
 from collections import deque
 from typing import List, Tuple, Optional
 
@@ -39,9 +40,27 @@ def stamp_from_float_seconds(t: float):
     return rclpy.time.Time(seconds=sec, nanoseconds=nanosec).to_msg()
 
 
+@dataclass
+class ConeTrack:
+    x: float
+    y: float
+    cls_id: int
+    last_seen: float
+    hits: int = 1
+
+
 class PFSlamNode(Node):
     """
-    PF-SLAM node + snap-back correction for yaw/pose drift.
+    PF-SLAM node + snap-back correction.
+    Also maintains a rolling LOCAL map window (tracks) with aging,
+    so the system doesn't accumulate permanent corruption.
+
+    Key behavior:
+      - Maintain track list in 'map' frame (after output correction).
+      - Update tracks by NN association from current observations projected into map.
+      - Age out tracks not seen for local.max_age_sec seconds.
+      - Publish map cones from tracks (optional gating by hits).
+      - Use tracks (not PF landmarks) as the reference map for snap-back.
     """
 
     def __init__(self):
@@ -53,13 +72,20 @@ class PFSlamNode(Node):
         self.declare_parameter("topics.slam_odom_out", "/slam/odom")
         self.declare_parameter("topics.map_cones_out", "/slam/map_cones")
 
-        # QoS (200 is a mistake for sensor streams)
+        # QoS
         self.declare_parameter("qos.best_effort", True)
         self.declare_parameter("qos.depth", 3)
         self.declare_parameter("odom_buffer_sec", 5.0)
 
         # Drop stale cone frames (sim lag / low RTF protection)
         self.declare_parameter("cones.max_age_sec", 0.20)
+
+        # Rolling local "map" window (track store)
+        self.declare_parameter("local.enable", True)
+        self.declare_parameter("local.max_age_sec", 5.0)
+        self.declare_parameter("local.assoc_dist_m", 0.9)
+        self.declare_parameter("local.ema_alpha", 0.35)
+        self.declare_parameter("local.min_hits_publish", 2)
 
         # Snap-back loop closure
         self.declare_parameter("lc.enable", True)
@@ -70,7 +96,7 @@ class PFSlamNode(Node):
         self.declare_parameter("lc.ransac_iters", 80)
         self.declare_parameter("lc.max_yaw_deg", 12.0)
         self.declare_parameter("lc.max_trans_m", 2.0)
-        self.declare_parameter("lc.min_map_cones", 60)
+        self.declare_parameter("lc.min_map_cones", 20)   # lowered because we now use local tracks
         self.declare_parameter("lc.min_obs_cones", 8)
 
         gp = self.get_parameter
@@ -84,6 +110,14 @@ class PFSlamNode(Node):
         self.odom_buffer_sec = float(gp("odom_buffer_sec").value)
         self.cones_max_age = float(gp("cones.max_age_sec").value)
 
+        # local tracks
+        self.local_enable = bool(gp("local.enable").value)
+        self.local_max_age = float(gp("local.max_age_sec").value)
+        self.local_assoc_dist = float(gp("local.assoc_dist_m").value)
+        self.local_ema_alpha = float(gp("local.ema_alpha").value)
+        self.local_min_hits_publish = int(gp("local.min_hits_publish").value)
+
+        # loop closure
         self.lc_enable = bool(gp("lc.enable").value)
         self.lc_rate_hz = float(gp("lc.rate_hz").value)
         self.lc_inlier_dist = float(gp("lc.inlier_dist_m").value)
@@ -137,6 +171,9 @@ class PFSlamNode(Node):
         # loop closure scheduling
         self.last_lc_time = -1e9
 
+        # rolling local tracks (map frame, corrected)
+        self.tracks: List[ConeTrack] = []
+
         self.get_logger().info(
             f"[pf_slam] odom_in={self.odom_topic}, cones_in={self.cones_topic}, "
             f"slam_odom_out={self.slam_odom_topic}, map_cones_out={self.map_cones_topic}"
@@ -188,15 +225,67 @@ class PFSlamNode(Node):
         self.corr_t = (R_new @ self.corr_t) + t_new
         self.corr_R = R_new @ self.corr_R
 
+    # ---------------------- Rolling local tracks ----------------------
+
+    def _prune_tracks(self, t_now: float):
+        if not self.local_enable:
+            return
+        age = self.local_max_age
+        self.tracks = [tr for tr in self.tracks if (t_now - tr.last_seen) <= age]
+
+    def _update_tracks_from_obs_map(self, t_now: float, obs_map: List[Tuple[float, float, int]]):
+        """
+        obs_map: list of (mx, my, cls_id) in corrected map frame
+        """
+        if not self.local_enable:
+            return
+
+        self._prune_tracks(t_now)
+        assoc2 = self.local_assoc_dist ** 2
+        a = self.local_ema_alpha
+
+        # Greedy NN association per observation
+        for mx, my, cls_id in obs_map:
+            best_i = None
+            best_d2 = None
+            for i, tr in enumerate(self.tracks):
+                if tr.cls_id != cls_id:
+                    continue
+                dx = tr.x - mx
+                dy = tr.y - my
+                d2 = dx * dx + dy * dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best_i = i
+
+            if best_i is not None and best_d2 is not None and best_d2 <= assoc2:
+                tr = self.tracks[best_i]
+                tr.x = (1.0 - a) * tr.x + a * mx
+                tr.y = (1.0 - a) * tr.y + a * my
+                tr.last_seen = t_now
+                tr.hits += 1
+            else:
+                self.tracks.append(ConeTrack(x=mx, y=my, cls_id=cls_id, last_seen=t_now, hits=1))
+
     # ---------------------- Loop closure / snap-back ----------------------
 
     def _build_map_points(self):
-        # Use PF best-particle landmarks as the "map" for snap-back.
+        """
+        Reference map for snap-back:
+          Prefer local tracks (rolling window).
+          Fallback to PF best-particle landmarks if tracks are disabled/empty.
+        """
+        pts_by_cls = {}
+
+        if self.local_enable and self.tracks:
+            for tr in self.tracks:
+                pts_by_cls.setdefault(int(tr.cls_id), []).append((float(tr.x), float(tr.y)))
+            return pts_by_cls
+
         best = self.pf.get_best_particle()
         if best is None:
             return {}
 
-        pts_by_cls = {}
         for lm in best.landmarks:
             cls_id = int(lm.cls)
             x = float(lm.mean[0])
@@ -213,7 +302,7 @@ class PFSlamNode(Node):
             mx = x + cy * bx - sy * by
             my = y + sy * bx + cy * by
             mx, my = self._apply_corr_to_point(mx, my)
-            out.append((mx, my, cls_id))
+            out.append((mx, my, int(cls_id)))
         return out
 
     def _nn_inliers(self, obs_map, map_by_cls, dist_thr: float) -> int:
@@ -271,7 +360,6 @@ class PFSlamNode(Node):
 
         base_inliers = self._nn_inliers(obs_map, map_by_cls, self.lc_inlier_dist)
 
-        # bucket obs by class for sampling
         obs_by_cls = {}
         for ox, oy, cls_id in obs_map:
             obs_by_cls.setdefault(cls_id, []).append((ox, oy))
@@ -314,7 +402,6 @@ class PFSlamNode(Node):
             if float(np.linalg.norm(t)) > self.lc_max_trans:
                 continue
 
-            # score
             inl = 0
             for ox, oy, cls_id in obs_map:
                 p = np.array([ox, oy], dtype=np.float64)
@@ -341,7 +428,6 @@ class PFSlamNode(Node):
         inliers, R_best, t_best, dth_best = best
         ratio = inliers / max(len(obs_map), 1)
 
-        # acceptance
         if inliers < self.lc_min_inliers:
             return
         if ratio < self.lc_min_ratio:
@@ -375,7 +461,7 @@ class PFSlamNode(Node):
         # drop stale frames if sim is lagging
         t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
         t_now = self.get_clock().now().nanoseconds * 1e-9
-        
+
         if (t_now - t_c) > 0.2:
             return
         if (t_now - t_c) > self.cones_max_age:
@@ -391,6 +477,9 @@ class PFSlamNode(Node):
             return
 
         if not meas_body:
+            # still age out local tracks over time
+            self._prune_tracks(t_c)
+            self._publish_map_cones(t_c)
             return
 
         pose_now = self._pose_at(t_c)
@@ -398,7 +487,7 @@ class PFSlamNode(Node):
             return
         x_o, y_o, yaw_o = pose_now
 
-        # --------- PF motion (IMPORTANT: use BODY-FRAME increments) ---------
+        # --------- PF motion (BODY-FRAME increments) ---------
         if not self.slam_initialised or self.last_cone_odom_pose is None:
             self.pf.init_pose(x_o, y_o, yaw_o)
             self.slam_initialised = True
@@ -429,13 +518,19 @@ class PFSlamNode(Node):
         # corrected pose BEFORE snap-back attempt
         x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
 
-        # snap-back: tries to fix yaw/pose drift by aligning obs to map landmarks
+        # Build obs in corrected map frame using corrected pose
+        obs_map = self._obs_body_to_map(x_pub, y_pub, yaw_pub, meas_body)
+
+        # Update rolling local tracks (association + 5s aging)
+        self._update_tracks_from_obs_map(t_c, obs_map)
+
+        # snap-back: align obs to local tracks (or PF map fallback)
         self._try_snap_back(t_c, x_pub, y_pub, yaw_pub, meas_body)
 
         # corrected pose AFTER snap-back (corr may have changed)
         x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
 
-        # publish corrected odom + corrected map
+        # publish corrected odom + rolling map
         self._publish_slam_odom(t_c, x_pub, y_pub, yaw_pub)
         self._publish_map_cones(t_c)
 
@@ -460,20 +555,47 @@ class PFSlamNode(Node):
         self.pub_slam_odom.publish(od)
 
     def _publish_map_cones(self, t: float):
-        best = self.pf.get_best_particle()
-        if best is None:
-            return
-
         msg = ConeArrayWithCovariance()
         msg.header.stamp = stamp_from_float_seconds(t)
         msg.header.frame_id = "map"
+
+        if self.local_enable and self.tracks:
+            # publish local tracks only
+            for tr in self.tracks:
+                if tr.hits < self.local_min_hits_publish:
+                    continue
+                cone = ConeWithCovariance()
+                cone.point.x = float(tr.x)
+                cone.point.y = float(tr.y)
+                cone.point.z = 0.0
+
+                if tr.cls_id == 0:
+                    msg.blue_cones.append(cone)
+                elif tr.cls_id == 1:
+                    msg.yellow_cones.append(cone)
+                elif tr.cls_id == 2:
+                    msg.orange_cones.append(cone)
+                elif tr.cls_id == 3:
+                    msg.big_orange_cones.append(cone)
+                else:
+                    try:
+                        msg.unknown_color_cones.append(cone)
+                    except AttributeError:
+                        pass
+
+            self.pub_map_cones.publish(msg)
+            return
+
+        # fallback: publish PF best particle landmarks (corrected)
+        best = self.pf.get_best_particle()
+        if best is None:
+            return
 
         for lm in best.landmarks:
             x = float(lm.mean[0])
             y = float(lm.mean[1])
             cls_id = int(lm.cls)
 
-            # apply output correction to landmarks too
             x, y = self._apply_corr_to_point(x, y)
 
             cone = ConeWithCovariance()
