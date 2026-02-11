@@ -13,7 +13,8 @@ Then, build the ros packages
 colcon build --symlink-install
 ```
 Store the package runner in ~/.bashrc for further use
-```echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc 
+```
+echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc 
 ```
 Restart the terminal (sources the package)
 
