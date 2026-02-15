@@ -109,7 +109,7 @@ class ImuWheelEKF(Node):
         self.bias_window_s = float(P("run.bias_window_s"))
         self.bias_min_samples = int(P("run.bias_min_samples"))
 
-        self.log_enable = bool(P("log.enable"))
+        self.log_enable = bool(0)
         self.cli_hz = float(P("log.cli_hz"))
 
         self.imu_use_rate_hz = float(P("input.imu_use_rate_hz"))

@@ -1,169 +1,161 @@
 #!/usr/bin/env python3
-# pp_debug.py
+# slam_path_sector_visualiser.py
 #
-# Live debug plotter for /path_points (nav_msgs/Path) + /slam/map_cones.
-# - Plots cones and car pose.
-# - Plots received path points as scatter (NOT joined).
-# - Fits and plots a B-spline through the received poses.
+# Visualiser for SLAM cone map using a sector FOV:
+#   - Subscribes to /slam/odom (nav_msgs/Odometry)
+#   - Subscribes to /slam/map_cones (eufs_msgs/ConeArrayWithCovariance)
+#   - FOV is a circular sector:
+#       * vertex 5 m behind car along heading
+#       * radius 30 m (from vertex) => about -5..+25 m along heading
+#       * total angle 60° (±30° around heading)
+#   - Inside the FOV:
+#       * Build Delaunay (or k-NN) edges on cones
+#       * Apply constraints:
+#           - edge length < 6 m (as currently configured)
+#           - drop blue-blue and yellow-yellow edges
+#           - drop any orange-like ↔ (blue or yellow) edges
+#           - keep orange-like ↔ orange-like and blue-yellow
+#       * For each edge, compute centroid; then:
+#           - enforce ≥ 1 m spacing between centroids, keeping the farther
+#             one from the car in each cluster
+#           - drop any centroid within 0.5 m of the car pose
+#           - plot an "X" at each kept centroid
+#           - additionally, if edge is big-orange ↔ big-orange, mark that
+#             centroid with a green square
+#       * Build a greedy NN path from car through all kept centroids,
+#         draw as cyan polyline.
 #
-# Notes:
-# - Requires: matplotlib, scipy
-# - If SciPy is missing, this node will log an error and plot only the scatter points.
-
 import math
 import threading
-from typing import List, Tuple, Optional
-
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
-
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
-from eufs_msgs.msg import ConeArrayWithCovariance
+from typing import List, Tuple
 
 import numpy as np
 
-# Matplotlib
-import matplotlib.pyplot as plt
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    QoSHistoryPolicy,
+    QoSReliabilityPolicy,
+    QoSDurabilityPolicy,
+)
 
-# SciPy spline fitting (preferred)
+from nav_msgs.msg import Odometry
+from eufs_msgs.msg import ConeArrayWithCovariance
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+
+# Optional SciPy-based Delaunay
 try:
-    from scipy.interpolate import splprep, splev
+    from scipy.spatial import Delaunay
     _HAS_SCIPY = True
-except Exception:
+except ImportError:
+    Delaunay = None
     _HAS_SCIPY = False
 
 
 def yaw_from_quat(qx, qy, qz, qw) -> float:
-    """Return yaw (rad) from quaternion."""
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-class PPDebug(Node):
+def wrap(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+class SlamPathSectorVisualizer(Node):
     def __init__(self):
-        super().__init__("pp_debug")
+        super().__init__("slam_path_sector_visualiser")
 
-        # ---------------- Parameters ----------------
-        self.declare_parameter("topics.path_in", "/path_points")
+        # ---- Parameters ----
+        self.declare_parameter("topics.odom_in", "/slam/odom")
         self.declare_parameter("topics.map_in", "/slam/map_cones")
-
-        self.declare_parameter("plot.hz", 20.0)
-
-        # Spline params
-        self.declare_parameter("spline.include_car_pose", True)   # include pose[0] in spline fit
-        self.declare_parameter("spline.smoothing", 0.5)           # s in splprep (0 = interpolate)
-        self.declare_parameter("spline.num_samples", 200)
-
-        # Plotting params
-        self.declare_parameter("plot.window_lock", False)         # if True, do not auto-rescale
-        self.declare_parameter("plot.padding_m", 5.0)
-
-        # QoS
         self.declare_parameter("qos.best_effort", True)
         self.declare_parameter("qos.depth", 50)
 
+        # Sector FOV parameters
+        # Vertex is at -5 m along heading from car
+        self.declare_parameter("fov.vertex_offset_m", -5.0)
+        # From vertex, radius so that we reach 25 m ahead of car: 30 m
+        self.declare_parameter("fov.radius_m", 30.0)
+        # Total FOV angle in degrees (around heading)
+        self.declare_parameter("fov.angle_deg", 60.0)
+
         gp = self.get_parameter
-        self.path_topic = str(gp("topics.path_in").value)
-        self.map_topic = str(gp("topics.map_in").value)
-
-        self.plot_hz = float(gp("plot.hz").value)
-        self.plot_period = 1.0 / max(1e-6, self.plot_hz)
-
-        self.include_car_pose = bool(gp("spline.include_car_pose").value)
-        self.spline_s = float(gp("spline.smoothing").value)
-        self.spline_num = int(gp("spline.num_samples").value)
-
-        self.window_lock = bool(gp("plot.window_lock").value)
-        self.padding_m = float(gp("plot.padding_m").value)
-
+        odom_topic = str(gp("topics.odom_in").value)
+        map_topic = str(gp("topics.map_in").value)
         best_effort = bool(gp("qos.best_effort").value)
         depth = int(gp("qos.depth").value)
+
+        self.vertex_offset = float(gp("fov.vertex_offset_m").value)
+        self.fov_radius = float(gp("fov.radius_m").value)
+        self.fov_angle_deg = float(gp("fov.angle_deg").value)
+        self.fov_half_rad = math.radians(self.fov_angle_deg * 0.5)
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=depth,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT if best_effort else QoSReliabilityPolicy.RELIABLE,
+            reliability=(
+                QoSReliabilityPolicy.BEST_EFFORT
+                if best_effort
+                else QoSReliabilityPolicy.RELIABLE
+            ),
             durability=QoSDurabilityPolicy.VOLATILE,
         )
 
-        # ---------------- State ----------------
-        self.lock = threading.Lock()
+        # ---- Subscriptions ----
+        self.create_subscription(Odometry, odom_topic, self.cb_odom, qos)
+        self.create_subscription(ConeArrayWithCovariance, map_topic, self.cb_map, qos)
 
-        # Latest path message info
-        self.frame_id: str = "map"
-        self.car_pose: Optional[Tuple[float, float, float]] = None  # (x,y,yaw)
-        self.path_points: List[Tuple[float, float]] = []            # remaining points (excluding car pose)
+        # ---- State ----
+        self.car_x = None
+        self.car_y = None
+        self.car_yaw = None  # radians
 
-        # Cones
-        self.blue: List[Tuple[float, float]] = []
-        self.yellow: List[Tuple[float, float]] = []
-        self.orange: List[Tuple[float, float]] = []
-        self.big: List[Tuple[float, float]] = []
+        # Global map cones in map frame
+        self.blue_global: List[Tuple[float, float]] = []
+        self.yellow_global: List[Tuple[float, float]] = []
+        self.orange_global: List[Tuple[float, float]] = []
+        self.big_global: List[Tuple[float, float]] = []
 
-        # ---------------- Subscriptions ----------------
-        self.create_subscription(Path, self.path_topic, self.cb_path, qos)
-        self.create_subscription(ConeArrayWithCovariance, self.map_topic, self.cb_map, qos)
+        self.data_lock = threading.Lock()
 
-        # ---------------- Plot setup ----------------
-        plt.ion()
+        # ---- Matplotlib figure ----
         self.fig, self.ax = plt.subplots()
-        self.ax.set_title("pp_debug: /path_points B-spline + cones + car pose")
-        self.ax.set_aspect("equal", adjustable="box")
+        self.ax.set_aspect("equal", adjustable="datalim")
         self.ax.grid(True)
-
-        # Persistent artists (initialized empty)
-        self.scat_blue = self.ax.scatter([], [], label="blue cones")
-        self.scat_yellow = self.ax.scatter([], [], label="yellow cones")
-        self.scat_orange = self.ax.scatter([], [], label="orange cones")
-        self.scat_big = self.ax.scatter([], [], label="big orange cones")
-
-        self.scat_pts = self.ax.scatter([], [], label="path points (raw)")
-
-        self.car_dot, = self.ax.plot([], [], marker="o", linestyle="", label="car")
-        self.car_arrow = None
-
-        self.spline_line, = self.ax.plot([], [], linewidth=2.0, label="B-spline")
-
-        self.ax.legend(loc="upper right")
+        self.ax.set_xlabel("X [m]")
+        self.ax.set_ylabel("Y [m]")
+        self.ax.set_title("Path-planning sector FOV (Delaunay + greedy NN)")
 
         if not _HAS_SCIPY:
-            self.get_logger().error(
-                "[pp_debug] SciPy not available. Install python3-scipy / pip scipy. "
-                "Spline will NOT be drawn."
+            self.get_logger().warn(
+                "[slam_path_sector_visualiser] SciPy not found; "
+                "falling back to k-NN graph instead of true Delaunay."
             )
 
         self.get_logger().info(
-            f"[pp_debug] Subscribing path={self.path_topic}, cones={self.map_topic}, plot_hz={self.plot_hz}"
+            f"[slam_path_sector_visualiser] odom={odom_topic}, map={map_topic}, "
+            f"vertex_offset={self.vertex_offset}m, radius={self.fov_radius}m, "
+            f"angle={self.fov_angle_deg}°"
         )
 
-        # Timer to refresh plot
-        self.create_timer(self.plot_period, self.timer_cb)
+    # --------------------- Callbacks ---------------------
 
-    # ---------------- Callbacks ----------------
-    def cb_path(self, msg: Path):
-        poses = msg.poses
-        if not poses:
-            return
+    def cb_odom(self, msg: Odometry):
+        x = float(msg.pose.pose.position.x)
+        y = float(msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        with self.lock:
-            self.frame_id = msg.header.frame_id.strip() or "map"
-
-            # Pose[0] is current car pose (as published by your upstream node)
-            p0 = poses[0].pose
-            x0 = float(p0.position.x)
-            y0 = float(p0.position.y)
-            q = p0.orientation
-            yaw0 = yaw_from_quat(q.x, q.y, q.z, q.w)
-            self.car_pose = (x0, y0, yaw0)
-
-            # Remaining poses are future points
-            pts = []
-            for ps in poses[1:]:
-                pts.append((float(ps.pose.position.x), float(ps.pose.position.y)))
-            self.path_points = pts
+        with self.data_lock:
+            self.car_x = x
+            self.car_y = y
+            self.car_yaw = yaw
 
     def cb_map(self, msg: ConeArrayWithCovariance):
         blue, yellow, orange, big = [], [], [], []
@@ -177,151 +169,474 @@ class PPDebug(Node):
         for c in msg.big_orange_cones:
             big.append((float(c.point.x), float(c.point.y)))
 
-        with self.lock:
-            self.blue = blue
-            self.yellow = yellow
-            self.orange = orange
-            self.big = big
+        with self.data_lock:
+            self.blue_global = blue
+            self.yellow_global = yellow
+            self.orange_global = orange
+            self.big_global = big
 
-    # ---------------- Spline helpers ----------------
-    def _fit_bspline(self, pts: np.ndarray) -> Optional[np.ndarray]:
+    # --------------------- FOV / graph helpers ---------------------
+
+    def _world_to_local(self, car_x, car_y, car_yaw, px, py):
         """
-        Fit a B-spline through pts (N,2). Returns sampled curve (M,2) or None.
-        Uses SciPy splprep/splev.
-
-        - For small N, automatically reduces spline degree.
+        Transform world -> car frame (x forward, y left).
         """
-        if not _HAS_SCIPY:
-            return None
+        c = math.cos(car_yaw)
+        s = math.sin(car_yaw)
+        dx = px - car_x
+        dy = py - car_y
+        # rotate by -yaw
+        lx =  c * dx + s * dy
+        ly = -s * dx + c * dy
+        return lx, ly
 
-        n = pts.shape[0]
-        if n < 2:
-            return None
+    def _compute_fov_points(self, car_x, car_y, car_yaw):
+        """
+        Select cones within the circular sector FOV.
 
-        # Reduce degree if too few points (splprep requires m > k)
-        k = min(3, n - 1)
-        if k < 1:
-            return None
+        Sector is defined in car-local coordinates with:
+          - vertex at (vertex_offset, 0)  [vertex_offset is negative => behind car]
+          - radius = self.fov_radius
+          - central direction = +x axis (car heading)
+          - FOV half-angle = self.fov_half_rad around +x, measured from vertex
+        """
+        vertex_offset = self.vertex_offset
+        R = self.fov_radius
+        half_angle = self.fov_half_rad
 
-        # Parameterize and fit
-        x = pts[:, 0]
-        y = pts[:, 1]
+        points_window: List[Tuple[float, float]] = []
+        classes_window: List[str] = []
 
-        # s controls smoothing; s=0 -> interpolating spline
-        try:
-            tck, _u = splprep([x, y], s=self.spline_s, k=k)
-            uu = np.linspace(0.0, 1.0, max(20, self.spline_num))
-            out = splev(uu, tck)
-            curve = np.vstack(out).T  # (M,2)
-            return curve
-        except Exception as e:
-            self.get_logger().warn(f"[pp_debug] Spline fit failed: {e}")
-            return None
+        def add_list(cones: List[Tuple[float, float]], cls_name: str):
+            nonlocal points_window, classes_window
+            for (px, py) in cones:
+                lx, ly = self._world_to_local(car_x, car_y, car_yaw, px, py)
+                # Position relative to vertex in local frame
+                vx = lx - vertex_offset
+                vy = ly
+                r = math.hypot(vx, vy)
+                if r > R or r < 1e-3:
+                    continue
+                theta = math.atan2(vy, vx)  # angle w.r.t +x from vertex
+                if abs(theta) <= half_angle:
+                    points_window.append((px, py))
+                    classes_window.append(cls_name)
 
-    # ---------------- Plot refresh ----------------
-    def timer_cb(self):
-        with self.lock:
-            car = self.car_pose
-            pts = list(self.path_points)
+        add_list(self.blue_global, "blue")
+        add_list(self.yellow_global, "yellow")
+        add_list(self.orange_global, "orange")
+        add_list(self.big_global, "big")
 
-            blue = list(self.blue)
-            yellow = list(self.yellow)
-            orange = list(self.orange)
-            big = list(self.big)
+        return points_window, classes_window
 
-        # Update scatter data for cones
-        def _set_scatter(sc, data: List[Tuple[float, float]]):
-            if not data:
-                sc.set_offsets(np.empty((0, 2)))
-            else:
-                sc.set_offsets(np.array(data, dtype=float))
+    def _build_edges(self, points_window, classes_window):
+        """
+        Build graph edges on FOV points using Delaunay (if available) or k-NN.
 
-        _set_scatter(self.scat_blue, blue)
-        _set_scatter(self.scat_yellow, yellow)
-        _set_scatter(self.scat_orange, orange)
-        _set_scatter(self.scat_big, big)
+        Constraints:
+          - edge length < 6 m
+          - Drop blue-blue edges
+          - Drop yellow-yellow edges
+          - Drop any orange-like ↔ (blue or yellow) edge
+          - Keep orange-like ↔ orange-like and blue-yellow
+        """
+        N = len(points_window)
+        if N < 2:
+            return []
 
-        # Car pose
-        if car is not None:
-            cx, cy, cyaw = car
-            self.car_dot.set_data([cx], [cy])
+        pts = np.asarray(points_window, dtype=float)
+        edges_set = set()
 
-            # Update heading arrow
-            if self.car_arrow is not None:
-                try:
-                    self.car_arrow.remove()
-                except Exception:
-                    pass
+        if _HAS_SCIPY and N >= 3:
+            tri = Delaunay(pts)
+            for simplex in tri.simplices:
+                i, j, k = int(simplex[0]), int(simplex[1]), int(simplex[2])
+                for a, b in ((i, j), (j, k), (k, i)):
+                    if a > b:
+                        a, b = b, a
+                    edges_set.add((a, b))
+        else:
+            # Fallback: simple k-NN (k up to 3)
+            k = min(3, N - 1)
+            for i in range(N):
+                d2 = np.sum((pts - pts[i]) ** 2, axis=1)
+                d2[i] = float("inf")
+                nn_idx = np.argsort(d2)[:k]
+                for j in nn_idx:
+                    a, b = i, int(j)
+                    if a > b:
+                        a, b = b, a
+                    edges_set.add((a, b))
 
-            arrow_len = 2.0
-            hx = cx + arrow_len * math.cos(cyaw)
-            hy = cy + arrow_len * math.sin(cyaw)
-            self.car_arrow = self.ax.annotate(
-                "",
-                xy=(hx, hy),
-                xytext=(cx, cy),
-                arrowprops=dict(arrowstyle="->", linewidth=2.0),
+        orange_like = {"orange", "big"}
+        blue_yellow = {"blue", "yellow"}
+
+        edges = []
+        max_len2 = 6.0 * 6.0  # 6 m
+
+        for (i, j) in edges_set:
+            ci = classes_window[i]
+            cj = classes_window[j]
+
+            # Length constraint
+            x1, y1 = points_window[i]
+            x2, y2 = points_window[j]
+            d2 = (x1 - x2) ** 2 + (y1 - y2) ** 2
+            if d2 >= max_len2:
+                continue
+
+            # Drop blue-blue and yellow-yellow
+            if (ci == "blue" and cj == "blue") or (ci == "yellow" and cj == "yellow"):
+                continue
+
+            # Drop any orange-like ↔ (blue or yellow) edge
+            if ((ci in orange_like and cj in blue_yellow) or
+               (cj in orange_like and ci in blue_yellow)):
+                continue
+
+            edges.append((i, j))
+
+        return edges
+
+    def _filter_centroids_min_spacing(
+        self,
+        centroids_raw: List[Tuple[float, float, bool]],
+        car_x: float,
+        car_y: float,
+        min_dist: float = 1.0,
+    ) -> List[Tuple[float, float, bool]]:
+        """
+        Enforce that:
+          - no two centroids are closer than min_dist to each other
+          - no centroid is within 0.5 m of the car pose
+
+        centroids_raw: list of (x, y, is_big_big)
+        Strategy:
+          - compute distance from car
+          - sort by distance DESC (farthest first)
+          - greedily keep centroids that are:
+              * ≥ 0.5 m from the car, AND
+              * ≥ min_dist from all already kept centroids
+
+        This matches: "No 2 centroid points should be obtained in less than 1m
+        circle distance - connect to the farther one from the chain" and
+        "ensure a point around 0.5m of the car pose is not registered".
+        """
+        if not centroids_raw:
+            return []
+
+        pts = np.array([[c[0], c[1]] for c in centroids_raw], dtype=float)
+        car = np.array([car_x, car_y], dtype=float)
+        d2_car = np.sum((pts - car) ** 2, axis=1)
+
+        # indices sorted by distance from car (farthest first)
+        order = np.argsort(-d2_car)
+
+        kept_pts = []
+        kept = []
+
+        min_car_dist = 2  # [m] reject centroids inside this radius around car
+
+        for idx in order:
+            p = pts[idx]
+
+            # Reject centroids too close to the car pose
+            if np.linalg.norm(p - car) < min_car_dist:
+                continue
+
+            if not kept_pts:
+                kept_pts.append(p)
+                kept.append(
+                    (float(p[0]), float(p[1]), bool(centroids_raw[idx][2]))
+                )
+                continue
+
+            # Check spacing to all kept
+            too_close = False
+            for kp in kept_pts:
+                if np.linalg.norm(p - kp) < min_dist:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+            kept_pts.append(p)
+            kept.append(
+                (float(p[0]), float(p[1]), bool(centroids_raw[idx][2]))
             )
-        else:
-            self.car_dot.set_data([], [])
 
-        # Raw path points scatter (NOT joined)
-        if pts:
-            self.scat_pts.set_offsets(np.array(pts, dtype=float))
-        else:
-            self.scat_pts.set_offsets(np.empty((0, 2)))
+        return kept
 
-        # Build spline input points (car + path points) or just path points
-        spline_pts_list: List[Tuple[float, float]] = []
-        if self.include_car_pose and car is not None:
-            spline_pts_list.append((car[0], car[1]))
-        spline_pts_list.extend(pts)
+    def _build_greedy_path(self, car_x, car_y, candidate_points: List[Tuple[float, float]]):
+        """
+        Greedy NN path with max step length:
 
-        spline_curve = None
-        if len(spline_pts_list) >= 2:
-            spline_curve = self._fit_bspline(np.array(spline_pts_list, dtype=float))
+          - start at car (car_x, car_y)
+          - repeatedly go to nearest unused candidate
+          - BUT only if the hop distance <= 7 m
 
-        if spline_curve is not None and spline_curve.shape[0] >= 2:
-            self.spline_line.set_data(spline_curve[:, 0], spline_curve[:, 1])
-        else:
-            self.spline_line.set_data([], [])
+        Returns list of world-frame points [p1, p2, ...] in visitation order.
+        """
+        if not candidate_points:
+            return []
 
-        # Auto-scale view (unless locked)
-        if not self.window_lock:
-            all_xy = []
-            if car is not None:
-                all_xy.append((car[0], car[1]))
-            all_xy.extend(pts)
-            all_xy.extend(blue)
-            all_xy.extend(yellow)
-            all_xy.extend(orange)
-            all_xy.extend(big)
+        pts = np.asarray(candidate_points, dtype=float)
+        N = pts.shape[0]
+        used = np.zeros(N, dtype=bool)
+        path_order: List[int] = []
 
-            if all_xy:
-                arr = np.array(all_xy, dtype=float)
-                xmin, ymin = arr.min(axis=0)
-                xmax, ymax = arr.max(axis=0)
-                pad = self.padding_m
+        current = np.array([car_x, car_y], dtype=float)
+        max_step2 = 7.0 * 7.0  # 7 m squared
+
+        for _ in range(N):
+            diff = pts - current
+            d2 = np.sum(diff * diff, axis=1)
+
+            # Mask out already-used points
+            d2[used] = float("inf")
+
+            # Enforce max step length: reject anything beyond 7 m
+            d2[d2 > max_step2] = float("inf")
+
+            idx = int(np.argmin(d2))
+            if not math.isfinite(d2[idx]) or d2[idx] == float("inf"):
+                # No remaining candidate within 7 m – stop the chain
+                break
+
+            used[idx] = True
+            path_order.append(idx)
+            current = pts[idx]
+
+        return [tuple(pts[i]) for i in path_order]
+
+
+    # --------------------- Plot update ---------------------
+
+    def update_plot(self):
+        with self.data_lock:
+            car_x = self.car_x
+            car_y = self.car_y
+            car_yaw = self.car_yaw
+
+            blue_global = list(self.blue_global)
+            yellow_global = list(self.yellow_global)
+            orange_global = list(self.orange_global)
+            big_global = list(self.big_global)
+
+        self.ax.clear()
+        self.ax.set_aspect("equal", adjustable="datalim")
+        self.ax.grid(True)
+        self.ax.set_xlabel("X [m]")
+        self.ax.set_ylabel("Y [m]")
+        self.ax.set_title("Path-planning sector FOV (Delaunay + greedy NN)")
+
+        all_x = []
+        all_y = []
+
+        # Plot all cones (global map)
+        if blue_global:
+            bx, by = zip(*blue_global)
+            self.ax.scatter(bx, by, s=20, c="b", marker="o", label="blue cones")
+            all_x.extend(bx)
+            all_y.extend(by)
+
+        if yellow_global:
+            yx, yy = zip(*yellow_global)
+            self.ax.scatter(
+                yx, yy, s=20, c="y", marker="o", edgecolors="k", label="yellow cones"
+            )
+            all_x.extend(yx)
+            all_y.extend(yy)
+
+        if orange_global:
+            ox, oy = zip(*orange_global)
+            self.ax.scatter(ox, oy, s=20, c="orange", marker="o", label="orange cones")
+            all_x.extend(ox)
+            all_y.extend(oy)
+
+        if big_global:
+            gx, gy = zip(*big_global)
+            self.ax.scatter(
+                gx, gy, s=40, c="magenta", marker="^", label="big orange cones"
+            )
+            all_x.extend(gx)
+            all_y.extend(gy)
+
+        # If we don't have car pose yet, stop here
+        if (car_x is None) or (car_y is None) or (car_yaw is None):
+            if all_x and all_y:
+                xmin, xmax = min(all_x), max(all_x)
+                ymin, ymax = min(all_y), max(all_y)
+                pad = 3.0
+                if xmax - xmin < 1e-3:
+                    xmax = xmin + 1.0
+                if ymax - ymin < 1e-3:
+                    ymax = ymin + 1.0
                 self.ax.set_xlim(xmin - pad, xmax + pad)
                 self.ax.set_ylim(ymin - pad, ymax + pad)
+            return
 
-        # Refresh
-        self.fig.canvas.draw_idle()
-        plt.pause(0.001)
+        # Car pose triangle
+        tri_len = 1.0
+        tri_width = 0.5
+        pts_local = np.array([
+            [tri_len, 0.0],
+            [-tri_len * 0.5, -tri_width],
+            [-tri_len * 0.5, +tri_width],
+        ])
+        c = math.cos(car_yaw)
+        s = math.sin(car_yaw)
+        R = np.array([[c, -s], [s, c]])
+        pts_world = (R @ pts_local.T).T + np.array([car_x, car_y])
+        car_tri = Polygon(
+            pts_world,
+            closed=True,
+            facecolor="black",
+            edgecolor="white",
+            linewidth=1.0,
+            label="car",
+        )
+        self.ax.add_patch(car_tri)
+        all_x.append(car_x)
+        all_y.append(car_y)
+
+        # Draw the FOV sector (dotted)
+        vertex_local = np.array([self.vertex_offset, 0.0])  # in car frame
+        vertex_world = (R @ vertex_local) + np.array([car_x, car_y])
+        vx, vy = vertex_world[0], vertex_world[1]
+
+        # Outer arc
+        arc_points = []
+        R_arc = self.fov_radius
+        for k in range(0, 61):  # 60 segments
+            theta = -self.fov_half_rad + (2.0 * self.fov_half_rad) * (k / 60.0)
+            # point in local frame relative to vertex
+            px_local = self.vertex_offset + R_arc * math.cos(theta)
+            py_local = 0.0 + R_arc * math.sin(theta)
+            p_world = (R @ np.array([px_local, py_local])) + np.array([car_x, car_y])
+            arc_points.append(p_world)
+        arc_points = np.asarray(arc_points)
+        self.ax.plot(arc_points[:, 0], arc_points[:, 1], linestyle=":", color="gray")
+
+        # Two radial edges (vertex -> arc ends)
+        left_theta = -self.fov_half_rad
+        right_theta = self.fov_half_rad
+        for theta in (left_theta, right_theta):
+            end_local = np.array([
+                self.vertex_offset + R_arc * math.cos(theta),
+                0.0 + R_arc * math.sin(theta),
+            ])
+            end_world = (R @ end_local) + np.array([car_x, car_y])
+            self.ax.plot(
+                [vx, end_world[0]],
+                [vy, end_world[1]],
+                linestyle=":",
+                color="gray",
+            )
+
+        # Compute cones inside FOV
+        points_window, classes_window = self._compute_fov_points(
+            car_x, car_y, car_yaw
+        )
+
+        # Build graph edges inside FOV
+        edges = self._build_edges(points_window, classes_window)
+
+        orange_like = {"orange", "big"}
+
+        # First pass: draw edges, collect raw centroids
+        centroids_raw: List[Tuple[float, float, bool]] = []  # (mx, my, is_big_big)
+
+        for (i, j) in edges:
+            (x1, y1) = points_window[i]
+            (x2, y2) = points_window[j]
+            ci = classes_window[i]
+            cj = classes_window[j]
+
+            is_big_big = (ci == "big" and cj == "big")
+
+            if ci in orange_like and cj in orange_like:
+                color = "orange"
+            else:
+                color = "k"
+
+            # edge
+            self.ax.plot([x1, x2], [y1, y2], color=color, linewidth=1.0)
+
+            # centroid
+            mx = 0.5 * (x1 + x2)
+            my = 0.5 * (y1 + y2)
+            centroids_raw.append((mx, my, is_big_big))
+
+        # Enforce ≥1 m spacing between centroids, preferring farther from car,
+        # and reject centroids in a 0.5 m radius around the car
+        centroids = self._filter_centroids_min_spacing(
+            centroids_raw, car_x, car_y, min_dist=1.0
+        )
+
+        # Plot final centroids and prepare candidate points for greedy path
+        candidate_points: List[Tuple[float, float]] = []
+
+        for (mx, my, is_big_big) in centroids:
+            # X at centroid
+            self.ax.scatter([mx], [my], marker="x", c="k", s=25)
+            # Green square if big-big edge
+            if is_big_big:
+                self.ax.scatter([mx], [my], marker="s", c="g", s=40)
+            candidate_points.append((mx, my))
+            all_x.append(mx)
+            all_y.append(my)
+
+        # Build greedy NN path over visible centroids
+        path_points = self._build_greedy_path(car_x, car_y, candidate_points)
+
+        if path_points:
+            px = [car_x]
+            py = [car_y]
+            for (x, y) in path_points:
+                px.append(x)
+                py.append(y)
+            self.ax.plot(px, py, color="cyan", linewidth=1.5, label="greedy path")
+
+        # Auto-fit axes
+        if all_x and all_y:
+            xmin, xmax = min(all_x), max(all_x)
+            ymin, ymax = min(all_y), max(all_y)
+            pad = 3.0
+            if xmax - xmin < 1e-3:
+                xmax = xmin + 1.0
+            if ymax - ymin < 1e-3:
+                ymax = ymin + 1.0
+            self.ax.set_xlim(xmin - pad, xmax + pad)
+            self.ax.set_ylim(ymin - pad, ymax + pad)
+
+        # De-duplicate legend
+        handles, labels = self.ax.get_legend_handles_labels()
+        uniq = {}
+        for h, l in zip(handles, labels):
+            uniq[l] = h
+        if uniq:
+            self.ax.legend(
+                uniq.values(),
+                uniq.keys(),
+                loc="upper right",
+                fontsize=8,
+            )
 
 
 def main():
     rclpy.init()
-    node = PPDebug()
+    node = SlamPathSectorVisualizer()
+    plt.ion()
+
     try:
-        rclpy.spin(node)
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.01)
+            node.update_plot()
+            plt.pause(0.01)
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            plt.close("all")
-        except Exception:
-            pass
         node.destroy_node()
         rclpy.shutdown()
 

@@ -36,13 +36,18 @@ def generate_launch_description():
             output="screen",
             parameters=common,
         ),
+        
+        
         Node(
             package="slam",
             executable="slam_node",
             name="slam",
             output="screen",
+            # parameters=[{"use_sim_time": True}],
             parameters=common,
         ),
+
+
 
         # 3) Path planning
         Node(
@@ -53,12 +58,12 @@ def generate_launch_description():
             parameters=common,
         ),
 
-        # # 4) Controls
-        # Node(
-        #     package="control_v2",
-        #     executable="control_loop",
-        #     name="control",
-        #     output="screen",
-        #     parameters=common,
-        # ),
+        # 4) Controls
+        Node(
+            package="controls",
+            executable="control_node",
+            name="control",
+            output="screen",
+            parameters=common,
+        ),
     ])
