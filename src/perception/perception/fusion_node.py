@@ -8,77 +8,69 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from sensor_msgs.msg import PointCloud2, PointField
-from sensor_msgs_py import point_cloud2 as pc2
-
-from message_filters import Subscriber, ApproximateTimeSynchronizer
-
-# Optional: best 1:1 assignment (Hungarian)
-try:
-    from scipy.optimize import linear_sum_assignment
-    SCIPY_OK = True
-except Exception:
-    SCIPY_OK = False
+from eufs_msgs.msg import ConeArrayWithCovariance
 
 
-class LidarStereoColourFuseNoTF(Node):
+class GroundTruthConeAdapter(Node):
     """
-    Fuses:
-      - LiDAR centroids: /perception/cones (frame velodyne), fields x,y,z
-      - Stereo+YOLO:     /perception/cones_stereo (camera optical), fields x,y,z,class_id
+    Ground-truth cone adapter.
 
-    No TF used.
-    We match in a common pseudo vehicle plane:
-      LiDAR:   forward=f=x, left=l=y
-      Camera optical: forward=f=z, left=l=-x   (since x=right, z=forward)
+    Input:
+      - /ground_truth/cones   (ConeArrayWithCovariance)
 
     Output:
-      - /perception/cones_fused in LiDAR frame_id (same as LiDAR msg)
-      - points are LiDAR xyz + camera class_id
-      - 1:1 matches only; unmatched LiDAR ignored
+      - /perception/cones_fused (PointCloud2)
+        fields: x, y, z, class_id
+
+    Keeps the same downstream format as the old fusion node, but without
+    depending on camera/lidar feeds.
     """
 
     def __init__(self):
-        super().__init__("lidar_stereo_colour_fuse_notf")
+        super().__init__("ground_truth_cone_adapter")
 
         # Topics
-        self.declare_parameter("lidar_topic", "/perception/cones")
-        self.declare_parameter("camera_topic", "/perception/cones_stereo")
+        self.declare_parameter("ground_truth_topic", "/ground_truth/cones")
         self.declare_parameter("output_topic", "/perception/cones_fused")
+        self.declare_parameter("output_frame", "")
 
-        # Sync
-        self.declare_parameter("sync_slop", 0.08)
-        self.declare_parameter("sync_queue", 10)
+        # IMPORTANT:
+        # Set these IDs to whatever your downstream stack expects.
+        # These defaults are a common convention, but if your RViz / planner /
+        # mapper uses another one, change only these five params.
+        self.declare_parameter("class_ids.yellow", 0)
+        self.declare_parameter("class_ids.blue", 1)
+        self.declare_parameter("class_ids.orange", 2)
+        self.declare_parameter("class_ids.big_orange", 3)
+        self.declare_parameter("class_ids.unknown", 4)
 
-        # Matching gate in meters (in forward/left plane)
-        self.declare_parameter("max_match_dist", 2.0)
+        self.declare_parameter("log.enable", True)
 
-        # Use Hungarian (best) if SciPy exists; else greedy
-        self.declare_parameter("use_hungarian", True)
+        P = lambda k: self.get_parameter(k).value
 
-        # Camera frame interpretation:
-        # "optical"  => camera points are (x=right, y=down, z=forward) [your current cones_stereo]
-        # "ros"      => camera points are (x=forward, y=left, z=up)   [if you ever publish that]
-        self.declare_parameter("camera_frame_mode", "optical")  # optical | ros
+        self.gt_topic = str(P("ground_truth_topic"))
+        self.output_topic = str(P("output_topic"))
+        self.output_frame = str(P("output_frame"))
+        self.log_enable = bool(P("log.enable"))
 
-        self.lidar_topic = self.get_parameter("lidar_topic").value
-        self.camera_topic = self.get_parameter("camera_topic").value
-        self.output_topic = self.get_parameter("output_topic").value
-        self.maxd = float(self.get_parameter("max_match_dist").value)
-        self.use_h = bool(self.get_parameter("use_hungarian").value) and SCIPY_OK
-        self.cam_mode = str(self.get_parameter("camera_frame_mode").value).lower()
+        self.class_id_yellow = int(P("class_ids.yellow"))
+        self.class_id_blue = int(P("class_ids.blue"))
+        self.class_id_orange = int(P("class_ids.orange"))
+        self.class_id_big_orange = int(P("class_ids.big_orange"))
+        self.class_id_unknown = int(P("class_ids.unknown"))
 
-        # Subscribers (sync)
-        self.sub_lidar = Subscriber(self, PointCloud2, self.lidar_topic, qos_profile=qos_profile_sensor_data)
-        self.sub_cam = Subscriber(self, PointCloud2, self.camera_topic, qos_profile=qos_profile_sensor_data)
-        self.sync = ApproximateTimeSynchronizer(
-            [self.sub_lidar, self.sub_cam],
-            queue_size=int(self.get_parameter("sync_queue").value),
-            slop=float(self.get_parameter("sync_slop").value),
+        self.sub = self.create_subscription(
+            ConeArrayWithCovariance,
+            self.gt_topic,
+            self.cb_cones,
+            qos_profile_sensor_data,
         )
-        self.sync.registerCallback(self.cb_sync)
 
-        # Publisher
-        self.pub = self.create_publisher(PointCloud2, self.output_topic, qos_profile_sensor_data)
+        self.pub = self.create_publisher(
+            PointCloud2,
+            self.output_topic,
+            qos_profile_sensor_data,
+        )
 
         self.fields = [
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
@@ -87,96 +79,59 @@ class LidarStereoColourFuseNoTF(Node):
             PointField(name="class_id", offset=12, datatype=PointField.UINT32, count=1),
         ]
 
-        self.get_logger().info(
-            f"[FuseNoTF] lidar={self.lidar_topic} cam={self.camera_topic} -> {self.output_topic} | "
-            f"cam_mode={self.cam_mode} | hungarian={self.use_h} (scipy={SCIPY_OK}) | gate={self.maxd}m"
+        if self.log_enable:
+            self.get_logger().info(
+                f"[GT-CONE-ADAPTER] {self.gt_topic} -> {self.output_topic} | "
+                f"IDs: yellow={self.class_id_yellow}, blue={self.class_id_blue}, "
+                f"orange={self.class_id_orange}, big_orange={self.class_id_big_orange}, "
+                f"unknown={self.class_id_unknown}"
+            )
+
+    @staticmethod
+    def cone_xyz(cone):
+        return (
+            float(cone.point.x),
+            float(cone.point.y),
+            float(cone.point.z),
         )
 
-    @staticmethod
-    def read_xyz(msg: PointCloud2) -> np.ndarray:
+    def cone_to_xyzcls(self, cone, class_id: int):
+        x, y, z = self.cone_xyz(cone)
+        return (x, y, z, int(class_id))
+
+    def build_output_points(self, msg: ConeArrayWithCovariance):
         pts = []
-        for x, y, z in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
-            pts.append((float(x), float(y), float(z)))
-        return np.asarray(pts, dtype=np.float64)
 
-    @staticmethod
-    def read_xyz_cls(msg: PointCloud2):
-        pts = []
-        cls = []
-        for x, y, z, cid in pc2.read_points(msg, field_names=("x", "y", "z", "class_id"), skip_nans=True):
-            pts.append((float(x), float(y), float(z)))
-            cls.append(int(cid))
-        return np.asarray(pts, dtype=np.float64), np.asarray(cls, dtype=np.int32)
+        # Preserve categories explicitly. No guessing in code path beyond the param values.
+        if hasattr(msg, "yellow_cones"):
+            for c in msg.yellow_cones:
+                pts.append(self.cone_to_xyzcls(c, self.class_id_yellow))
 
-    def to_forward_left_lidar(self, P_l: np.ndarray) -> np.ndarray:
-        # LiDAR assumed: x forward, y left
-        if P_l.shape[0] == 0:
-            return np.empty((0, 2), dtype=np.float64)
-        return P_l[:, [0, 1]]  # (forward, left)
+        if hasattr(msg, "blue_cones"):
+            for c in msg.blue_cones:
+                pts.append(self.cone_to_xyzcls(c, self.class_id_blue))
 
-    def to_forward_left_cam(self, P_c: np.ndarray) -> np.ndarray:
-        if P_c.shape[0] == 0:
-            return np.empty((0, 2), dtype=np.float64)
+        if hasattr(msg, "orange_cones"):
+            for c in msg.orange_cones:
+                pts.append(self.cone_to_xyzcls(c, self.class_id_orange))
 
-        if self.cam_mode == "ros":
-            # camera points already x forward, y left
-            f = P_c[:, 0]
-            l = P_c[:, 1]
-        else:
-            # optical: x right, y down, z forward  => forward=z, left=-x
-            f = P_c[:, 2]
-            l = -P_c[:, 0]
-        return np.stack([f, l], axis=1)
+        if hasattr(msg, "big_orange_cones"):
+            for c in msg.big_orange_cones:
+                pts.append(self.cone_to_xyzcls(c, self.class_id_big_orange))
 
-    def associate_1to1(self, A: np.ndarray, B: np.ndarray):
-        """
-        A: Nx2 (lidar forward/left)
-        B: Mx2 (cam forward/left)
-        returns list of (i, j) matches (1:1) within gate
-        """
-        n, m = A.shape[0], B.shape[0]
-        if n == 0 or m == 0:
-            return []
+        if hasattr(msg, "unknown_color_cones"):
+            for c in msg.unknown_color_cones:
+                pts.append(self.cone_to_xyzcls(c, self.class_id_unknown))
 
-        D = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)  # NxM
-        BIG = 1e6
-        C = np.where(D <= self.maxd, D, BIG)
+        return pts
 
-        matches = []
-        if self.use_h:
-            rows, cols = linear_sum_assignment(C)
-            for i, j in zip(rows, cols):
-                if C[i, j] < BIG:
-                    matches.append((int(i), int(j)))
-        else:
-            # greedy
-            Cg = C.copy()
-            used_i = set()
-            used_j = set()
-            while True:
-                i, j = np.unravel_index(np.argmin(Cg), Cg.shape)
-                if Cg[i, j] >= BIG:
-                    break
-                if i in used_i or j in used_j:
-                    Cg[i, j] = BIG
-                    continue
-                matches.append((int(i), int(j)))
-                used_i.add(i)
-                used_j.add(j)
-                Cg[i, :] = BIG
-                Cg[:, j] = BIG
-
-        return matches
-
-    def publish_cloud(self, header_in, frame_id: str, pts_xyz: np.ndarray, pts_cls: np.ndarray):
-        K = pts_xyz.shape[0]
+    def publish_cloud(self, header_in, frame_id: str, points):
+        K = len(points)
         point_step = 16
         data = bytearray(point_step * K)
 
-        for i in range(K):
+        for i, (x, y, z, cid) in enumerate(points):
             base = i * point_step
-            x, y, z = pts_xyz[i]
-            cid = int(pts_cls[i])
             data[base + 0: base + 4] = np.float32(x).tobytes()
             data[base + 4: base + 8] = np.float32(y).tobytes()
             data[base + 8: base + 12] = np.float32(z).tobytes()
@@ -184,7 +139,9 @@ class LidarStereoColourFuseNoTF(Node):
 
         msg = PointCloud2()
         msg.header = header_in
-        msg.header.frame_id = frame_id
+        if frame_id:
+            msg.header.frame_id = frame_id
+
         msg.height = 1
         msg.width = K
         msg.fields = self.fields
@@ -196,43 +153,19 @@ class LidarStereoColourFuseNoTF(Node):
 
         self.pub.publish(msg)
 
-    def cb_sync(self, lidar_msg: PointCloud2, cam_msg: PointCloud2):
-        P_l = self.read_xyz(lidar_msg)
-        P_c, C_c = self.read_xyz_cls(cam_msg)
+    def cb_cones(self, msg: ConeArrayWithCovariance):
+        points = self.build_output_points(msg)
 
-        # empty publish
-        if P_l.shape[0] == 0 or P_c.shape[0] == 0:
-            self.publish_cloud(
-                lidar_msg.header,
-                lidar_msg.header.frame_id,
-                np.empty((0, 3), dtype=np.float64),
-                np.empty((0,), dtype=np.int32),
-            )
-            return
+        frame_id = self.output_frame.strip()
+        if not frame_id:
+            frame_id = msg.header.frame_id
 
-        A = self.to_forward_left_lidar(P_l)
-        B = self.to_forward_left_cam(P_c)
-
-        matches = self.associate_1to1(A, B)
-
-        if len(matches) == 0:
-            self.publish_cloud(
-                lidar_msg.header,
-                lidar_msg.header.frame_id,
-                np.empty((0, 3), dtype=np.float64),
-                np.empty((0,), dtype=np.int32),
-            )
-            return
-
-        out_xyz = np.array([P_l[i] for i, _ in matches], dtype=np.float64)  # LiDAR xyz
-        out_cls = np.array([C_c[j] for _, j in matches], dtype=np.int32)    # camera class_id
-
-        self.publish_cloud(lidar_msg.header, lidar_msg.header.frame_id, out_xyz, out_cls)
+        self.publish_cloud(msg.header, frame_id, points)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LidarStereoColourFuseNoTF()
+    node = GroundTruthConeAdapter()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

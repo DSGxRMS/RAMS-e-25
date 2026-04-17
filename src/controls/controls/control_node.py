@@ -13,7 +13,7 @@ from controls.telemetryplot import TelemetryVisualizer, generate_turning_arc
 # ================================
 # Control Constants
 # ================================
-MAX_VELOCITY = 1.5
+MAX_VELOCITY = 2
 VEL_LIMIT_FACTOR = 0.6   # Slow down more in corners to prevent overshoot
 ROUTE_IS_LOOP = False
 STOP_SPEED_THRESHOLD = -10.1
