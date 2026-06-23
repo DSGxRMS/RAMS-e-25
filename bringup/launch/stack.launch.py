@@ -53,12 +53,12 @@ def generate_launch_description():
             parameters=common,
         ),
 
-        # 4) Controls
-        Node(
-            package="controls",
-            executable="control_node",
-            name="control",
-            output="screen",
-            parameters=common,
-        ),
+        # # 4) Controls
+        # Node(
+        #     package="controls",
+        #     executable="control_node",
+        #     name="control",
+        #     output="screen",
+        #     parameters=common,
+        # ),
     ])
