@@ -28,14 +28,14 @@ def generate_launch_description():
             parameters=common,
         ),
 
-        # 2) SLAM
-        Node(
-            package="slam",
-            executable="pred_node",
-            name="pred",
-            output="screen",
-            parameters=common,
-        ),
+        # # 2) SLAM
+        # Node(
+        #     package="slam",
+        #     executable="pred_node",
+        #     name="pred",
+        #     output="screen",
+        #     parameters=common,
+        # ),
         Node(
             package="slam",
             executable="slam_node",
@@ -53,12 +53,12 @@ def generate_launch_description():
             parameters=common,
         ),
 
-        # # 4) Controls
-        # Node(
-        #     package="controls",
-        #     executable="control_node",
-        #     name="control",
-        #     output="screen",
-        #     parameters=common,
-        # ),
+        # 4) Controls
+        Node(
+            package="controls",
+            executable="control_node",
+            name="control",
+            output="screen",
+            parameters=common,
+        ),
     ])
