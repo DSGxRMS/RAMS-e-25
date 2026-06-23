@@ -163,13 +163,13 @@ class MPPIController:
     W_CT        = 2.0       # Huber crosstrack weight (raised vs MATLAB for tighter path)
     W_HEAD      = 0.5       # heading weight
     CT_SAT      = 3.0       # Huber knee (m) — smaller track = tighter saturation
-    K_FF        = 0.85      # feedforward gain
+    K_FF        = 0.0       # feedforward gain — disabled: PP gives ≤9 sparse pts, curvature estimate is noise
     LOOKAHEAD_M = 1.5       # arc-length lookahead (metres) — replaces MATLAB index lookahead=8
     KP_ROLL     = 0.40      # P-only lon gain inside rollout
     KP          = 0.50      # PI lon kp (raised to compensate for low-speed sluggishness)
     KI          = 0.05      # PI lon ki (small to avoid windup)
     I_CLAMP     = 2.0       # integral clamp (reduced from 5.0 to limit windup)
-    V_FLOOR     = 0.5       # min speed target (m/s)
+    V_FLOOR     = 0.8       # min speed target (m/s)
     V_MAX_PATH  = 2.0       # cap on speed profile (m/s) — EUFS safe limit
     CT0         = 3.0       # CTE for speed reduction onset (m)
     K_CT        = 0.6       # CTE speed reduction gain
@@ -285,8 +285,9 @@ class MPPIController:
         }
 
         # reset progress when path changes
-        self.cur    = 0
-        self.I_spd  = 0.0   # also reset PI integrator to avoid windup on new path
+        self.cur = 0
+        # NOTE: do NOT reset I_spd here — the path key changes almost every frame
+        # as PP slides its window forward, so resetting here kills the PI integral.
         print(f"[MPPI] Path updated: {N} pts, "
               f"total={s_np[-1]:.1f} m, vt=[{vt.min():.1f},{vt.max():.1f}] m/s")
 
@@ -334,6 +335,13 @@ class MPPIController:
                 _speed = max(_speed, self._speed_est)
         self._prev_pos = (x, y)
 
+        # debug: log once per ~100 calls to confirm speed estimation is working
+        if not hasattr(self, '_dbg_ctr'): self._dbg_ctr = 0
+        self._dbg_ctr += 1
+        if self._dbg_ctr % 100 == 1:
+            print(f"[MPPI] odom_spd={speed:.3f}  est_spd={_speed:.3f}  "
+                  f"yr={self.yaw_rate:.3f}  cur={self.cur}/{pd['N']}  I={self.I_spd:.3f}")
+
         # ---- 6-D state bridge: odom -> Neural ODE state (ENU convention) ----
         # yaw_sin = sin(yaw),  yaw_cos = cos(yaw)
         x6 = torch.tensor(
@@ -359,16 +367,22 @@ class MPPIController:
         vt_cur = float(pd["vt"][self.cur].item())
         vr_eff = float(np.clip(vt_cur * scale, self.V_FLOOR, self.V_MAX_PATH))
 
-        # ---- arc-length marching (replaces index marching — works for any path density) ----
+        # ---- arc-length marching (replaces index marching) ----
         s_cur  = float(pd["s"][self.cur].item())
         s_max  = float(pd["s"][-1].item())
-        # advance by (speed * DT) metres per horizon step
-        pace_m = max(_speed, self.V_FLOOR) * self.DT
+        # pace_m: how far the car moves per rollout step.
+        # Use actual speed but clamp min to 0.1 m/step so that even at standstill
+        # the horizon spreads over the full path (not just 0.125 m).
+        # Also scale T so the arc always covers at least s_max - s_cur.
+        pace_m = max(_speed, 0.5) * self.DT
+        # If path is short, ensure the last horizon step reaches the path end
+        n_steps_needed = max(self.T, int((s_max - s_cur - self.LOOKAHEAD_M) / max(pace_m, 1e-3)) + 1)
+        n_steps_used = min(n_steps_needed, self.T)
         s_tgt  = torch.clamp(
             s_cur + self.LOOKAHEAD_M
             + torch.arange(self.T, dtype=torch.float32, device=dev) * pace_m,
             0.0, s_max,
-        )   # (T,)
+        )   # (T,)  — later steps clamp to s_max so they all aim at the path end
 
         refE  = _interp1d(pd["s"], pd["rx"], s_tgt)
         refN  = _interp1d(pd["s"], pd["ry"], s_tgt)
