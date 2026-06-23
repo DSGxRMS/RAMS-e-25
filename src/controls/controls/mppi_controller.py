@@ -134,8 +134,11 @@ def _world_vel(x):
     vy = x[VY_I, :]
     sn = x[SIN_I, :]
     cs = x[COS_I, :]
-    Ve = -(vx * sn + vy * cs)
-    Vn = vx * cs - vy * sn
+    # Standard ROS ENU rotation: yaw=0 means East, CCW positive.
+    # MATLAB wv() used a North-reference convention — that must NOT be used here
+    # because the EUFS SLAM yaw is standard ENU (CCW from East/x-axis).
+    Ve = vx * cs - vy * sn   # = Vx*cos(yaw) - Vy*sin(yaw)
+    Vn = vx * sn + vy * cs   # = Vx*sin(yaw) + Vy*cos(yaw)
     return Ve, Vn
 
 
@@ -167,13 +170,13 @@ class MPPIController:
     KP         = 0.35       # PI lon kp (actual output)
     KI         = 0.10       # PI lon ki
     I_CLAMP    = 5.0        # integral clamp
-    V_FLOOR    = 2.0        # min speed target (m/s)
+    V_FLOOR    = 1.0        # min speed target (m/s)  — EUFS runs at 2 m/s max
     CT0        = 4.0        # CTE threshold for speed reduction
     K_CT       = 0.7        # CTE speed reduction gain
     WIN        = 40         # window for nearest-point search
     L_WB       = 1.535      # wheelbase (m)  — same FS car
     ACCEL_MAX  = 3.0        # lon[-1,1] -> accel m/s² scaling
-    V_MAX_PATH = 4.0        # cap on generated speed profile (m/s)
+    V_MAX_PATH = 2.0        # cap on generated speed profile (m/s) — EUFS safe limit
 
     def __init__(self, ckpt_path=None):
         # ---- device ----
@@ -297,11 +300,10 @@ class MPPIController:
         accel_out : float   acceleration command (m/s²), clamped to ACCEL_MAX
         info      : dict    target_speed, cte, heading_err, mean_traj
         """
-        # ---- fallback when no valid path ----
+        # ---- fallback when no valid path: steer straight and brake ----
         if self._path_data is None:
-            self._last_steer *= 0.9
-            return self._last_steer, -self.ACCEL_MAX, {
-                "target_speed": self.V_FLOOR,
+            return 0.0, -self.ACCEL_MAX, {
+                "target_speed": 0.0,
                 "cte": 0.0, "heading_err": 0.0,
                 "mean_traj": [],
             }
@@ -318,6 +320,10 @@ class MPPIController:
             self.yaw_rate = alpha * raw_yr + (1 - alpha) * self.yaw_rate
         self.prev_yaw = yaw
 
+        # yaw_sin = sin(yaw), yaw_cos = cos(yaw) — ENU convention
+        # Neural ODE grey-box: yaw_sin stored at SIN_I=3, yaw_cos at COS_I=4
+        # deriv: d(yaw_sin)/dt = cos(yaw)*yawRate = yaw_cos*yawRate  (SIN_I)
+        #        d(yaw_cos)/dt = -sin(yaw)*yawRate = -yaw_sin*yawRate (COS_I)
         x6 = torch.tensor(
             [speed, 0.0, self.yaw_rate, math.sin(yaw), math.cos(yaw), 0.0],
             dtype=torch.float32, device=dev,
@@ -402,8 +408,8 @@ class MPPIController:
                 ctc  = (ap.clamp(max=self.CT_SAT) ** 2
                       + 2 * self.CT_SAT * (ap - self.CT_SAT).clamp(min=0.0))
 
-                # C2: pure-pursuit heading
-                carTh = torch.atan2(xk[COS_I, :], -xk[SIN_I, :])   # (K,)
+                # C2: pure-pursuit heading — yaw_sin=sin(yaw), yaw_cos=cos(yaw), ENU
+                carTh = torch.atan2(xk[SIN_I, :], xk[COS_I, :])   # (K,)
                 bear  = torch.atan2(refN[t] - pk[1], refE[t] - pk[0])
                 dh    = _angle_diff(carTh, bear)                      # (K,)
 
@@ -414,9 +420,7 @@ class MPPIController:
         # ---- softmax weighting ----
         wts  = torch.exp(-(cost - cost.min()) / self.LAMBDA)
         wts  = wts / wts.sum()                                  # (K,)
-        nom_new = (wts.unsqueeze(0) * A).sum(dim=1, keepdim=True)  # wait — A is (K,T)
-        # correct shape: sum over K -> (T,)
-        nom_new = (wts.unsqueeze(1) * A).sum(dim=0)            # (T,)
+        nom_new = (wts.unsqueeze(1) * A).sum(dim=0)            # (T,)  sum over K
         self.nom = nom_new.unsqueeze(0)                         # (1, T)
 
         # ---- apply first action ----
