@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import time
 import math
-from turtle import speed
 import numpy as np
 from scipy.interpolate import splprep, splev
 

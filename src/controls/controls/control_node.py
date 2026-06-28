@@ -1,37 +1,61 @@
 #!/usr/bin/env python3
 """
-control_node.py  —  MPPI controller entry point for RAMS-e-25 (EUFS Gazebo).
+control_node.py  —  MPPI controller ENTRY POINT for RAMS-e-25 (EUFS Gazebo).
 
-Replaces the previous geometric forward-search controller with the exp09
-Neural ODE MPPI (mppi_controller.py).  All ROS wiring, telemetry, and
-sim-time management are kept identical so nothing else in the stack changes.
+This is the active control node (per the branch layout: control logic is driven
+from here; helpers in control_utils.py; sim comms in ros_connect.py). The heavy
+MPPI rollout lives in mppi_controller.py and is invoked via MPPIController.compute().
+
+Velocity note: SLAM /slam/odom publishes twist=0, so ros_connect.py reads the real
+speed from /ground_truth/odom while keeping position/yaw from /slam/odom.
+
+Headless: set MPPI_VIZ=0 (and MPLBACKEND=Agg) to run without the telemetry plot
+(needed for headless / on-car operation). Default MPPI_VIZ=1 shows the plot.
 
 Run:  ros2 run controls control_node
+      MPPI_VIZ=0 ros2 run controls control_node   # headless
 """
+import os
 import rclpy
 from rclpy.time import Time
 import threading, time, math
 import numpy as np
-import matplotlib.pyplot as plt
+
+# Force a non-interactive matplotlib backend at import time so the exit plot
+# never tries to open a Tk window (which crashes on Ctrl+C). MPPI_VIZ=1 overrides.
+if os.environ.get("MPPI_VIZ", "0") != "1":
+    import matplotlib
+    matplotlib.use("Agg")
 
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
-from controls.telemetryplot import TelemetryVisualizer, generate_turning_arc
 from controls.mppi_controller import MPPIController
 
 # ================================
 # Control Constants
 # ================================
-MAX_VELOCITY        = 4.0    # m/s  — raise once MPPI is validated
+MAX_VELOCITY        = 4.0    # m/s  — NN lower training bound (real steering authority)
 WHEELBASE_M         = 1.5
 MAX_STEER_RAD       = 0.349  # model training limit; EUFS hardware cap is 0.7
 ROUTE_IS_LOOP       = False
 STOP_SPEED_THRESHOLD = -10.1
 
 # ================================
-# Visualization Constants
+# Visualization (optional / headless)
 # ================================
+# Default OFF: the live Tk telemetry window is laggy and crashes on Ctrl+C.
+# The exit trajectory plot (_plot_trajectory, Agg backend) is the useful one and
+# always saves to D:\RAMS-e-25\mppi_trajectory.png. Set MPPI_VIZ=1 to force live.
+VIZ = os.environ.get("MPPI_VIZ", "0") == "1"
 VIZ_UPDATE_HZ = 20
+
+# PP-dropout behaviour (senior's spec): if PP stops publishing a usable path,
+# DON'T hard-brake — hold the last steer command and coast down gently until PP recovers.
+COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel while waiting
+
+if VIZ:
+    import matplotlib.pyplot as plt
+    from controls.telemetryplot import TelemetryVisualizer, generate_turning_arc
 
 
 def main():
@@ -48,11 +72,11 @@ def main():
     threading.Thread(target=executor.spin, daemon=True).start()
 
     # ---- wait for first odometry ----
-    print("Waiting for first odometry message...")
+    print("Waiting for first odometry message...", flush=True)
     while True:
         cx, cy, yaw, speed, have_odom = node.get_state()
         if have_odom:
-            print("First position received.")
+            print("First position received.", flush=True)
             break
         time.sleep(0.1)
 
@@ -60,15 +84,23 @@ def main():
     mppi = MPPIController()
 
     # ---- state initialisation ----
-    last_ros_time       = node.get_clock().now()
+    last_ros_time        = node.get_clock().now()
     last_viz_update_real = time.perf_counter()
 
-    cur_idx = 0
-    viz     = None
+    cur_idx   = 0
+    viz       = None
+    last_steer = 0.0          # held during PP dropout
 
-    plt.ion()
+    # ---- trajectory recorder (for the exit plot) ----
+    rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte = [], [], [], [], []
+    rec_path_pts = []         # snapshots of (route_x, route_y) every N cycles
+    rec_ctr = 0
 
-    while rclpy.ok():
+    if VIZ:
+        plt.ion()
+
+    try:
+      while rclpy.ok():
         # ---- sim-clock dt ----
         current_ros_time = node.get_clock().now()
         dt_nano = (current_ros_time - last_ros_time).nanoseconds
@@ -87,8 +119,10 @@ def main():
         mppi.update_path(new_path)
 
         if not new_path:
-            # No path yet — brake and wait
-            node.send_command(steering=0.0, speed=0.0, accel=-mppi.ACCEL_MAX)
+            # PP dropout — DON'T hard-brake. Hold the last steer command and
+            # coast down gently so the car keeps tracking until PP recovers.
+            node.send_command(steering=last_steer, speed=0.0,
+                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             time.sleep(0.05)
             continue
 
@@ -96,7 +130,7 @@ def main():
         route_x, route_y = path_points[:, 0], path_points[:, 1]
 
         # ---- init telemetry visualizer on first good path ----
-        if viz is None:
+        if VIZ and viz is None:
             vt_viz = np.full_like(route_x, MAX_VELOCITY)
             viz = TelemetryVisualizer(route_x, route_y, vt_viz)
             plt.show()
@@ -107,6 +141,14 @@ def main():
         # Clamp to hardware limits (safety)
         steer     = float(np.clip(steer,     -MAX_STEER_RAD,  MAX_STEER_RAD))
         accel_cmd = float(np.clip(accel_cmd, -mppi.ACCEL_MAX, mppi.ACCEL_MAX))
+        last_steer = steer
+
+        # ---- record for the exit trajectory plot ----
+        rec_cx.append(cx); rec_cy.append(cy); rec_yaw.append(yaw)
+        rec_steer.append(steer); rec_cte.append(info["cte"])
+        rec_ctr += 1
+        if rec_ctr % 5 == 1:                      # snapshot the PP path occasionally
+            rec_path_pts.append((route_x.copy(), route_y.copy()))
 
         target_speed = info["target_speed"]
         cte          = info["cte"]
@@ -114,13 +156,11 @@ def main():
         mean_traj    = info["mean_traj"]   # list of (x,y) for arc display
 
         # ---- telemetry ----
-        if viz is not None:
+        if VIZ and viz is not None:
             vt_viz = np.full_like(route_x, MAX_VELOCITY)
             viz.update_path_data(route_x, route_y, vt_viz)
 
             arc_pts = generate_turning_arc(cx, cy, yaw, steer, WHEELBASE_M)
-
-            # Use MPPI mean trajectory as "future_pts" for the path overlay
             lookahead_pt = mean_traj[0] if mean_traj else None
 
             viz.log_state(
@@ -144,14 +184,62 @@ def main():
 
         # ---- stop condition ----
         if (not ROUTE_IS_LOOP) and cur_idx >= len(route_x) - 5 and speed < STOP_SPEED_THRESHOLD:
-            print("End of route.")
+            print("End of route.", flush=True)
             break
 
         time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\n[control_node] stopped by user.", flush=True)
+    finally:
+        print("[control_node] generating trajectory plot...", flush=True)
+        try:
+            _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts)
+        except Exception as e:
+            print(f"[plot] failed: {e}", flush=True)
+        rclpy.shutdown()
 
-    rclpy.shutdown()
-    plt.ioff()
-    plt.show()
+
+def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps):
+    """Save GT car trajectory vs the PP path snapshots + diagnostics on exit.
+    Uses the Agg backend so it ALWAYS saves to a PNG (never blocks/crashes on
+    a second Ctrl+C). Saved to the D drive so it's visible from Windows."""
+    import matplotlib
+    matplotlib.use("Agg")          # non-interactive: always saves, never hangs
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if len(cx) < 2:
+        print("[plot] not enough data", flush=True)
+        return
+    cx = np.array(cx); cy = np.array(cy)
+    fig = plt.figure(figsize=(15, 8))
+    gs = fig.add_gridspec(3, 2, width_ratios=[2, 1], hspace=0.4, wspace=0.25)
+
+    # main XY: car path + all PP path snapshots
+    ax = fig.add_subplot(gs[:, 0])
+    for (px, py) in path_snaps:
+        ax.plot(px, py, '-', color='lightblue', lw=0.6, alpha=0.5)
+    if path_snaps:
+        ax.plot([], [], '-', color='lightblue', label='PP path snapshots')
+    sc = ax.scatter(cx, cy, c=np.arange(len(cx)), cmap='viridis', s=10, zorder=3)
+    ax.plot(cx, cy, '-', color='gray', lw=0.5, alpha=0.5)
+    ax.scatter([cx[0]], [cy[0]], c='lime', s=140, marker='o', edgecolor='k', zorder=5, label='start')
+    ax.scatter([cx[-1]], [cy[-1]], c='red', s=140, marker='X', edgecolor='k', zorder=5, label='end')
+    ax.set_title('Car trajectory (GT) vs PP path'); ax.set_xlabel('E (m)'); ax.set_ylabel('N (m)')
+    ax.axis('equal'); ax.grid(alpha=0.3); ax.legend(fontsize=8)
+    fig.colorbar(sc, ax=ax, label='time step', shrink=0.5)
+
+    t = np.arange(len(cx))
+    a1 = fig.add_subplot(gs[0, 1]); a1.plot(t, np.degrees(yaw), '-b'); a1.set_title('car yaw (deg)'); a1.grid(alpha=0.3)
+    a2 = fig.add_subplot(gs[1, 1]); a2.plot(t, steer, '-m'); a2.set_title('steer cmd (rad)'); a2.grid(alpha=0.3)
+    a3 = fig.add_subplot(gs[2, 1]); a3.plot(t, cte, '-c'); a3.set_title('CTE (m)'); a3.set_xlabel('step'); a3.grid(alpha=0.3)
+
+    # save to the D drive so it's visible from Windows (\\wsl... or D:\)
+    out = "/mnt/d/RAMS-e-25/mppi_trajectory.png"
+    try:
+        plt.savefig(out, dpi=120, bbox_inches='tight')
+        print(f"[plot] saved {out}  (Windows: D:\\RAMS-e-25\\mppi_trajectory.png)", flush=True)
+    except Exception as e:
+        print(f"[plot] save failed: {e}", flush=True)
 
 
 if __name__ == '__main__':

@@ -72,7 +72,9 @@ class SlamPathSectorVisualizer(Node):
         super().__init__("slam_path_sector_visualiser")
 
         # ---- Parameters ----
-        self.declare_parameter("topics.odom_in", "/slam/odom")
+        # /slam/odom_raw = live ~190 Hz GT relay (NOT the cone-gated ~5 Hz /slam/odom that
+        # freezes at spawn). Keeps the debug plot's car marker + path live with the car.
+        self.declare_parameter("topics.odom_in", "/slam/odom_raw")
         self.declare_parameter("topics.map_in", "/slam/map_cones")
         self.declare_parameter("qos.best_effort", True)
         self.declare_parameter("qos.depth", 50)

@@ -60,7 +60,11 @@ class SlamPathSectorVisualizer(Node):
         super().__init__("slam_path_sector_visualiser")
 
         # ---- Parameters ----
-        self.declare_parameter("topics.odom_in", "/slam/odom")
+        # odom_in = /slam/odom_raw (live ~190 Hz GT relay), NOT /slam/odom: the latter is
+        # cone-gated (~5 Hz, frozen at spawn until SLAM sees cones), so the sector-FOV used
+        # to be anchored to a stale pose -> path lagged the car (esp. heading in corners).
+        # The SLAM-team nodes already default to /slam/odom_raw; this aligns PP with them.
+        self.declare_parameter("topics.odom_in", "/slam/odom_raw")
         self.declare_parameter("topics.map_in", "/slam/map_cones")
         self.declare_parameter("topics.path_out", "/path_points")
 
@@ -70,7 +74,7 @@ class SlamPathSectorVisualizer(Node):
         # Sector FOV parameters
         self.declare_parameter("fov.vertex_offset_m", -5.0)
         self.declare_parameter("fov.radius_m", 30.0)
-        self.declare_parameter("fov.angle_deg", 60.0)
+        self.declare_parameter("fov.angle_deg", 90.0)
 
         # Candidate filtering
         self.declare_parameter("candidates.min_spacing_m", 1.0)

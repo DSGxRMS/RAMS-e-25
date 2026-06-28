@@ -6,6 +6,12 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=[package_name],
+    package_data={
+        # ship the Neural ODE checkpoint with the package so it is present in
+        # the install tree (colcon would otherwise drop the .pt file).
+        package_name: ['fs_model/*.pt'],
+    },
+    include_package_data=True,
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
