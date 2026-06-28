@@ -1,36 +1,57 @@
+````md
 # RAMS'e - 25
-First edition legacy stack - version 1.0
 
-## To Operate, refer:
+First edition legacy stack - Version 1.0.
 
-### 1. Setting up the stack for the FIRST time
-Get to the repo -
-```
+## Documentation
+
+- [System Architecture](ARCHITECTURE.md)
+
+---
+
+## Getting Started
+
+### 1. Initial Setup
+
+> **Note:** Update the project path according to your local directory structure.
+
+Navigate to the repository:
+
+```bash
 cd RAMS-e-25
-```
-Then, build the ros packages
-```
+````
+
+Build the ROS 2 workspace:
+
+```bash
 colcon build --symlink-install
 ```
-Store the package runner in ~/.bashrc for further use
+
+Add the workspace to your `~/.bashrc` so it is sourced automatically in future terminals:
+
+```bash
+echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc
 ```
-echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc 
-```
-Restart the terminal (sources the package)
 
-#Note: Ensure to change the path of the folder as per local structure!
+Restart the terminal (or run `source ~/.bashrc`) to apply the changes.
 
+---
 
-### 2. Using the stack
-To run the stack until controls - 
-``` 
+## Running the Stack
+
+### Launch the perception, SLAM, and planning stack
+
+```bash
 ros2 launch bringup stack.launch.py
 ```
 
-To run Controls - 
-```
+### Launch the controller
+
+```bash
 ros2 run controls control_node
 ```
 
-#### #NOTE: Do ensure to set the driving mode to manual drive for the car to move
+> **Important:** Before running the controller, set the EUFS simulator driving mode to **Manual ("Go")** so the vehicle accepts `/cmd` commands.
 
+```
+```
