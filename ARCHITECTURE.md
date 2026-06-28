@@ -525,23 +525,33 @@ single visible wall) belongs in the planner.
 
 ---
 
-## 10. Build & run
+## 10. Build & run 
 
-See [`README.md`](README.md) for the canonical commands. In short:
+#Note: Ensure to change the path of the folder as per local structure!
 
 ```bash
 cd RAMS-e-25
 colcon build --symlink-install
 source install/setup.bash
-
-# upstream stack (perception + slam + planning):
-ros2 launch slam testslam.launch.py
-
-# the controller:
-MPPI_CSV=/tmp/mppi_trace.csv ros2 run controls control_node
 ```
+```
+Store the package runner in ~/.bashrc for further use
+```
+echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc 
+```
+Restart the terminal (sources the package)
 
-Run the EUFS simulator (we test on the **small_track** option) with the driving mode set to
+#to launch the sim:
+ros2 launch eufs_launcher eufs_launcher.launch.py
+
+# to launch the stack : (perception + slam + planning):
+ros2 launch bringup stack.launch.py
+
+# to run the controller controller:
+MPPI_CSV=/tmp/mppi_trace.csv ros2 run controls control_node
+
+#### #NOTE: Do ensure to set the driving mode to manual drive for the car to move
+Run the EUFS simulator with the driving mode set to
 **manual/“go”** so the car accepts `/cmd`, and make sure the EUFS workspace is sourced (the
 cone-recovery uses the `eufs_msgs` message type).
 
