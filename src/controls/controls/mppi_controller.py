@@ -705,6 +705,7 @@ class MPPIController:
             "cte":          cte_val,
             "heading_err":  float(heading_err),
             "mean_traj":    mean_traj,
+            "path_bad":     bool(path_is_bad),   # one-sided-cone heading flip -> recovery
         }
 
     # =====================================================================

@@ -6,6 +6,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
+from eufs_msgs.msg import ConeArrayWithCovariance   # /slam/map_cones (for one-sided recovery)
 import math
 
 
@@ -18,11 +19,18 @@ class ROSInterface(Node):
     # prediction_node GT relay (out.pose = ground_truth pose, full rate, always
     # live and — per the branch design — 100% accurate).
     def __init__(self, odom_topic="/slam/odom_raw", cmd_topic="/cmd", path_topic="/path_points",
-                 gt_odom_topic="/ground_truth/odom"):
+                 gt_odom_topic="/ground_truth/odom", cones_topic="/slam/map_cones"):
         super().__init__('ros_interface')
 
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
         self.have_odom = False
+
+        # Cones (for the one-sided-cone RECOVERY: blue-only -> steer right, yellow-only ->
+        # steer left). /slam/map_cones is the global SLAM map, so we count only cones that
+        # are NEAR + AHEAD of the car (approximates what's currently in view).
+        self._cones_blue   = []   # list[(x,y)] map frame
+        self._cones_yellow = []
+        self.CONE_NEAR_R   = 12.0 # m: radius around car to consider "in view"
 
         # Ground-truth velocity (SLAM odom twist is always 0; GT carries real twist).
         # We take POSITION/yaw from /slam/odom (PP's frame) but SPEED from GT.
@@ -56,6 +64,7 @@ class ROSInterface(Node):
         self.create_subscription(Odometry, odom_topic, self._odom_cb, self.qos_best_effort)
         self.create_subscription(Odometry, gt_odom_topic, self._gt_odom_cb, self.qos_best_effort)
         self.create_subscription(Path, path_topic, self._path_cb, self.qos_best_effort)
+        self.create_subscription(ConeArrayWithCovariance, cones_topic, self._cones_cb, self.qos_best_effort)
 
         self.pub = self.create_publisher(AckermannDriveStamped, cmd_topic, 10)
 
@@ -80,6 +89,31 @@ class ROSInterface(Node):
         # reading when the car slides sideways, poisoning the planner.
         self.gt_speed = float(msg.twist.twist.linear.x)
         self.have_gt = True
+
+    def _cones_cb(self, msg: ConeArrayWithCovariance):
+        self._cones_blue   = [(float(c.point.x), float(c.point.y)) for c in msg.blue_cones]
+        self._cones_yellow = [(float(c.point.x), float(c.point.y)) for c in msg.yellow_cones]
+
+    def get_local_cone_counts(self):
+        """Count blue/yellow cones that are NEAR and roughly AHEAD of the car
+        (approximates what's currently in view, from the global SLAM map).
+        Returns (n_blue, n_yellow). Used for one-sided-cone recovery."""
+        cx, cy, yaw = self.cx, self.cy, self.yaw
+        fx, fy = math.cos(yaw), math.sin(yaw)
+        r2 = self.CONE_NEAR_R * self.CONE_NEAR_R
+
+        def count(cones):
+            n = 0
+            for (px, py) in cones:
+                dx, dy = px - cx, py - cy
+                if dx * dx + dy * dy > r2:
+                    continue
+                if dx * fx + dy * fy < -1.0:      # behind the car -> ignore
+                    continue
+                n += 1
+            return n
+
+        return count(self._cones_blue), count(self._cones_yellow)
 
     def _path_cb(self, msg: Path):
         # Always store the latest message, but only promote to "usable" if it has enough points.

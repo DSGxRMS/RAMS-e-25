@@ -53,6 +53,15 @@ VIZ_UPDATE_HZ = 20
 # DON'T hard-brake — hold the last steer command and coast down gently until PP recovers.
 COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel while waiting
 
+# ONE-SIDED-CONE RECOVERY (senior's option c): when the path is unusable (PP gave nothing,
+# OR it points the wrong way — the one-sided-cone heading flip) AND only one cone colour is
+# in view, steer a fixed gentle angle toward the MISSING wall at a slow creep until PP
+# recovers, then hand back to MPPI. FS convention: blue=LEFT edge, yellow=RIGHT edge.
+#   only blue (left) visible  -> turn RIGHT  (steer < 0)
+#   only yellow (right) visible-> turn LEFT   (steer > 0)
+RECOVER_STEER = 0.20         # rad (gentle, not full lock)
+RECOVER_SPEED = 1.0          # m/s creep during recovery
+
 if VIZ:
     import matplotlib.pyplot as plt
     from controls.telemetryplot import TelemetryVisualizer, generate_turning_arc
@@ -90,6 +99,7 @@ def main():
     cur_idx   = 0
     viz       = None
     last_steer = 0.0          # held during PP dropout
+    was_recovering = False     # one-sided-cone recovery state (for transition logging)
 
     # ---- trajectory recorder (for the exit plot) ----
     rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte = [], [], [], [], []
@@ -118,13 +128,52 @@ def main():
         # Push new path into MPPI (no-op if path hasn't changed)
         mppi.update_path(new_path)
 
-        if not new_path:
-            # PP dropout — DON'T hard-brake. Hold the last steer command and
-            # coast down gently so the car keeps tracking until PP recovers.
-            node.send_command(steering=last_steer, speed=0.0,
-                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+        # ---- decide if the path is usable ----
+        # Two failure modes count as "PP not giving a path":
+        #   (1) empty path, or
+        #   (2) MPPI flags path_bad (one-sided-cone heading flip — points the wrong way).
+        info = None
+        steer = accel_cmd = None
+        path_unusable = (not new_path)
+        if not path_unusable:
+            steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt)
+            path_unusable = bool(info.get("path_bad", False))
+
+        if path_unusable:
+            # ---- ONE-SIDED-CONE RECOVERY (option c) ----
+            nb, ny = node.get_local_cone_counts()
+            if nb > 0 and ny == 0:
+                rsteer = -RECOVER_STEER          # only blue (left) -> turn right
+                recovering = True
+            elif ny > 0 and nb == 0:
+                rsteer = +RECOVER_STEER          # only yellow (right) -> turn left
+                recovering = True
+            else:
+                recovering = False               # can't tell side (both/neither in view)
+
+            if recovering:
+                racc = float(np.clip(0.6 * (RECOVER_SPEED - speed),
+                                     -mppi.ACCEL_MAX, mppi.ACCEL_MAX))
+                node.send_command(steering=rsteer, speed=RECOVER_SPEED, accel=racc)
+                last_steer = rsteer
+                if not was_recovering:
+                    side = "blue->RIGHT" if rsteer < 0 else "yellow->LEFT"
+                    print(f"[REC] one-sided cones ({side}) nb={nb} ny={ny} "
+                          f"steer={rsteer:+.2f} creep={RECOVER_SPEED:.1f} m/s", flush=True)
+            else:
+                # ambiguous (both or no cones near) -> safe coast, hold last steer
+                node.send_command(steering=last_steer, speed=0.0,
+                                  accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+                if not was_recovering:
+                    print(f"[REC] path unusable, side ambiguous nb={nb} ny={ny} -> coast/stop",
+                          flush=True)
+            was_recovering = True
             time.sleep(0.05)
             continue
+
+        if was_recovering:
+            print("[REC] PP recovered -> back to MPPI", flush=True)
+            was_recovering = False
 
         path_points = np.array(new_path)
         route_x, route_y = path_points[:, 0], path_points[:, 1]
@@ -134,9 +183,6 @@ def main():
             vt_viz = np.full_like(route_x, MAX_VELOCITY)
             viz = TelemetryVisualizer(route_x, route_y, vt_viz)
             plt.show()
-
-        # ---- run MPPI ----
-        steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt)
 
         # Clamp to hardware limits (safety)
         steer     = float(np.clip(steer,     -MAX_STEER_RAD,  MAX_STEER_RAD))
