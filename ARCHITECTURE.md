@@ -525,50 +525,63 @@ single visible wall) belongs in the planner.
 
 ---
 
-## 10. Build & run 
+````md
+## 10. Build & Run
 
-#Note: Ensure to change the path of the folder as per local structure!
+> **Note:** Update the project path according to your local directory structure.
+
+### Build the workspace
 
 ```bash
 cd RAMS-e-25
 colcon build --symlink-install
 source install/setup.bash
-```
-```
-Store the package runner in ~/.bashrc for further use
-```
-echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc 
-```
-Restart the terminal (sources the package)
+````
 
-#to launch the sim:
+### Add the workspace to your shell (recommended)
+
+Store the package setup script in `~/.bashrc` so it is sourced automatically for future terminals.
+
+```bash
+echo "source ~/eufs_dev/RAMS-e-25/install/setup.bash" >> ~/.bashrc
+```
+
+Restart your terminal (or run `source ~/.bashrc`) to apply the changes.
+
+### Launch the simulator
+
+```bash
 ros2 launch eufs_launcher eufs_launcher.launch.py
+```
 
-# to launch the stack : (perception + slam + planning):
+### Launch the autonomous stack
+
+(Perception + SLAM + Planning)
+
+```bash
 ros2 launch bringup stack.launch.py
+```
 
-# to run the controller controller:
+### Run the controller
+
+```bash
 MPPI_CSV=/tmp/mppi_trace.csv ros2 run controls control_node
+```
 
-#### #NOTE: Do ensure to set the driving mode to manual drive for the car to move
-Run the EUFS simulator with the driving mode set to
-**manual/“go”** so the car accepts `/cmd`, and make sure the EUFS workspace is sourced (the
-cone-recovery uses the `eufs_msgs` message type).
+> **Important:** Before running the controller, set the EUFS simulator driving mode to **Manual ("Go")**. Otherwise, the vehicle will not accept `/cmd` commands. Also ensure that the EUFS workspace is sourced, as the cone recovery module depends on the `eufs_msgs` message definitions.
 
 ---
 
-## 11. Known limitations & where we're heading
+## 11. Known Limitations & Future Work
 
-- **Tracking quality:** the car cuts slightly to the inside of corners (a pure-pursuit look-ahead
-  effect) and slows itself when off-line. Curvature-/speed-adaptive look-ahead is the next step.
-- **One-sided cones:** handled today by the recovery fallback; the fuller fix (synthesise a centreline
-  from a single wall) belongs in the planner.
-- **SLAM timing:** the stack currently leans on the live `/slam/odom_raw`. Removing that dependence is
-  a SLAM-side roadmap item (a fast live updater plus a slower correction filter).
-- **Lap end:** behaviour at the end of the known path (clean stop vs. loop closure) is still being
-  defined.
-- **Speed:** capped low (`V_MAX = 2.5`) while we harden tracking; the corner speed profile is already
-  in place for when we raise it.
+* **Tracking quality:** The vehicle tends to cut slightly toward the inside of corners due to the fixed pure-pursuit look-ahead distance. Curvature- and speed-adaptive look-ahead is planned to improve tracking.
 
-The current milestone: the car **completes a full lap** of the test track end-to-end through this
-pipeline.
+* **One-sided cone detection:** Currently handled by the recovery fallback. A more robust solution—generating a centreline from a single cone wall—will be implemented within the planner.
+
+* **SLAM timing:** The stack currently relies on the live `/slam/odom_raw` topic. Future work aims to remove this dependency by introducing a fast live update stage alongside a slower correction filter.
+
+* **End-of-lap behaviour:** The behaviour after reaching the end of the known path (clean stop vs. loop closure) is still under development.
+
+* **Speed:** The maximum speed is currently limited (`V_MAX = 2.5 m/s`) while tracking performance is being refined. The curvature-based speed profile is already implemented and will support higher speeds in future releases.
+
+
