@@ -25,12 +25,15 @@ class ROSInterface(Node):
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
         self.have_odom = False
 
-        # Cones (for the one-sided-cone RECOVERY: blue-only -> steer right, yellow-only ->
-        # steer left). /slam/map_cones is the global SLAM map, so we count only cones that
-        # are NEAR + AHEAD of the car (approximates what's currently in view).
-        self._cones_blue   = []   # list[(x,y)] map frame
+        # Cones (for the one-sided-cone RECOVERY: blue dominates -> steer right, yellow
+        # dominates -> steer left). /slam/map_cones is the global SLAM map; we count only
+        # cones inside the SAME sector FOV the PP node plans on, so REC's "which wall do we
+        # see" matches what PP actually built its (bad) path from. Matches pp_node_skidpad.py.
+        self._cones_blue   = []                  # list[(x,y)] map frame
         self._cones_yellow = []
-        self.CONE_NEAR_R   = 12.0 # m: radius around car to consider "in view"
+        self.FOV_VERTEX = -5.0                   # m: FOV vertex 5 m behind car along heading
+        self.FOV_RADIUS = 30.0                   # m: sector radius from the vertex
+        self.FOV_HALF   = math.radians(45.0)     # half-angle (PP uses fov.angle_deg = 90)
 
         # Ground-truth velocity (SLAM odom twist is always 0; GT carries real twist).
         # We take POSITION/yaw from /slam/odom (PP's frame) but SPEED from GT.
@@ -52,6 +55,8 @@ class ROSInterface(Node):
         self.DEDUP_R   = 0.4                 # m: don't add a point within this of an existing one
         self.BEHIND_M  = 1.0                 # m: drop points more than this BEHIND the car
         self.AHEAD_MAX = 25.0                # m: cap how far ahead we keep (bounded buffer)
+        self.MAX_GAP_M = 3.5                 # m: when chaining points into a path, a jump bigger
+                                             #    than this ends the path (stray cone / other lane)
 
         # Best Effort QoS (typical for high-rate sensor-ish streams)
         self.qos_best_effort = QoSProfile(
@@ -95,20 +100,26 @@ class ROSInterface(Node):
         self._cones_yellow = [(float(c.point.x), float(c.point.y)) for c in msg.yellow_cones]
 
     def get_local_cone_counts(self):
-        """Count blue/yellow cones that are NEAR and roughly AHEAD of the car
-        (approximates what's currently in view, from the global SLAM map).
-        Returns (n_blue, n_yellow). Used for one-sided-cone recovery."""
+        """Count blue/yellow cones inside the SAME sector FOV the PP node plans on
+        (vertex FOV_VERTEX m behind the car, radius FOV_RADIUS m, +/-FOV_HALF around
+        heading). So the recovery's 'which wall is visible' matches what PP actually
+        saw when it built the (bad) path. Returns (n_blue, n_yellow)."""
         cx, cy, yaw = self.cx, self.cy, self.yaw
-        fx, fy = math.cos(yaw), math.sin(yaw)
-        r2 = self.CONE_NEAR_R * self.CONE_NEAR_R
+        cs, sn = math.cos(yaw), math.sin(yaw)
+        R2 = self.FOV_RADIUS * self.FOV_RADIUS
 
         def count(cones):
             n = 0
             for (px, py) in cones:
                 dx, dy = px - cx, py - cy
-                if dx * dx + dy * dy > r2:
+                lx =  cs * dx + sn * dy          # forward (car frame)
+                ly = -sn * dx + cs * dy          # left
+                vx = lx - self.FOV_VERTEX        # relative to the FOV vertex (behind car)
+                vy = ly
+                rr = vx * vx + vy * vy
+                if rr < 1e-6 or rr > R2:          # outside the sector radius
                     continue
-                if dx * fx + dy * fy < -1.0:      # behind the car -> ignore
+                if abs(math.atan2(vy, vx)) > self.FOV_HALF:   # outside the +/-45 deg wedge
                     continue
                 n += 1
             return n
@@ -165,17 +176,33 @@ class ROSInterface(Node):
     def get_path(self):
         """
         Return the accumulated rolling-window path AHEAD of the car (map frame),
-        ordered by arc-length from the car. Points the car has passed are pruned.
-        Falls back to the last good raw PP frame if the buffer is too thin.
+        ordered ALONG THE TRACK by greedy nearest-neighbour chaining from the car.
+        Points the car has passed are pruned. Falls back to the last good raw PP
+        frame if the buffer is too thin.
         """
         self._prune_accum()
-        # order the kept points by distance projected along the car heading so the
-        # controller gets a monotonically-forward path (not jumbled by insertion order)
-        cx, cy, cyaw = self.cx, self.cy, self.yaw
-        fx, fy = math.cos(cyaw), math.sin(cyaw)
-        scored = sorted(self._accum, key=lambda p: (p[0] - cx) * fx + (p[1] - cy) * fy)
-        if len(scored) >= self._min_path_points:
-            return scored
+        pts = list(self._accum)
+        if len(pts) >= self._min_path_points:
+            # Reconstruct the 1-D track order from the 2-D point cloud by greedy
+            # nearest-neighbour starting at the car. The OLD code sorted by projection
+            # onto the car heading, which ZIG-ZAGGED on curves (a point far along a bend
+            # projects small and interleaves with near points) -> 70-500 m garbage
+            # splines no controller can follow. We stop the chain at a big gap so a
+            # stray cone / the other lane can't make it jump back across the track.
+            cx, cy = self.cx, self.cy
+            remaining = pts[:]
+            cur = min(remaining, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+            remaining.remove(cur)
+            ordered = [cur]
+            while remaining:
+                lx, ly = ordered[-1]
+                nxt = min(remaining, key=lambda p: (p[0] - lx) ** 2 + (p[1] - ly) ** 2)
+                if math.hypot(nxt[0] - lx, nxt[1] - ly) > self.MAX_GAP_M:
+                    break                       # next point too far -> path ends here
+                ordered.append(nxt)
+                remaining.remove(nxt)
+            if len(ordered) >= self._min_path_points:
+                return ordered
         # not enough accumulated yet -> use the latest good raw PP frame
         if self._last_good_path:
             return self._last_good_path

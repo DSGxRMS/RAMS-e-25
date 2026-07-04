@@ -10,18 +10,18 @@ PERFORMANCE (the reason this works in WSL2 now):
   passthrough adds ~0.6 ms overhead PER kernel launch, and the per-step Python
   loop launches thousands of tiny kernels.
   Fixed with CUDA GRAPHS: the whole T-step rollout is captured once into a graph
-  and replayed as a SINGLE GPU submission.  Benchmarked K=1024,T=100 -> 37.8 ms
-  (bit-identical to the plain rollout).  Stays fully on GPU, full sample count.
+  and replayed as a SINGLE GPU submission (K=1024,T=200 -> ~80 ms in WSL2,
+  bit-identical to the plain rollout).  Stays fully on GPU, full sample count.
 
-DESIGN NOTES (EUFS-specific, validated by headless tests):
-  - SLAM odom twist = 0 -> speed estimated from windowed position regression.
-  - PP path is a sparse 5-11 pt rolling window -> arc-length interpolation.
-  - Kinematic yaw injection (yawRate = Vx*tan(steer)/L) each step: the NN was
-    trained where yawRate already tracked the kinematic value, so its dyawRate is
-    a small residual, not the primary yaw driver.
-  - V_PLAN_MIN injected into rollout Vx so the NN sees in-distribution speed and
-    trajectories spread (gives meaningful steering cost).
-  - K_FF=0: curvature feedforward off (np.gradient on ~6 pts is noise).
+DESIGN NOTES (EUFS-specific):
+  - Speed comes from /ground_truth/odom twist (SLAM odom twist is 0) and is fed
+    straight into the rollout state Vx (exp10 model is valid 0-13.9 m/s; no floor).
+  - PP path is a sparse 5-11 pt rolling window -> B-spline smoothed + densely
+    resampled, giving a clean arc-length reference and analytic curvature.
+  - Steering = K_FF * spline-curvature feedforward + MPPI sampled correction.
+  - The rollout steps the grey-box model with [steer, longitudinal] only; yaw rate
+    evolves from the learned dynamics (no per-step kinematic yaw injection). The
+    measured yaw rate seeds only the INITIAL rollout state.
 
 AUTHOR: Soumil (RMS controls team)
 """
@@ -31,7 +31,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import math
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -190,42 +189,78 @@ class MPPIController:
     # -> turned in late / ran wide). T=200 keeps a 1.0 s horizon, identical to MATLAB
     # fs_mppi (o.T=200, o.dt=0.005). ~2x the compute of T=100 (~80 ms in WSL2), still fine.
     T           = 200         # horizon steps (200 * 0.005 = 1.0 s rollout)  [MATLAB o.T]
-    DT          = 0.005       # model training dt
     DT_EFF      = 0.005       # rollout dt = training dt (num_rk4_steps=1)    [MATLAB o.dt]
     USE_EULER   = False       # RK4 (full accuracy; CUDA graph makes it affordable)
-    LAMBDA      = 1.0         # (legacy fixed temperature — replaced by adaptive lam)
     LAMBDA_FRAC = 0.15        # adaptive softmax temp = LAMBDA_FRAC * (cost_max-cost_min)
     LAMBDA_MIN  = 1e-3        # floor so lam never hits 0 when all costs identical
-    SIG_STEER   = 0.08        # steer noise (rad)            [MITL]
+    SIG_STEER   = 0.08        # per-step steer JITTER (rad)  [MITL] (fine exploration)
+    # ---- sustained per-sample bias (this is what makes MPPI actually work) -------
+    # Pure per-step white noise (the old code) averages out over T=200 steps: a
+    # sample's NET sustained lean is only SIG_STEER/sqrt(T) ~= 0.006 rad, so all 1024
+    # rollouts drove to ~the same place -> identical cost -> nEff~1024 -> MPPI dead.
+    # SIG_BIAS gives each sample ONE steady steer offset held across the whole horizon
+    # (some lean left, some right), so the rollouts fan out into genuinely different
+    # trajectories -> the cost gets a real gradient -> the softmax can pick the plan
+    # that hugs the path. This is the lever that makes MPPI carry the steering instead
+    # of the feedforward. Tune: too small -> MPPI stays weak (nEff near 1024); too big
+    # -> jittery / over-exploring. Watch nEff DROP well below 1024 once this is on.
+    SIG_BIAS    = 0.05        # sustained per-sample steer bias (rad)
+                              # 0.12 woke MPPI but TOO aggressively: it made bold
+                              # full-lock commits and, when the path reference was even
+                              # slightly off, committed boldly the WRONG way -> violent
+                              # left/right oscillation, off-track in seconds. 0.05 keeps
+                              # MPPI discriminating (nEff still drops below 1024) but its
+                              # corrections are gentle. Ramp UP only if stable & too weak.
     STEER_MAX   = 0.349       # 20° — model range
     W_CT        = 1.0         # crosstrack weight (Huber)    [MITL]
     W_HEAD      = 0.3         # pure-pursuit heading weight  [MITL]
     CT_SAT      = 5.0         # Huber knee (m)               [MITL]
-    LOOKAHEAD_M = 5.0         # arc-length preview offset (m). Pure-pursuit cuts the inside
-                              # of a corner by ~L^2/(2R). MATLAB used 8 m on Thunderhill
-                              # (R=22-75 m -> tiny cut), but our skidpad is R~10-12 m, so
-                              # 8 m cut ~2.6 m inside (seen as steady CTE~-4). 5 m -> ~1 m
-                              # cut. (The dt fix, not lookahead, is what fixed late turn-in.)
-                              # Clamped at runtime to <=0.5*remaining-path on short windows.
+    LOOKAHEAD_M = 3.0         # FIXED arc-length preview offset (m). Bigger = the feedforward
+                              # reads the curve sooner and turns in EARLY (cuts the inside);
+                              # smaller = turns late (runs wide). At V_MAX=2.5 the rollout only
+                              # reaches ~2.5 m, so lookahead must be near that, not beyond it.
+                              # History: 5 m & 4 m both cut inside ~3 m at speed; 1.5-2.5 ran
+                              # wide BUT only because the speed collapsed (now fixed via the
+                              # softer CT0/K_CT). 3 m ~= the planning reach. DO NOT make this
+                              # speed-adaptive again; tune the fixed value if it cuts/runs wide.
     K_FF        = 0.85        # curvature feedforward gain (MATLAB o.k_ff)
     SPLINE_NPTS   = 40        # dense points resampled from the B-spline
-    SPLINE_SMOOTH = 0.05      # spline smoothing factor per point (0=interpolate, >0=smooth)
+    SPLINE_SMOOTH = 0.12      # spline smoothing per point. Raised 0.05->0.12: the rolling-
+                              # window accumulator keeps slightly-offset centreline points from
+                              # different PP frames, so a near-interpolating spline wiggled and
+                              # the curvature spiked -> feedforward slammed the wheel. More
+                              # smoothing irons out sub-~0.35 m point noise while keeping real
+                              # corner shape (corners are bigger features than the noise).
 
-    # ---- longitudinal (PI controller, applied to ACCEL output) ----  [MITL values]
-    KP          = 0.35
+    # ---- longitudinal (PI controller, applied to ACCEL output) ----
+    KP          = 0.50        # raised 0.35->0.50: tighter P tracking so actual hugs target
+                              # (on GT there's no sensor noise to amplify, so a firmer P is safe)
     KI          = 0.10
-    I_CLAMP     = 5.0
+    I_CLAMP     = 1.5         # was 5.0. The integral could reach KI*5=0.5 of full throttle —
+                              # a HUGE positive bias that wound up during launch / straights and
+                              # then RESISTED braking when the corner target dropped -> actual
+                              # overshot target by up to 1.9 m/s. 1.5 -> max KI*I=0.15 trim only.
+    I_BAND      = 1.0         # only integrate when |target-actual| < this. The integral's job is
+                              # steady-state trim near the setpoint; during big transients (launch,
+                              # corner-exit accel) P handles it and the integral must NOT wind up.
     KP_ROLL     = 0.40        # P-only longitudinal INSIDE the rollout (track target speed)
-    V_FLOOR     = 3.0         # (legacy, no longer used for vr_eff floor)
     V_CREEP     = 1.0         # tiny hard floor so the car never fully stops on a live path
     HORIZON_CAP_FRAC = 0.5    # cap speed so 50% of the horizon fits in visible path
-    PATH_END_M  = 1.5         # if <this much path remains ahead, hold steer + crawl
     STOP_PATH_M = 1.5         # if remaining path < this, command a FULL STOP (don't drive blind)
     BRAKE_A     = 2.5         # m/s^2 braking decel used for the stop-at-path-end ramp
-    V_MAX       = 2.5         # max speed (m/s) — senior's request; very slow so PP/SLAM
-                              # have max time and control is smooth. exp10 valid this low.
-    CT0         = 4.0         # CTE threshold for speed reduction (m)  [MITL]
-    K_CT        = 0.7         # [MITL]
+    V_MAX       = 3.0         # max speed (m/s). Moderate test speed now that the model is
+                              # actually loaded (was running on random weights — see
+                              # model-weights-never-loaded). 3 m/s gives a clean read of the
+                              # now-working MPPI without the "outrun the ~10 m PP path" risk
+                              # that 5 m/s had. Bump toward 5 for the senior's high-speed test
+                              # once low/mid speed is confirmed good. exp10 model valid 0-12 m/s.
+    # CTE -> speed reduction. SOFTENED from MITL (CT0=4, K_CT=0.7) to break a death
+    # spiral: at low V_MAX the old values crushed speed to ~0.75 m/s when off-line, and
+    # at that speed MPPI can only plan ~1 m ahead, so it cut the corner MORE -> more CTE
+    # -> even slower -> a 1-2 m cut snowballed to 6 m through the cones. CT0=8/K_CT=0.4
+    # keeps ~2 m/s even at 4 m off-line, so MPPI can still see far enough to steer back.
+    CT0         = 8.0         # CTE (m) at which the speed reduction reaches its max
+    K_CT        = 0.4         # how hard to slow per unit CTE (gentler than MITL 0.7)
     ACCEL_MAX   = 3.0         # m/s²  (EUFS sim clip: -3 .. 3)
     HD_BAD_RAD  = 1.4         # ~80°: if path heading at car is more off than this,
                               # the path is one-sided-cone garbage -> stop, don't chase
@@ -234,16 +269,11 @@ class MPPIController:
                               # braking pass (ports MATLAB fs_mppi_init.m vt mechanism).
 
     # ---- planning speed for rollout ----
-    # exp10 model is valid 0-13.9 m/s (x_min[Vx]=0), so we feed the REAL measured
-    # speed into the rollout state Vx (no lie/floor). Only cap the TOP at the model's
-    # training ceiling so we never extrapolate above it.
-    # (V_PLAN_MIN removed — it was the old exp09 floor, now unused.)
+    # exp10 model is valid 0-13.9 m/s (x_min[Vx]=0); feed the REAL measured speed into
+    # the rollout state Vx, only capping the TOP at the model's training ceiling.
     V_PLAN_MAX  = 13.0        # exp10 training ceiling (~13.9) — never feed Vx above this
     SPEED_SANE_MAX = 16.0     # reject absurd odom readings
     L_WB_KIN    = 1.535       # wheelbase for kinematic yaw injection
-
-    # ---- windowed speed estimator ----
-    SPD_WINDOW_S = 0.5
 
     def __init__(self, ckpt_path=None, force_cpu=False):
         # ---- device ----
@@ -260,8 +290,20 @@ class MPPIController:
         # ---- load checkpoint ----
         cp = ckpt_path or CKPT_PATH
         ck = torch.load(str(cp), map_location=self.dev, weights_only=False)
-        self.model = _GB(ck).to(self.dev)
+        self.model = _GB(ck)
+        # CRITICAL: load the TRAINED weights. _GB.__init__ only sets up the
+        # normalisation buffers + a RANDOM _Func; WITHOUT this load the Neural ODE runs
+        # on random weights, so the rollout ignores steering completely (every MPPI
+        # sample rolls out the same -> nEff=1024 "MPPI dead", and whenever MPPI did act
+        # it was trusting a random world-model -> steered the wrong way). model_state_dict
+        # holds both the norm buffers and the func.net.* weights; its keys line up exactly
+        # with _GB.state_dict(), so this one call restores the real model.
+        self.model.load_state_dict(ck["model_state_dict"])
+        self.model = self.model.to(self.dev)
         self.model.eval()
+        # sanity: trained net should NOT look like default init (std ~0.2)
+        _w_std = float(self.model.func.net[0].weight.std())
+        print(f"[MPPI] model weights loaded (net[0].weight std={_w_std:.3f})")
         self._dt_t = torch.tensor(self.DT_EFF, dtype=torch.float32, device=self.dev)
 
         # ---- static buffers for the rollout (fixed addresses for CUDA graph) ----
@@ -287,7 +329,6 @@ class MPPIController:
 
         # ---- longitudinal PI state ----
         self.I_spd = 0.0
-        self._last_good_steer = 0.0   # held at path-end until PP extends the path
         self._ahead_lp = 8.0          # smoothed path-ahead (m), seeded mid-range
         self._vr_lp    = self.V_CREEP # smoothed target speed (rate-limited down)
 
@@ -299,9 +340,6 @@ class MPPIController:
         # ---- yaw-rate (finite diff + low-pass) ----
         self.prev_yaw = None
         self.yaw_rate = 0.0
-
-        # ---- windowed speed estimator ----
-        self._pose_window = deque()
 
         self._dbg_ctr = 0
 
@@ -443,7 +481,11 @@ class MPPIController:
         nN   =  np.cos(heading)
 
         # ---- C3 curvature feedforward from the SMOOTH spline curvature ----
-        kap = np.clip(kap, -0.5, 0.5)
+        # Clip tightened 0.5->0.3: the track's tightest corner is ~R>3 m (|kap|<0.3),
+        # so 0.5 (R=2 m) was pure headroom that only let curvature NOISE spike the
+        # feedforward to near full lock (ff=atan(1.535*0.5)=0.65). 0.3 caps ff at 0.43
+        # without clipping any real corner, killing the spurious hard-steer spikes.
+        kap = np.clip(kap, -0.3, 0.3)
         ff_steer = np.arctan(self.L_WB_KIN * kap)
 
         # ---- CORNER SPEED PROFILE (ports MATLAB fs_mppi_init.m:16-25) ----------
@@ -494,7 +536,6 @@ class MPPIController:
         # gt_speed). The gt_vs_slam diagnostic proved it is clean and accurate
         # (Vx climbs 0->32 smoothly, Vy=0). The old windowed position-regression
         # spiked to 25 m/s on position jumps and poisoned the rollout — removed.
-        reg_spd = 0.0   # kept for debug-line compatibility
         _speed = float(np.clip(float(speed), 0.0, self.SPEED_SANE_MAX))
         # Feed the REAL measured speed into the rollout state Vx (exp10 is valid down
         # to 0 m/s, so NO vplan "lie" needed). Only clamp the very top to the model's
@@ -529,13 +570,37 @@ class MPPIController:
         _hd_off     = abs(_angle_diff(yaw, _hd_ref_now))
         path_is_bad = (_hd_off > self.HD_BAD_RAD)
 
+        # ---- CLEAN HAND-OFF: bail out early on a bad path ----------------------
+        # If the path is garbage (points the wrong way), the recovery in control_node
+        # takes over and ignores whatever we return here. So DON'T run the heavy rollout
+        # and DON'T touch any of MPPI's carried-over "memory":
+        #     self.nom    -> the warm-started steering plan
+        #     self._vr_lp -> the smoothed target speed
+        #     self.I_spd  -> the speed integral
+        # All three are updated only LATER in this function, so returning now FREEZES them
+        # exactly as they were on the last GOOD frame. That way, when the path becomes good
+        # again and control hands the wheel back to MPPI, MPPI resumes from its last good
+        # plan instead of one quietly corrupted by the garbage path -> no confused transition.
+        if path_is_bad:
+            return 0.0, 0.0, {
+                "target_speed": 0.0,
+                "cte":          cte_val,
+                "heading_err":  float(_angle_diff(yaw, _hd_ref_now)),
+                "mean_traj":    [],
+                "path_bad":     True,
+            }
+
         # ---- horizon capped to AVAILABLE path length (anti-outrun) ----
         # The car must never plan/drive beyond the ~12 m it can actually see, else
         # it aims at nothing, locks steering, and runs off in circles.
         s_cur     = float(pd["s"][self.cur].item())
         s_max     = float(pd["s"][-1].item())
-        # Adaptive preview: aim LOOKAHEAD_M ahead, but never beyond half the remaining
-        # path (a short PP window must not push the reference past the path end).
+        # FIXED preview (reverted from speed-adaptive). The speed-adaptive version shrank
+        # the lookahead to its floor exactly when the car SLOWED into a corner -> it lost
+        # anticipation -> turned in too LATE -> ran WIDE and diverged (CTE +10). That was
+        # the same failure short lookahead always caused. A fixed preview is stable and
+        # never collapses mid-corner; only clamp it to half the visible path so a short PP
+        # window can't push the reference past the path end.
         lookahead_eff = min(self.LOOKAHEAD_M, 0.5 * max(s_max - s_cur, 0.0))
         path_ahead = max(s_max - s_cur - lookahead_eff, 0.5)   # metres of path left
         # speed that keeps the *first part* of the horizon within the visible path.
@@ -575,9 +640,9 @@ class MPPIController:
         vr_eff = float(self._vr_lp)
 
         # ---- arc-length reference horizon ----
-        # pace marches reference points along the path per rollout step at the
-        # planning speed (so the rollout reference matches the speed we intend),
-        # but never beyond the visible path (clamped to s_max).
+        # pace marches reference points along the path per rollout step at the planning
+        # speed (so the rollout reference matches the speed we intend), but never beyond
+        # the visible path (clamped to s_max).
         pace_m = max(vr_eff, 0.5) * self.DT_EFF
         s_tgt  = torch.clamp(
             s_cur + lookahead_eff
@@ -592,9 +657,15 @@ class MPPIController:
         # P-longitudinal anticipates the corner too, matching MATLAB vtgt=Vr_eff(ti))
         vtgt_t = _interp_1d(pd["s"], pd["vt"], s_tgt)
 
-        # ---- steer samples ----
-        eps = self.SIG_STEER * torch.randn(self.K, self.T, device=dev)
-        A   = (self.nom + eps).clamp(-self.STEER_MAX, self.STEER_MAX)
+        # ---- steer samples: sustained per-sample bias + fine per-step jitter ----
+        # bias: ONE steady offset per sample, held across the whole horizon -> the
+        #       1024 rollouts fan out into truly different trajectories (the thing that
+        #       makes the cost discriminate and MPPI actually steer). See SIG_BIAS note.
+        # jit:  small per-step exploration on top, for fine variation.
+        bias = self.SIG_BIAS  * torch.randn(self.K, 1, device=dev)
+        jit  = self.SIG_STEER * torch.randn(self.K, self.T, device=dev)
+        eps  = bias + jit
+        A    = (self.nom + eps).clamp(-self.STEER_MAX, self.STEER_MAX)
 
         # ---- fill static buffers ----
         self._A.copy_(A)
@@ -644,7 +715,6 @@ class MPPIController:
 
         # ---- DEBUG: cost + sample diversity diagnostics ----
         cost_min  = float(cost.min()); cost_max = float(cost.max())
-        cost_mean = float(cost.mean())
         # effective sample size: ~K if all equal-weighted (degenerate), ~1 if one dominates
         n_eff     = float(1.0 / (wts * wts).sum())
         # steer sample diversity at t=0 (are the 1024 samples actually different?)
@@ -667,10 +737,13 @@ class MPPIController:
         err          = vr_eff - _speed
         raw          = self.KP * err + self.KI * self.I_spd
         lon0         = float(np.clip(raw, -1.0, 1.0))
-        # Anti-windup: only integrate when NOT saturated, or when the error would
-        # push the command back out of saturation. Stops the integral pinning accel.
+        # Anti-windup: integrate ONLY when (a) the command isn't saturated AND (b) we're
+        # close to the target (|err| < I_BAND). Integrating during big transients wound the
+        # integral up into a large positive bias that then RESISTED braking when the corner
+        # target dropped -> the car overshot target by up to ~1.9 m/s and entered corners hot.
+        # Near the setpoint the integral just trims steady-state error; P handles transients.
         saturated    = (raw >= 1.0 and err > 0.0) or (raw <= -1.0 and err < 0.0)
-        if not saturated:
+        if (not saturated) and abs(err) < self.I_BAND:
             self.I_spd = float(np.clip(self.I_spd + err * dt_ros, -self.I_CLAMP, self.I_CLAMP))
         accel_out    = lon0 * self.ACCEL_MAX
 
@@ -706,6 +779,8 @@ class MPPIController:
             "heading_err":  float(heading_err),
             "mean_traj":    mean_traj,
             "path_bad":     bool(path_is_bad),   # one-sided-cone heading flip -> recovery
+            "n_eff":        n_eff,               # MPPI sample diversity (K=degenerate, 1=peaked)
+            "actual_speed": _speed,              # measured speed (for the speed-tracking plot)
         }
 
     # =====================================================================

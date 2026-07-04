@@ -569,10 +569,13 @@ class PFSlamNode(Node):
                 cone.point.y = float(tr.y)
                 cone.point.z = 0.0
 
+                # class_id convention MUST match perception (camera_node + fusion_node):
+                #   yellow = 0, blue = 1, orange = 2, big_orange = 3.
+                # (was 0->blue, 1->yellow here, which SWAPPED blue/yellow vs perception.)
                 if tr.cls_id == 0:
-                    msg.blue_cones.append(cone)
-                elif tr.cls_id == 1:
                     msg.yellow_cones.append(cone)
+                elif tr.cls_id == 1:
+                    msg.blue_cones.append(cone)
                 elif tr.cls_id == 2:
                     msg.orange_cones.append(cone)
                 elif tr.cls_id == 3:
@@ -603,10 +606,11 @@ class PFSlamNode(Node):
             cone.point.y = y
             cone.point.z = 0.0
 
+            # class_id convention MUST match perception: yellow=0, blue=1, orange=2, big=3.
             if cls_id == 0:
-                msg.blue_cones.append(cone)
-            elif cls_id == 1:
                 msg.yellow_cones.append(cone)
+            elif cls_id == 1:
+                msg.blue_cones.append(cone)
             elif cls_id == 2:
                 msg.orange_cones.append(cone)
             elif cls_id == 3:

@@ -57,10 +57,15 @@ COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel whi
 # OR it points the wrong way — the one-sided-cone heading flip) AND only one cone colour is
 # in view, steer a fixed gentle angle toward the MISSING wall at a slow creep until PP
 # recovers, then hand back to MPPI. FS convention: blue=LEFT edge, yellow=RIGHT edge.
-#   only blue (left) visible  -> turn RIGHT  (steer < 0)
-#   only yellow (right) visible-> turn LEFT   (steer > 0)
+#   blue (left) DOMINATES   -> turn RIGHT  (steer < 0)
+#   yellow (right) DOMINATES -> turn LEFT   (steer > 0)
+# We use a DOMINANCE RATIO, not "exactly zero of the other colour": in a 12 m radius
+# there's almost always >=1 cone of each colour, so the old "ny==0" test never fired and
+# the car just coasted to a stop. Now if one colour outnumbers the other by RECOVER_RATIO
+# (and has >=2 cones), we treat that wall as the only usable one and steer off it.
 RECOVER_STEER = 0.20         # rad (gentle, not full lock)
 RECOVER_SPEED = 1.0          # m/s creep during recovery
+RECOVER_RATIO = 3.0          # one colour must outnumber the other by this to act
 
 if VIZ:
     import matplotlib.pyplot as plt
@@ -103,8 +108,11 @@ def main():
 
     # ---- trajectory recorder (for the exit plot) ----
     rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte = [], [], [], [], []
+    rec_neff, rec_tgt_spd, rec_act_spd = [], [], []   # MPPI diversity + speed tracking
     rec_path_pts = []         # snapshots of (route_x, route_y) every N cycles
     rec_ctr = 0
+    rec_episodes = 0          # how many times REC took over (one-sided-cone recovery)
+    rec_seconds  = 0.0        # total sim-time spent in REC
 
     if VIZ:
         plt.ion()
@@ -140,16 +148,25 @@ def main():
             path_unusable = bool(info.get("path_bad", False))
 
         if path_unusable:
-            # ---- ONE-SIDED-CONE RECOVERY (option c) ----
+            # tally REC usage for the exit plot: one episode per entry, plus dwell time
+            if not was_recovering:
+                rec_episodes += 1
+            rec_seconds += dt
+            # ---- ONE-SIDED-CONE RECOVERY (cone-colour dominance) ----
+            # The SLAM blue/yellow swap is now fixed, so the cone colours are CORRECT and
+            # this reads the right wall. FS convention: blue = LEFT edge, yellow = RIGHT.
+            #   blue dominates  (car near left wall)  -> steer RIGHT (-RECOVER_STEER)
+            #   yellow dominates (car near right wall) -> steer LEFT  (+RECOVER_STEER)
+            # Counts come from the same sector FOV the planner uses (get_local_cone_counts).
             nb, ny = node.get_local_cone_counts()
-            if nb > 0 and ny == 0:
-                rsteer = -RECOVER_STEER          # only blue (left) -> turn right
+            if nb >= 2 and (ny == 0 or nb >= RECOVER_RATIO * ny):
+                rsteer = -RECOVER_STEER          # blue (left) dominates -> turn right
                 recovering = True
-            elif ny > 0 and nb == 0:
-                rsteer = +RECOVER_STEER          # only yellow (right) -> turn left
+            elif ny >= 2 and (nb == 0 or ny >= RECOVER_RATIO * nb):
+                rsteer = +RECOVER_STEER          # yellow (right) dominates -> turn left
                 recovering = True
             else:
-                recovering = False               # can't tell side (both/neither in view)
+                recovering = False               # both walls balanced -> can't tell side
 
             if recovering:
                 racc = float(np.clip(0.6 * (RECOVER_SPEED - speed),
@@ -161,7 +178,7 @@ def main():
                     print(f"[REC] one-sided cones ({side}) nb={nb} ny={ny} "
                           f"steer={rsteer:+.2f} creep={RECOVER_SPEED:.1f} m/s", flush=True)
             else:
-                # ambiguous (both or no cones near) -> safe coast, hold last steer
+                # both walls balanced / no cones -> safe coast, hold last steer
                 node.send_command(steering=last_steer, speed=0.0,
                                   accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
                 if not was_recovering:
@@ -192,6 +209,9 @@ def main():
         # ---- record for the exit trajectory plot ----
         rec_cx.append(cx); rec_cy.append(cy); rec_yaw.append(yaw)
         rec_steer.append(steer); rec_cte.append(info["cte"])
+        rec_neff.append(info.get("n_eff", float('nan')))
+        rec_tgt_spd.append(info.get("target_speed", float('nan')))
+        rec_act_spd.append(info.get("actual_speed", speed))
         rec_ctr += 1
         if rec_ctr % 5 == 1:                      # snapshot the PP path occasionally
             rec_path_pts.append((route_x.copy(), route_y.copy()))
@@ -239,13 +259,17 @@ def main():
     finally:
         print("[control_node] generating trajectory plot...", flush=True)
         try:
-            _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts)
+            _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts,
+                             rec_neff, rec_tgt_spd, rec_act_spd, mppi.K,
+                             rec_episodes, rec_seconds)
         except Exception as e:
             print(f"[plot] failed: {e}", flush=True)
         rclpy.shutdown()
 
 
-def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps):
+def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
+                     neff=None, tgt_spd=None, act_spd=None, K=1024,
+                     rec_episodes=0, rec_seconds=0.0):
     """Save GT car trajectory vs the PP path snapshots + diagnostics on exit.
     Uses the Agg backend so it ALWAYS saves to a PNG (never blocks/crashes on
     a second Ctrl+C). Saved to the D drive so it's visible from Windows."""
@@ -257,8 +281,8 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps):
         print("[plot] not enough data", flush=True)
         return
     cx = np.array(cx); cy = np.array(cy)
-    fig = plt.figure(figsize=(15, 8))
-    gs = fig.add_gridspec(3, 2, width_ratios=[2, 1], hspace=0.4, wspace=0.25)
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(5, 2, width_ratios=[2, 1], hspace=0.55, wspace=0.25)
 
     # main XY: car path + all PP path snapshots
     ax = fig.add_subplot(gs[:, 0])
@@ -270,14 +294,33 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps):
     ax.plot(cx, cy, '-', color='gray', lw=0.5, alpha=0.5)
     ax.scatter([cx[0]], [cy[0]], c='lime', s=140, marker='o', edgecolor='k', zorder=5, label='start')
     ax.scatter([cx[-1]], [cy[-1]], c='red', s=140, marker='X', edgecolor='k', zorder=5, label='end')
-    ax.set_title('Car trajectory (GT) vs PP path'); ax.set_xlabel('E (m)'); ax.set_ylabel('N (m)')
+    ax.set_title(f'Car trajectory (GT) vs PP path\n'
+                 f'one-sided-cone REC: fired {rec_episodes}x, {rec_seconds:.1f}s total',
+                 fontsize=11)
+    ax.set_xlabel('E (m)'); ax.set_ylabel('N (m)')
     ax.axis('equal'); ax.grid(alpha=0.3); ax.legend(fontsize=8)
     fig.colorbar(sc, ax=ax, label='time step', shrink=0.5)
 
     t = np.arange(len(cx))
     a1 = fig.add_subplot(gs[0, 1]); a1.plot(t, np.degrees(yaw), '-b'); a1.set_title('car yaw (deg)'); a1.grid(alpha=0.3)
     a2 = fig.add_subplot(gs[1, 1]); a2.plot(t, steer, '-m'); a2.set_title('steer cmd (rad)'); a2.grid(alpha=0.3)
-    a3 = fig.add_subplot(gs[2, 1]); a3.plot(t, cte, '-c'); a3.set_title('CTE (m)'); a3.set_xlabel('step'); a3.grid(alpha=0.3)
+    a3 = fig.add_subplot(gs[2, 1]); a3.plot(t, cte, '-c'); a3.set_title('CTE (m)'); a3.grid(alpha=0.3)
+
+    # nEff: MPPI sample diversity. K = degenerate (MPPI doing nothing), low = peaked/useful.
+    a4 = fig.add_subplot(gs[3, 1])
+    if neff is not None and len(neff):
+        a4.plot(t, np.array(neff), '-', color='darkorange')
+        a4.axhline(K, color='r', ls='--', lw=0.8, alpha=0.7, label=f'K={K} (MPPI dead)')
+        a4.set_ylim(0, K * 1.05); a4.legend(fontsize=7, loc='lower right')
+    a4.set_title('MPPI nEff (lower = MPPI useful)'); a4.grid(alpha=0.3)
+
+    # target vs actual speed (replaces the telemetry window you don't like)
+    a5 = fig.add_subplot(gs[4, 1])
+    if tgt_spd is not None and len(tgt_spd):
+        a5.plot(t, np.array(tgt_spd), '-', color='green', label='target')
+        a5.plot(t, np.array(act_spd), '-', color='black', lw=0.9, label='actual')
+        a5.legend(fontsize=7, loc='upper right')
+    a5.set_title('speed: target vs actual (m/s)'); a5.set_xlabel('step'); a5.grid(alpha=0.3)
 
     # save to the D drive so it's visible from Windows (\\wsl... or D:\)
     out = "/mnt/d/RAMS-e-25/mppi_trajectory.png"
