@@ -37,7 +37,7 @@ from scipy.interpolate import splprep, splev
 
 from controls.path_reference import project_reference
 from controls.random_seed import sampling_seed
-from controls.steering_actuator import SteeringActuator, steering_actuator_enabled
+from controls.steering_actuator import SteeringActuator, steering_actuator_enabled, steering_option
 
 # =========================================================================
 # Checkpoints are package data, available in source and colcon installs.
@@ -280,6 +280,7 @@ class MPPIController:
         # ---- load checkpoint (weights AND norm buffers) ----
         model_name = os.environ.get("MPPI_MODEL", "exp13")
         self.steering_actuator_enabled = steering_actuator_enabled(model_name)
+        self.elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model_name == "exp13")
         print(f"[MPPI] EUFS steering actuator model={'on' if self.steering_actuator_enabled else 'off'}",
               flush=True)
         if model_name == "exp13":
@@ -328,6 +329,7 @@ class MPPIController:
         # ---- warm-start nominal steer (full buffer width; only the active
         # horizon columns are consumed by the rollout each cycle) ----
         self.nom = torch.zeros(1, TM, device=dev)
+        self._previous_steering_plan = None
 
         # ---- longitudinal PI state ----
         self.I_spd  = 0.0
@@ -389,6 +391,34 @@ class MPPIController:
         self._wheel_angle.fill_(wheel_angle)
         self._steer_index.copy_(torch.as_tensor(indices, device=self.dev))
         self._queued_steer.copy_(torch.as_tensor(queued_full, device=self.dev))
+
+    def reset_steering_plan(self):
+        self.nom.zero_()
+        self._previous_steering_plan = None
+
+    def _warm_start(self, candidate_start_s, hold_steps):
+        """Resample the previous scored sequence on today's action timeline."""
+        previous = self._previous_steering_plan
+        if previous is None:
+            return self.nom, None
+        previous_start, previous_hold, available_steps, scored_steps = previous
+        elapsed_steps = (candidate_start_s - previous_start) / self.DT_EFF
+        if elapsed_steps >= available_steps:
+            # The previous plan no longer covers the next command.
+            return torch.zeros_like(self.nom), elapsed_steps
+
+        # Candidate zero is held for several integration steps. All subsequent
+        # candidates are spaced one model step apart.
+        offsets = np.arange(self.T_MAX, dtype=np.float64)
+        offsets[1:] += hold_steps - 1
+        aligned_offsets = offsets + elapsed_steps
+        indices = np.clip(aligned_offsets - previous_hold + 1, 0, scored_steps - 1)
+        indices[aligned_offsets < previous_hold] = 0
+        lower = np.floor(indices).astype(np.int64)
+        index = torch.as_tensor(lower, device=self.dev)
+        weight = torch.as_tensor(indices - lower, dtype=self.nom.dtype, device=self.dev)
+        shifted = torch.lerp(self.nom[:, index], self.nom[:, (index + 1).clamp_max(scored_steps - 1)], weight)
+        return shifted, elapsed_steps
 
     def _scheduled_steer(self, horizon):
         indices = self._steer_index[:horizon]
@@ -557,7 +587,7 @@ class MPPIController:
     #  compute — one MPPI planning step
     # =====================================================================
     def compute(self, x, y, yaw, speed, dt_ros, one_sided=True, speed_cap=None,
-                steering_prediction=None):
+                steering_prediction=None, steering_state_s=None):
         """Returns (steer, accel, info). `one_sided` = only one cone colour
         visible (from control_node's FOV counts); gates the bad-path guard.
         `speed_cap` = optional hard cap (m/s) on the speed target -- used to
@@ -704,10 +734,25 @@ class MPPIController:
         vtgt_t = _interp_1d(pd["s"], pd["vt"], s_tgt)
 
         # ---- steer samples: sustained per-sample bias + fine jitter ----
+        model_actuator = self.steering_actuator_enabled and steering_prediction is not None
+        prefix_steps, hold_steps = 0, 1
+        if model_actuator:
+            wheel_angle, queued, solve_s, measured_wheel = steering_prediction
+            prefix_steps = len(queued)
+            hold_steps = max(1, round(solve_s / self.DT_EFF))
+            self._set_steering_schedule(wheel_angle, queued, solve_s)
+
+        use_elapsed = self.elapsed_warm_start and steering_state_s is not None
+        elapsed_steps = None
+        if use_elapsed:
+            candidate_start_s = steering_state_s + prefix_steps * self.DT_EFF
+            nominal, elapsed_steps = self._warm_start(candidate_start_s, hold_steps)
+        else:
+            nominal = self.nom
         bias = self.SIG_BIAS  * torch.randn(self.K, 1, device=dev, generator=self._rng)
         jit  = self.SIG_STEER * torch.randn(self.K, self.T_MAX, device=dev, generator=self._rng)
         eps  = bias + jit
-        A    = (self.nom + eps).clamp(-self.STEER_MAX, self.STEER_MAX)
+        A    = (nominal + eps).clamp(-self.STEER_MAX, self.STEER_MAX)
 
         # ---- fill static buffers (slice to the ACTIVE horizon: buffers are
         # T_MAX wide, the interp outputs are `horizon` wide, and the rollout
@@ -728,10 +773,6 @@ class MPPIController:
         self._p0.copy_(torch.tensor([x, y], dtype=torch.float32, device=dev))
 
         # ---- rollout (CUDA graph replay, or plain call on CPU) ----
-        model_actuator = self.steering_actuator_enabled and steering_prediction is not None
-        if model_actuator:
-            wheel_angle, queued, solve_s, measured_wheel = steering_prediction
-            self._set_steering_schedule(wheel_angle, queued, solve_s)
         _t_roll = time.perf_counter()
         if self.use_graph:
             g = self._graphs.get((horizon, model_actuator))
@@ -781,8 +822,15 @@ class MPPIController:
         if os.environ.get("MPPI_FORCE_STEER0") == "1":
             steer_out = 0.0
 
-        # warm-start shift
-        self.nom = torch.cat([self.nom[:, 1:], self.nom[:, -1:]], dim=1)
+        if use_elapsed:
+            available_steps = horizon - prefix_steps
+            scored_steps = max(1, available_steps - hold_steps + 1) if available_steps > 0 else 0
+            if scored_steps:
+                self._previous_steering_plan = candidate_start_s, hold_steps, available_steps, scored_steps
+            else:
+                self.reset_steering_plan()
+        else:
+            self.nom = torch.cat([self.nom[:, 1:], self.nom[:, -1:]], dim=1)
 
         # ---- PI longitudinal with anti-windup ----
         err  = vr_eff - _speed
@@ -845,6 +893,7 @@ class MPPIController:
                 "lookahead_m": lookahead_eff,
                 "v_plan": v_plan,
                 "yaw_rate_seed": self.yaw_rate,
+                "steering_warm_start_elapsed_steps": elapsed_steps,
                 "cur": self.cur,
                 "N": pd["N"],
             }

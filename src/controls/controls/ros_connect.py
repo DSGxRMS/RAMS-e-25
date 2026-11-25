@@ -10,6 +10,7 @@ from eufs_msgs.msg import ConeArrayWithCovariance, WheelSpeedsStamped
 from controls.control_utils import local_closest_index, cross_track_error
 from controls.path_reference import OrderedReference
 import math
+from threading import Lock
 
 
 class ROSInterface(Node):
@@ -27,6 +28,7 @@ class ROSInterface(Node):
 
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
         self.have_odom = False
+        self._pose_snapshot = (0.0, 0.0, 0.0, None)
 
         # Cones (for the one-sided-cone RECOVERY: blue dominates -> steer right, yellow
         # dominates -> steer left). /slam/map_cones is the global SLAM map; we count only
@@ -166,6 +168,8 @@ class ROSInterface(Node):
         # P16 frame-split guard: PF pose in the cone-map's frame (BEST_EFFORT, same as everything else)
         self.create_subscription(Odometry, "/slam/odom", self._slam_odom_cb, self.qos_best_effort)
         self.applied_steering = None
+        self._wheel_lock = Lock()
+        self._wheel_samples = ()
         if wheel_feedback:
             self.create_subscription(WheelSpeedsStamped, "/ground_truth/wheel_speeds",
                                      self._wheel_cb, self.qos_best_effort)
@@ -175,8 +179,21 @@ class ROSInterface(Node):
     def _wheel_cb(self, msg):
         angle = float(msg.speeds.steering)
         stamp = msg.header.stamp
-        if math.isfinite(angle):
-            self.applied_steering = stamp.sec + stamp.nanosec * 1e-9, angle
+        stamp_s = stamp.sec + stamp.nanosec * 1e-9
+        if stamp_s > 0 and math.isfinite(angle):
+            sample = stamp_s, angle
+            with self._wheel_lock:
+                self.applied_steering = sample
+                self._wheel_samples = (*self._wheel_samples[-63:], sample)
+
+    def steering_samples(self):
+        with self._wheel_lock:
+            return self._wheel_samples
+
+    def reset_steering_samples(self):
+        with self._wheel_lock:
+            self._wheel_samples = ()
+            self.applied_steering = None
 
     def _odom_cb(self, msg: Odometry):
         self.cx = float(msg.pose.pose.position.x)
@@ -186,6 +203,8 @@ class ROSInterface(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.yaw = math.atan2(siny_cosp, cosy_cosp)
+        stamp = msg.header.stamp
+        self._pose_snapshot = self.cx, self.cy, self.yaw, stamp.sec + stamp.nanosec * 1e-9
 
         # SLAM twist is 0 — keep for fallback only.
         vx, vy = float(msg.twist.twist.linear.x), float(msg.twist.twist.linear.y)
@@ -528,7 +547,7 @@ class ROSInterface(Node):
             kept.append((px, py, ts, pseudo))
         self._accum = kept
 
-    def get_state(self):
+    def get_state(self, *, stamped=False):
         """Returns (x, y, yaw, speed, have_odom).
 
         Position/yaw from /slam/odom_raw; speed from /ground_truth/odom (SLAM
@@ -553,7 +572,9 @@ class ROSInterface(Node):
                 # the PI decelerates instead of planning from stale motion.
                 spd = 0.0
                 self._gt_ever_stale = True
-        return (self.cx, self.cy, self.yaw, spd, self.have_odom)
+        x, y, yaw, pose_stamp = self._pose_snapshot
+        state = x, y, yaw, spd, self.have_odom
+        return (*state, pose_stamp) if stamped else state
 
     def get_path(self):
         """

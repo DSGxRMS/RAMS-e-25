@@ -31,7 +31,10 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
 from controls.mppi_controller import MPPIController
-from controls.steering_actuator import SteeringActuator, steering_actuator_enabled
+from controls.steering_actuator import (
+    SteeringActuator, steering_actuator_enabled, steering_option, steering_state_time,
+    wheel_at_or_before,
+)
 from nav_msgs.msg import Path as PathMsg
 from geometry_msgs.msg import PoseStamped, Point
 from std_msgs.msg import String
@@ -74,6 +77,7 @@ if VIZ:
 
 def main():
     model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
+    align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
     rclpy.init()
     node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator)
 
@@ -125,6 +129,7 @@ def main():
             "mode": mode,
             "sim_ns": current_ros_time.nanoseconds,
             "command_publish_sim_ns": command_publish_sim_ns,
+            "pose_stamp_sim_s": pose_stamp,
             "cycle_ms": (time.perf_counter() - cycle_begin) * 1000,
             "pose_used": [cx, cy, yaw],
             "speed_used": speed,
@@ -225,6 +230,8 @@ def main():
 
         if dt_nano < 0:
             steering_actuator.reset()
+            node.reset_steering_samples()
+            mppi.reset_steering_plan()
             bridge_cap = None
             bridge_was_fresh = False
             rejected_planner = None
@@ -242,7 +249,7 @@ def main():
         # ---- get path and state ----
         new_path = ()
         path_source = "none"
-        cx, cy, yaw, speed, have_odom = node.get_state()
+        cx, cy, yaw, speed, have_odom, pose_stamp = node.get_state(stamped=True)
 
         # ---- P16: frame-split guard ----
         # The cone map lives in the SLAM-corrected frame; we plan in the GT
@@ -328,13 +335,22 @@ def main():
             # Hold the crawl cap on the first cycle after the bridge expires.
             bridge_was_fresh = fresh
             steering_prediction = None
+            steering_origin = now
+            wheel_feedback = None
             if model_actuator:
+                if align_steering:
+                    steering_origin = steering_state_time(now, pose_stamp)
+                    wheel_feedback = wheel_at_or_before(node.steering_samples(), steering_origin)
+                else:
+                    wheel_feedback = node.applied_steering
                 steering_prediction = steering_actuator.prediction(
-                    now, node.applied_steering, mppi.DT_EFF, mppi.T_MAX)
+                    steering_origin, wheel_feedback, mppi.DT_EFF, mppi.T_MAX,
+                    decision_s=now)
             steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
                                                   one_sided=one_sided_for_compute,
                                                   speed_cap=bridge_cap,
-                                                  steering_prediction=steering_prediction)
+                                                  steering_prediction=steering_prediction,
+                                                  steering_state_s=steering_origin)
             last_path_bad  = bool(info.get("path_bad", False))
             if path_source == "planner":
                 rejected_planner = planner_path if last_path_bad else None
@@ -429,6 +445,8 @@ def main():
             _audit_command(audit_mode, steer, target_speed, accel_cmd, info,
                            blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
                            bridge_fresh=fresh, one_sided_for_compute=one_sided_for_compute,
+                           steering_state_sim_s=steering_origin if model_actuator else None,
+                           wheel_feedback_stamp_sim_s=(wheel_feedback[0] if wheel_feedback else None),
                            pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
 
         # No artificial sleep here: the MPPI rollout already takes ~110 ms, so this loop

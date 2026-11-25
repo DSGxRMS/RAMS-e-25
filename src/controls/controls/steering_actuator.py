@@ -6,12 +6,34 @@ import os
 import numpy as np
 
 
-def steering_actuator_enabled(model):
-    default = "1" if model == "exp13" else "0"
-    value = os.environ.get("MPPI_STEERING_ACTUATOR", default)
+def steering_option(name, default):
+    value = os.environ.get(name, "1" if default else "0")
     if value not in ("0", "1"):
-        raise ValueError("MPPI_STEERING_ACTUATOR must be 0 or 1")
+        raise ValueError(f"{name} must be 0 or 1")
     return value == "1"
+
+
+def steering_actuator_enabled(model):
+    return steering_option("MPPI_STEERING_ACTUATOR", model == "exp13")
+
+
+MAX_POSE_CLOCK_LEAD_S = 0.06
+
+
+def steering_state_time(clock_s, pose_stamp_s):
+    """Use the pose stamp when it belongs to the current simulator clock window."""
+    if pose_stamp_s is None or pose_stamp_s <= 0 or clock_s <= 0:
+        return clock_s
+    lead_s = pose_stamp_s - clock_s
+    if -SteeringActuator.FEEDBACK_MAX_AGE_S <= lead_s <= MAX_POSE_CLOCK_LEAD_S:
+        return pose_stamp_s
+    return clock_s
+
+
+def wheel_at_or_before(samples, state_s):
+    """Choose the newest wheel sample at or before the state being predicted."""
+    return max((sample for sample in samples if sample[0] <= state_s),
+               key=lambda sample: sample[0], default=None)
 
 
 class SteeringActuator:
@@ -34,11 +56,13 @@ class SteeringActuator:
         if solved and sent_s >= decision_s:
             self.publish_delays.append(sent_s - decision_s)
 
-    def prediction(self, now, feedback, dt, horizon):
+    def prediction(self, now, feedback, dt, horizon, *, decision_s=None):
         """Return the current angle and the fixed requests before MPPI can act.
 
         Each feedback sample is (simulator timestamp, applied angle).
-        Recent commands represent the queue using host publication timestamps.
+        The pose may be stamped ahead of the local clock used for decision
+        and publish latency. Keep queued and newly solved actions on the same
+        timeline by computing the new activation from that decision clock.
         """
         feedback_fresh = (feedback is not None
                           and 0 <= now - feedback[0] <= self.FEEDBACK_MAX_AGE_S)
@@ -67,7 +91,9 @@ class SteeringActuator:
         self.estimate = now, angle
 
         solve_s = float(np.median(self.publish_delays)) if self.publish_delays else 0.04
-        prefix_steps = min(horizon, math.ceil((self.DELAY_S + solve_s - 1e-9) / dt))
+        decision_s = now if decision_s is None else decision_s
+        until_activation = max(0.0, decision_s - now + self.DELAY_S + solve_s)
+        prefix_steps = min(horizon, math.ceil((until_activation - 1e-9) / dt))
         query = now + np.arange(prefix_steps) * dt
         # Right-continuous zero-order hold for already-issued commands.
         if self.commands:

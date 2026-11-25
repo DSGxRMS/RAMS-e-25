@@ -315,7 +315,8 @@ def analyze(args):
                     "lookahead_m", "v_plan", "yaw_rate_seed", "frame_split_m", "path_source",
                     "planner_available", "command_publish_sim_ns", "wheel_angle_seed_rad",
                     "wheel_seed_from_feedback", "steering_publish_delay_estimate_s",
-                    "steering_prefix_steps"):
+                    "steering_prefix_steps", "pose_stamp_sim_s", "steering_state_sim_s",
+                    "wheel_feedback_stamp_sim_s", "steering_warm_start_elapsed_steps"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.
