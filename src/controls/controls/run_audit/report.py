@@ -308,7 +308,8 @@ def analyze(args):
                     "cost_min", "cost_max", "temperature", "a0_std", "I_spd", "ff_part", "mppi_part",
                     "blue_in_fov", "yellow_in_fov", "path_exhausted", "path_bad", "bridge_fresh", "pp_silent",
                     "pseudo_reject", "pseudo_added", "cur", "N", "path_speed_cap", "braking_speed_cap",
-                    "lookahead_m", "v_plan", "yaw_rate_seed", "frame_split_m"):
+                    "lookahead_m", "v_plan", "yaw_rate_seed", "frame_split_m", "path_source",
+                    "planner_available"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.

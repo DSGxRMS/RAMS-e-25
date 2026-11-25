@@ -62,25 +62,9 @@ COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel whi
 # and MPPI's bad-path guard.
 RECOVER_RATIO = 3.0
 
-# P14 ONE-WALL PSEUDO CENTRELINE (replaces the old REC + EXH state machines):
-# when the rolling buffer is starving (or the path is garbage) AND only one
-# wall is in view, synthesize centreline points from that wall (line fit +
-# half-track offset, see ros_connect.pseudo_wall_path) and feed them into the
-# SAME rolling buffer. MPPI keeps driving the whole time — no mode switch, no
-# latch, no handback, no creep. Trigger early so the car never runs the
-# buffer dry in the first place.
-PSEUDO_TRIGGER_M = 6.0       # feed when smoothed path-ahead drops below this
+# Recovery uses a separately fitted reference and a crawl speed cap.
 BRIDGE_SPEED_MPS = 1.5
 BRIDGE_RELEASE_MPS2 = 0.75    # raise the speed ceiling in simulation time
-
-# P18-b PP-SILENCE UNLOCK: the one_sided dominance gate blocks the bridge
-# exactly where BOTH walls stay visible yet PP delivers nothing usable
-# (measured 2026-08-25 lap-2 descent: fov ~4-5 vs ~3-4 all section long, zero
-# feeds, buffer eaten to cur=38/40 -> permanent STOP_PATH_M park). When no
-# real PP point has been accepted for this many sim-seconds AND the buffer is
-# starving, let the bridge fire on the larger wall WITHOUT the majority rule;
-# ros_connect.pseudo_wall_path then applies its extra straightness gate.
-PSEUDO_UNLOCK_SILENT_S = 3.0
 
 if VIZ:
     import matplotlib.pyplot as plt
@@ -89,7 +73,7 @@ if VIZ:
 
 def main():
     rclpy.init()
-    node = ROSInterface()
+    node = ROSInterface(ordered_reference=True)
 
     # CRITICAL: Sync with Simulator Clock
     node.set_parameters([
@@ -141,6 +125,7 @@ def main():
             "pose_used": [cx, cy, yaw],
             "speed_used": speed,
             "buffer": new_path,
+            "path_source": path_source,
             "command": {"steering_angle": steering, "speed": target, "acceleration": acceleration},
         }
         for key in ("cte", "heading_err", "hd_bad", "path_bad", "path_exhausted", "ahead_eff",
@@ -207,8 +192,8 @@ def main():
     pseudo_pts = []           # (x, y) car positions where a pseudo feed fired (exit plot)
     rec_ctr = 0
     pseudo_events = 0         # how many times the pseudo centreline extended the buffer
-    last_ahead_eff = 99.0     # previous cycle's MPPI smoothed path-ahead (pseudo trigger)
-    last_path_bad = False     # previous cycle's MPPI bad-path flag (pseudo trigger)
+    rejected_planner = None
+    prefer_recovery = False
     last_reject_print = 0.0   # throttle for the [PSEUDO] no-fit diagnostic
     bridge_cap = None
     bridge_was_fresh = False
@@ -227,6 +212,10 @@ def main():
         if dt_nano < 0:
             bridge_cap = None
             bridge_was_fresh = False
+            rejected_planner = None
+            prefer_recovery = False
+            node.invalidate_buffer()
+            mppi.update_path(())
         if dt < 0.001:
             time.sleep(0.001)
             continue
@@ -236,7 +225,8 @@ def main():
         pseudo_reject = None
 
         # ---- get path and state ----
-        new_path = node.get_path()
+        new_path = ()
+        path_source = "none"
         cx, cy, yaw, speed, have_odom = node.get_state()
 
         # ---- P16: frame-split guard ----
@@ -246,6 +236,11 @@ def main():
         # drop the poisoned buffer until the frames re-converge.
         if not node.frame_ok():
             node.invalidate_buffer()
+            mppi.update_path(())
+            rejected_planner = None
+            prefer_recovery = False
+            bridge_cap = BRIDGE_SPEED_MPS
+            bridge_was_fresh = True
             node.send_command(steering=last_steer, speed=0.0,
                               accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             _audit_command("frame_split", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
@@ -259,62 +254,55 @@ def main():
             time.sleep(0.05)
             continue
 
-        if new_path:
-            buffer_pub.publish(_to_path_msg(new_path))
-
-        # ---- cone evidence (same FOV wedge PP plans on) ----
+        # ---- cone evidence for controls recovery ----
         nb, ny = node.get_local_cone_counts()
         one_sided = ((nb >= 2 and (ny == 0 or nb >= RECOVER_RATIO * ny)) or
                      (ny >= 2 and (nb == 0 or ny >= RECOVER_RATIO * nb)) or
                      (nb == 0 and ny == 0))
 
-        # ---- P14: ONE-WALL PSEUDO CENTRELINE (replaces REC + EXH) ----
-        # PP is stateless: with one wall out of its view it publishes nothing
-        # usable and the rolling buffer runs dry (the old REC/EXH rescue
-        # lottery). Instead: when the buffer is starving or the path is
-        # garbage AND only one wall is visible, synthesize centreline points
-        # from that wall and feed them into the SAME buffer. The trigger uses
-        # the PREVIOUS cycle's MPPI signals (1 cycle ~110 ms lag is ~0.5 m at
-        # 5 m/s) so the pseudo points are already in the path MPPI plans on.
-        starving = ((not new_path)
-                    or last_path_bad
-                    or last_ahead_eff < PSEUDO_TRIGGER_M)
-        # P18-b: unlock when PP has gone SILENT (no newly accepted real point
-        # for a while) even if both walls are technically visible -- the gate
-        # must not deadlock the buffer there. At a standstill ahead_eff is
-        # tiny, so starving holds and this same path restarts the car.
-        pp_silent = node.seconds_since_real_points() > PSEUDO_UNLOCK_SILENT_S
-        if starving and (one_sided or pp_silent):
+        now = current_ros_time.nanoseconds * 1e-9
+        pose = (cx, cy, yaw)
+        planner_path = node.reference.planner_path(now, pose)
+        planner_available = bool(planner_path)
+        can_track = bool(planner_path) and (not one_sided or planner_path != rejected_planner)
+        if can_track and not prefer_recovery:
+            new_path, path_source = planner_path, "planner"
+        else:
+            new_path = node.reference.recovery_path(now, pose)
+            if new_path:
+                path_source = "recovery"
+        if not new_path:
             pseudo = node.pseudo_wall_path(allow_both_walls=(not one_sided))
-            pseudo_added = node.feed_pseudo_points(pseudo) if pseudo else 0
-            if pseudo_added:
+            if node.reference.accept_recovery(pseudo, now):
+                new_path = node.reference.recovery_path(now, pose)
+                pseudo_added = len(new_path)
+            if new_path:
+                path_source = "recovery"
                 pseudo_events += 1
                 pseudo_pts.append((cx, cy))
-                new_path = node.get_path()
-                pseudo_pub.publish(_to_path_msg(pseudo))
+                pseudo_pub.publish(_to_path_msg(new_path))
                 wall = "blue" if nb > ny else "yellow"
                 mode = "UNLOCK" if (pp_silent and not one_sided) else "one-sided"
                 print(f"[PSEUDO] feed #{pseudo_events}: {wall} wall ({mode}), "
                       f"+{len(pseudo)} pts, nb={nb} ny={ny} (speed cap 1.5)",
                       flush=True)
-            elif not pseudo:
-                pseudo_reject = node.last_pseudo_reject
+            else:
+                pseudo_reject = node.last_pseudo_reject if not pseudo else "too little recovery path ahead"
                 now_s = time.perf_counter()
                 if now_s - last_reject_print > 2.0:
                     last_reject_print = now_s
-                    print(f"[PSEUDO] no fit: {node.last_pseudo_reject}", flush=True)
+                    print(f"[PSEUDO] no fit: {pseudo_reject}", flush=True)
 
-        # Push new path into MPPI (no-op if path hasn't changed)
+        if not new_path and can_track:
+            new_path, path_source = planner_path, "planner"
+        prefer_recovery = False
+        if new_path:
+            buffer_pub.publish(_to_path_msg(new_path))
         mppi.update_path(new_path)
 
         if new_path:
-            # P14-c: a freshly fed bridge is TRUSTED -- it was synthesized from
-            # live cones this cycle, so the one-sided-garbage veto (path_is_bad,
-            # which fires exactly when a corner bridge turns >80 deg off the
-            # nose) must not eat it. Withholding the one_sided evidence for
-            # this compute does exactly that, and only that.
-            fresh = node.bridge_fresh()
-            one_sided_for_compute = one_sided and not fresh
+            fresh = path_source == "recovery"
+            one_sided_for_compute = one_sided
             if fresh:
                 bridge_cap = BRIDGE_SPEED_MPS
             elif bridge_cap is not None and not bridge_was_fresh:
@@ -326,11 +314,15 @@ def main():
             steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
                                                   one_sided=one_sided_for_compute,
                                                   speed_cap=bridge_cap)
-            last_ahead_eff = float(info.get("ahead_eff", 99.0))
             last_path_bad  = bool(info.get("path_bad", False))
+            if path_source == "planner":
+                rejected_planner = planner_path if last_path_bad else None
+                prefer_recovery = last_path_bad
             if last_path_bad:
                 # A zero speed target alone leaves Gazebo coasting in acceleration mode.
                 accel_cmd = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
+                if fresh:
+                    node.reference.recovery = None
             tt = info.get("top_trajs")
             if tt:
                 _publish_rollouts(tt)
@@ -341,7 +333,7 @@ def main():
             node.send_command(steering=last_steer, speed=0.0,
                               accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             _audit_command("no_path", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
-                           blue_in_fov=nb, yellow_in_fov=ny, pp_silent=pp_silent,
+                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
                            pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
             time.sleep(0.05)
             continue
@@ -413,7 +405,7 @@ def main():
             else:
                 audit_mode = "tracking"
             _audit_command(audit_mode, steer, target_speed, accel_cmd, info,
-                           blue_in_fov=nb, yellow_in_fov=ny, pp_silent=pp_silent,
+                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
                            bridge_fresh=fresh, one_sided_for_compute=one_sided_for_compute,
                            pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
 

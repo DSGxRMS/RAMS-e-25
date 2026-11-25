@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 from scipy.interpolate import splprep, splev
 
-from controls.control_utils import local_closest_index, cross_track_error, path_heading
+from controls.path_reference import project_reference
 
 # =========================================================================
 # Checkpoints are package data, available in source and colcon installs.
@@ -327,6 +327,7 @@ class MPPIController:
         self._path_key  = None
         self._path_data = None
         self.cur        = 0            # closest-point index (exposed in CSV)
+        self._progress_s = None
 
         # ---- yaw rate: finite difference + low-pass (seeds rollout x0) ----
         self.prev_yaw = None
@@ -431,16 +432,16 @@ class MPPIController:
     #  update_path — spline the buffer, build reference + speed profile
     # =====================================================================
     def update_path(self, path_pts):
-        if not path_pts or len(path_pts) < 3:
+        if not path_pts or len(path_pts) < 2:
+            self._path_key = self._path_data = self._progress_s = None
             return
-        key = (len(path_pts), path_pts[0], path_pts[-1])
+        key = tuple(map(tuple, path_pts))
         if key == self._path_key:
             return
         self._path_key = key
 
         raw = np.array(path_pts, dtype=np.float64)
         rx0, ry0 = raw[:, 0], raw[:, 1]
-        N0 = len(rx0)
 
         # B-spline smoothing + dense resampling: PP/buffer points are sparse and
         # slightly offset; raw they wiggle the reference and spike the curvature.
@@ -453,7 +454,7 @@ class MPPIController:
                 u = np.linspace(0.0, 1.0, self.SPLINE_NPTS)
                 rx, ry = np.asarray(splev(u, tck))
                 dx1, dy1 = splev(u, tck, der=1)
-                dx2, dy2 = splev(u, tck, der=2)
+                dx2, dy2 = splev(u, tck, der=2) if k >= 2 else (0.0, 0.0)
                 denom = np.power(dx1*dx1 + dy1*dy1, 1.5) + 1e-9
                 kap = (dx1*dy2 - dy1*dx2) / denom       # signed curvature
                 heading = np.arctan2(dy1, dx1)
@@ -499,11 +500,12 @@ class MPPIController:
             "vt": torch.tensor(vt,   dtype=torch.float32, device=dev),
             "ff": torch.tensor(ff_steer, dtype=torch.float32, device=dev),
             "rx_np": rx, "ry_np": ry, "s_np": s_np,
+            "xy_np": np.column_stack((rx, ry)),
             "kap_np": np.asarray(kap, dtype=np.float64),
             "vt_np":  np.asarray(vt,  dtype=np.float64),
         }
         self.cur = 0
-        print(f"[MPPI] path  {N0}->{N} pts (spline)  {s_np[-1]:.1f} m  vt={self.V_MAX:.1f}")
+        self._progress_s = None
 
     # =====================================================================
     #  compute — one MPPI planning step
@@ -559,18 +561,18 @@ class MPPIController:
         self.prev_yaw = yaw
 
         # ---- closest path point + crosstrack ----
-        self.cur = int(np.clip(
-            local_closest_index((x, y), pd["rx_np"], pd["ry_np"], 0, loop=False),
-            0, pd["N"] - 1))
-        cte_val, _ = cross_track_error(x, y, pd["rx_np"], pd["ry_np"], self.cur, loop=False)
+        self.cur, s_cur, cte_val, hd_ref = project_reference(
+            x, y, yaw, pd["xy_np"], pd["s_np"], self._progress_s,
+            forward_window=max(2.0, 1.0 + _speed * dt_ros))
+        self._progress_s = s_cur
         ct_abs = abs(cte_val)
 
         # ---- bad-path guard ----
         # One-sided cones make PP emit full-length but WRONG paths (~100 deg off).
         # Geometry alone also false-positives legit hairpins, so the flag requires
         # BOTH: heading wildly off AND one-sided cone evidence.
-        _hd_ref_now = path_heading(pd["rx_np"], pd["ry_np"], self.cur, loop=False)
-        _hd_off     = abs(_angle_diff(yaw, _hd_ref_now))
+        heading_err = _angle_diff(yaw, hd_ref)
+        _hd_off     = abs(heading_err)
         hd_bad      = (_hd_off > self.HD_BAD_RAD)
         path_is_bad = hd_bad and bool(one_sided)
 
@@ -584,7 +586,7 @@ class MPPIController:
             return 0.0, 0.0, {
                 "target_speed": 0.0,
                 "cte":          cte_val,
-                "heading_err":  float(_angle_diff(yaw, _hd_ref_now)),
+                "heading_err":  heading_err,
                 "mean_traj":    [],
                 "path_bad":     True,
                 "hd_bad":       bool(hd_bad),
@@ -592,8 +594,7 @@ class MPPIController:
             }
 
         # ---- speed target: corner profile, then caps, then rate limit ----
-        s_cur = float(pd["s"][self.cur].item())
-        s_max = float(pd["s"][-1].item())
+        s_max = float(pd["s_np"][-1])
         lookahead_eff = min(self.LOOKAHEAD_M, 0.5 * max(s_max - s_cur, 0.0))
         path_ahead = max(s_max - s_cur - lookahead_eff, 0.5)   # m of usable path
 
@@ -608,7 +609,7 @@ class MPPIController:
         # CTE reduction (slow when off-line) on top of the corner profile.
         scale    = float(np.clip(1.0 - self.K_CT * min(ct_abs / self.CT0, 1.0), 0.0, 1.0))
         vt_np    = pd.get("vt_np")
-        v_corner = float(vt_np[self.cur]) if (vt_np is not None and len(vt_np)) else self.V_MAX
+        v_corner = float(np.interp(s_cur, pd["s_np"], vt_np))
         vr_uncapped = v_corner * scale
         v_brake_cap = math.sqrt(2.0 * self.BRAKE_A * max(path_ahead, 0.0))
         vr_raw = min(vr_uncapped, v_path_cap, v_brake_cap)
@@ -744,8 +745,6 @@ class MPPIController:
         accel_out = lon0 * self.ACCEL_MAX
 
         # ---- telemetry ----
-        hd_ref      = path_heading(pd["rx_np"], pd["ry_np"], self.cur, loop=False)
-        heading_err = _angle_diff(yaw, hd_ref)
         mean_traj   = self._viz_kinematic(x, y, yaw, steer_out, _speed)
 
         self._dbg_ctr += 1

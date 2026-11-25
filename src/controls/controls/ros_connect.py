@@ -8,6 +8,7 @@ from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
 from eufs_msgs.msg import ConeArrayWithCovariance   # /slam/map_cones
 from controls.control_utils import local_closest_index, cross_track_error
+from controls.path_reference import OrderedReference
 import math
 
 
@@ -20,7 +21,8 @@ class ROSInterface(Node):
     # prediction_node GT relay (out.pose = ground_truth pose, full rate, always
     # live and — per the branch design — 100% accurate).
     def __init__(self, odom_topic="/slam/odom_raw", cmd_topic="/cmd", path_topic="/path_points",
-                 gt_odom_topic="/ground_truth/odom", cones_topic="/slam/map_cones"):
+                 gt_odom_topic="/ground_truth/odom", cones_topic="/slam/map_cones",
+                 ordered_reference=False):
         super().__init__('ros_interface')
 
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
@@ -132,6 +134,7 @@ class ROSInterface(Node):
 
         # Path buffering / gating
         self.latest_path = None               # last received Path message
+        self.reference = OrderedReference() if ordered_reference else None
         self._last_good_path = []            # last "usable" path as list[(x,y)]
         self._min_path_points = 5            # ignore tiny paths (fixes IndexError in controller)
 
@@ -229,6 +232,8 @@ class ROSInterface(Node):
         that no longer matches the pose -- drop them all."""
         self._accum.clear()
         self._last_good_path = []
+        if self.reference is not None:
+            self.reference.clear()
 
     def get_fov_cones(self):
         """Blue/yellow cone POSITIONS (map frame) inside the planning FOV wedge
@@ -447,6 +452,10 @@ class ROSInterface(Node):
         self.latest_path = msg
 
         pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        if self.reference is not None:
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            self.reference.accept_planner(pts, msg.header.frame_id, stamp, self._min_path_points)
+            return
         if len(pts) >= self._min_path_points:
             self._last_good_path = pts
 
