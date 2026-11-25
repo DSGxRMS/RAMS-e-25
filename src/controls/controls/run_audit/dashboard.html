@@ -218,6 +218,12 @@ function choose(i) {
     ["Horizon / roll time",(r.horizon??"—")+" / "+format(r.roll_ms,0)+" ms"],
     ["Blue / yellow in FOV",(r.blue_in_fov??"—")+" / "+(r.yellow_in_fov??"—")],
     ["Nearest cone center",format(r.cone_center_distance_m)+" m"]];
+  if(r.clearance_decision) {
+    stats.push(["Clearance decision",r.clearance_decision],
+      ["Feasible rollouts",(r.clearance_feasible_count??"—")],
+      ["Selected clearance",format(r.clearance_selected_margin_m)+" m"],
+      ["Clearance work",format(r.clearance_ms,1)+" ms"]);
+  }
   $("detail").replaceChildren();
   for(const [label,value] of stats) {
     const box=document.createElement("div"), name=document.createElement("small"), data=document.createElement("b");

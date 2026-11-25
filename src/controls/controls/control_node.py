@@ -84,8 +84,10 @@ def main():
 def _run(resources):
     model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
     align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
+    check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
     rclpy.init()
-    node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator)
+    node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator,
+                        clearance_feedback=check_clearance)
 
     # CRITICAL: Sync with Simulator Clock
     node.set_parameters([
@@ -371,7 +373,9 @@ def _run(resources):
                                                   one_sided=one_sided_for_compute,
                                                   speed_cap=bridge_cap,
                                                   steering_prediction=steering_prediction,
-                                                  steering_state_s=steering_origin)
+                                                  steering_state_s=steering_origin,
+                                                  clearance_cones=node.clearance_cones(steering_origin)
+                                                  if check_clearance else None)
             last_path_bad  = bool(info.get("path_bad", False))
             if path_source == "planner":
                 rejected_planner = planner_path if last_path_bad else None
@@ -381,6 +385,8 @@ def _run(resources):
                 accel_cmd = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
                 if fresh:
                     node.reference.recovery = None
+            if info.get("clearance_blocked"):
+                steer = last_steer
             tt = info.get("top_trajs")
             if tt:
                 _publish_rollouts(tt)
@@ -455,7 +461,9 @@ def _run(resources):
         command_publish_sim_ns = publish_command(steer, target_speed, accel_cmd,
                                                   solved=not last_path_bad)
         if audit_pub is not None:
-            if last_path_bad:
+            if info.get("clearance_blocked"):
+                audit_mode = "clearance_brake"
+            elif last_path_bad:
                 audit_mode = "path_rejected"
             elif info.get("path_exhausted"):
                 audit_mode = "path_exhausted"

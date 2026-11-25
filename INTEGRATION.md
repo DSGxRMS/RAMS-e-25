@@ -187,6 +187,8 @@ Use the same checkout and sources as the other terminals. This opens the separat
 
 For a timing A/B test, leave `MPPI_STEERING_ACTUATOR=1` and `MPPI_STEERING_SYNC=1` in both trials and toggle `MPPI_ELAPSED_WARM_START=0` versus `1` on the controller command. Exp13 defaults to all three on. The settings are saved in `run.json`.
 
+For the Small Track cone clearance experiment, prefix the Exp13 command with `MPPI_CONE_CLEARANCE=1`. Restart from a fresh world for the enabled and baseline runs. In the report, check clearance decisions, feasible rollouts, selected margin and added time. Use the default simulator car and its normal ground-truth cone stream. This uses conservative planar geometry and requires GUI verification of false stops and stopping distances.
+
 ## Troubleshooting
 
 | Symptom | Check |

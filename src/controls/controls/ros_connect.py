@@ -9,6 +9,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from eufs_msgs.msg import ConeArrayWithCovariance, WheelSpeedsStamped
 from controls.control_utils import local_closest_index, cross_track_error
 from controls.path_reference import OrderedReference
+from controls.cone_clearance import SMALL_CONE_RADIUS_M, LARGE_CONE_RADIUS_M
 import math
 from threading import Lock
 
@@ -23,11 +24,13 @@ class ROSInterface(Node):
     # live and — per the branch design — 100% accurate).
     def __init__(self, odom_topic="/slam/odom_raw", cmd_topic="/cmd", path_topic="/path_points",
                  gt_odom_topic="/ground_truth/odom", cones_topic="/slam/map_cones",
-                 ordered_reference=False, wheel_feedback=False):
+                 ordered_reference=False, wheel_feedback=False, clearance_feedback=False):
         super().__init__('ros_interface')
 
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
         self.have_odom = False
+        self._clearance_feedback = clearance_feedback
+        self._clearance_snapshot = None
         self._pose_snapshot = (0.0, 0.0, 0.0, None)
 
         # Cones (for the one-sided-cone RECOVERY: blue dominates -> steer right, yellow
@@ -231,6 +234,24 @@ class ROSInterface(Node):
     def _cones_cb(self, msg: ConeArrayWithCovariance):
         self._cones_blue   = [(float(c.point.x), float(c.point.y)) for c in msg.blue_cones]
         self._cones_yellow = [(float(c.point.x), float(c.point.y)) for c in msg.yellow_cones]
+        if self._clearance_feedback and msg.header.frame_id == "map":
+            stamp = msg.header.stamp
+            cone_groups = ((msg.blue_cones, SMALL_CONE_RADIUS_M),
+                           (msg.yellow_cones, SMALL_CONE_RADIUS_M),
+                           (msg.orange_cones, SMALL_CONE_RADIUS_M),
+                           (msg.big_orange_cones, LARGE_CONE_RADIUS_M),
+                           (getattr(msg, "unknown_color_cones", ()), LARGE_CONE_RADIUS_M))
+            points = tuple((c.point.x, c.point.y, radius) for group, radius in cone_groups
+                           for c in group if math.isfinite(c.point.x) and math.isfinite(c.point.y))
+            stamp_s = stamp.sec + stamp.nanosec * 1e-9
+            if self._clearance_snapshot is None or stamp_s >= self._clearance_snapshot[0]:
+                self._clearance_snapshot = (stamp_s, points)
+
+    def clearance_cones(self, now):
+        snapshot = self._clearance_snapshot
+        if snapshot is not None and -.06 <= now - snapshot[0] <= .25:
+            return snapshot[1] or None
+        return None
 
     def _slam_odom_cb(self, msg: Odometry):
         """P16: PF pose in the CORRECTED frame -- the same frame the cone map
@@ -261,6 +282,7 @@ class ROSInterface(Node):
         that no longer matches the pose -- drop them all."""
         self._accum.clear()
         self._last_good_path = []
+        self._clearance_snapshot = None
         if self.reference is not None:
             self.reference.clear()
 

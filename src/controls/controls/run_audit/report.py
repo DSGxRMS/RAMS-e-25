@@ -316,7 +316,10 @@ def analyze(args):
                     "planner_available", "command_publish_sim_ns", "wheel_angle_seed_rad",
                     "wheel_seed_from_feedback", "steering_publish_delay_estimate_s",
                     "steering_prefix_steps", "pose_stamp_sim_s", "steering_state_sim_s",
-                    "wheel_feedback_stamp_sim_s", "steering_warm_start_elapsed_steps"):
+                    "wheel_feedback_stamp_sim_s", "steering_warm_start_elapsed_steps",
+                    "clearance_cone_count", "clearance_feasible_count", "clearance_best_margin_m",
+                    "clearance_weighted_margin_m", "clearance_selected_margin_m",
+                    "clearance_decision", "clearance_ms"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.
@@ -395,6 +398,12 @@ def analyze(args):
                      episode_gap_s=args.contact_gap, native_payload=native_payload, ros_payload=ros_payload,
                      partial_or_unknown=True, coverage=coverage),
         closest_mapped_cone_center_m=geometry_closest)
+    clearance_rows = [r for r in timeline if r["clearance_decision"]]
+    if clearance_rows:
+        summary["clearance"] = dict(
+            decisions=dict(collections.Counter(r["clearance_decision"] for r in clearance_rows)),
+            check_ms=metrics([r["clearance_ms"] for r in clearance_rows]),
+            feasible_rollouts=metrics([r["clearance_feasible_count"] for r in clearance_rows]))
 
     for event in contacts:
         at = lookup["gt"].nearest(event["t"], .25).get("data", {})

@@ -72,6 +72,7 @@ def main():
         model_actuator = steering_actuator_enabled(model)
         align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
         elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
+        check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 2
@@ -94,6 +95,7 @@ def main():
         "mppi_steering_actuator": model_actuator,
         "mppi_steering_sync": align_steering,
         "mppi_elapsed_warm_start": elapsed_warm_start,
+        "mppi_cone_clearance": check_clearance,
         "mppi_worker_python": env.get("MPPI_WORKER_PYTHON"),
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
