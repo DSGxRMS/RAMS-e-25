@@ -272,7 +272,8 @@ def main():
             if new_path:
                 path_source = "recovery"
         if not new_path:
-            pseudo = node.pseudo_wall_path(allow_both_walls=(not one_sided))
+            allow_both_walls = not one_sided
+            pseudo = node.pseudo_wall_path(allow_both_walls=allow_both_walls)
             if node.reference.accept_recovery(pseudo, now):
                 new_path = node.reference.recovery_path(now, pose)
                 pseudo_added = len(new_path)
@@ -282,7 +283,7 @@ def main():
                 pseudo_pts.append((cx, cy))
                 pseudo_pub.publish(_to_path_msg(new_path))
                 wall = "blue" if nb > ny else "yellow"
-                mode = "UNLOCK" if (pp_silent and not one_sided) else "one-sided"
+                mode = "UNLOCK" if allow_both_walls else "one-sided"
                 print(f"[PSEUDO] feed #{pseudo_events}: {wall} wall ({mode}), "
                       f"+{len(pseudo)} pts, nb={nb} ny={ny} (speed cap 1.5)",
                       flush=True)
