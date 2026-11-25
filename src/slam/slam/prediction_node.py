@@ -466,9 +466,6 @@ class ImuWheelEKF(Node):
 
         yaw_wrapped = wrap(yaw)
 
-        # Use full yaw for velocity direction
-        yaw_for_vel = yaw_wrapped
-
         # publish-only yaw deadband for pose orientation
         if abs(yaw_wrapped) < self.yaw_deadband:
             yaw_pub = 0.0
@@ -489,11 +486,8 @@ class ImuWheelEKF(Node):
         )
 
         od.twist.twist = Twist(
-            linear=Vector3(
-                x=v * math.cos(yaw_for_vel),
-                y=v * math.sin(yaw_for_vel),
-                z=0.0,
-            ),
+            # The velocity estimate is forward speed in the child frame.
+            linear=Vector3(x=v, y=0.0, z=0.0),
             angular=Vector3(x=0.0, y=0.0, z=self.last_yawrate),
         )
 

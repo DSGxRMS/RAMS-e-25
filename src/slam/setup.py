@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import find_namespace_packages, setup
 import os
 from glob import glob
 package_name = 'slam'
@@ -6,7 +6,9 @@ package_name = 'slam'
 setup(
     name=package_name,
     version='0.0.0',
-    packages=[package_name],
+    packages=find_namespace_packages(
+        include=[package_name, 'slam.slam_utils', 'slam.debug']
+    ),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),

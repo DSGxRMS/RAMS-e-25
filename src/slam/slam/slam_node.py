@@ -33,13 +33,6 @@ def yaw_from_quat(qx, qy, qz, qw) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def stamp_from_float_seconds(t: float):
-    """Safe float seconds -> builtin_interfaces/Time"""
-    sec = int(math.floor(t))
-    nanosec = int((t - sec) * 1e9)
-    return rclpy.time.Time(seconds=sec, nanoseconds=nanosec).to_msg()
-
-
 @dataclass
 class ConeTrack:
     x: float
@@ -68,7 +61,18 @@ class PFSlamNode(Node):
 
         # ---- Parameters ----
         self.declare_parameter("topics.odom_in", "/slam/odom_raw")
-        self.declare_parameter("topics.cones_in", "/perception/cones_fused")
+        cone_source = self.declare_parameter("cones.source", "perception").value
+        if cone_source == "ground_truth":
+            cone_topic = "/ground_truth/cones"
+            cone_type = ConeArrayWithCovariance
+            cone_callback = self.cb_ground_truth_cones
+        elif cone_source == "perception":
+            cone_topic = "/perception/cones_fused"
+            cone_type = PointCloud2
+            cone_callback = self.cb_cones
+        else:
+            raise ValueError(f"Unsupported cones.source: {cone_source}")
+        self.declare_parameter("topics.cones_in", cone_topic)
         self.declare_parameter("topics.slam_odom_out", "/slam/odom")
         self.declare_parameter("topics.map_cones_out", "/slam/map_cones")
 
@@ -142,7 +146,7 @@ class PFSlamNode(Node):
 
         # ---- Subscriptions ----
         self.create_subscription(Odometry, self.odom_topic, self.cb_odom, qos)
-        self.create_subscription(PointCloud2, self.cones_topic, self.cb_cones, qos)
+        self.create_subscription(cone_type, self.cones_topic, cone_callback, qos)
 
         # ---- Publishers ----
         self.pub_slam_odom = self.create_publisher(Odometry, self.slam_odom_topic, 5)
@@ -175,7 +179,7 @@ class PFSlamNode(Node):
         self.tracks: List[ConeTrack] = []
 
         self.get_logger().info(
-            f"[pf_slam] odom_in={self.odom_topic}, cones_in={self.cones_topic}, "
+            f"[pf_slam] source={cone_source}, odom_in={self.odom_topic}, cones_in={self.cones_topic}, "
             f"slam_odom_out={self.slam_odom_topic}, map_cones_out={self.map_cones_topic}"
         )
 
@@ -189,24 +193,22 @@ class PFSlamNode(Node):
         idx = bisect.bisect_left(times, t_query)
 
         if idx == 0:
-            _, x0, y0, yaw0 = self.odom_buf[0]
-            return x0, y0, yaw0
+            return self.odom_buf[0][1:]
         if idx >= len(self.odom_buf):
-            _, x1, y1, yaw1 = self.odom_buf[-1]
-            return x1, y1, yaw1
+            return self.odom_buf[-1][1:]
 
-        t0, x0, y0, yaw0 = self.odom_buf[idx - 1]
-        t1, x1, y1, yaw1 = self.odom_buf[idx]
+        t0, x0, y0, yaw0, twist0 = self.odom_buf[idx - 1]
+        t1, x1, y1, yaw1, twist1 = self.odom_buf[idx]
 
         if t1 == t0:
-            return x0, y0, yaw0
+            return x0, y0, yaw0, twist0
 
         a = (t_query - t0) / (t1 - t0)
         x = x0 + a * (x1 - x0)
         y = y0 + a * (y1 - y0)
         dyaw = ((yaw1 - yaw0 + math.pi) % (2.0 * math.pi)) - math.pi
         yaw = yaw0 + a * dyaw
-        return x, y, wrap(yaw)
+        return x, y, wrap(yaw), twist0 if a < 0.5 else twist1
 
     # ---------------------- Correction helpers ----------------------
 
@@ -240,7 +242,6 @@ class PFSlamNode(Node):
         if not self.local_enable:
             return
 
-        self._prune_tracks(t_now)
         assoc2 = self.local_assoc_dist ** 2
         a = self.local_ema_alpha
 
@@ -295,13 +296,13 @@ class PFSlamNode(Node):
         return pts_by_cls
 
     def _obs_body_to_map(self, x: float, y: float, yaw: float, meas_body):
+        # The supplied pose already includes the map correction.
         cy = math.cos(yaw)
         sy = math.sin(yaw)
         out = []
         for bx, by, cls_id in meas_body:
             mx = x + cy * bx - sy * by
             my = y + sy * bx + cy * by
-            mx, my = self._apply_corr_to_point(mx, my)
             out.append((mx, my, int(cls_id)))
         return out
 
@@ -452,22 +453,12 @@ class PFSlamNode(Node):
         q = msg.pose.pose.orientation
         yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
 
-        self.odom_buf.append((t, x, y, yaw))
+        self.odom_buf.append((t, x, y, yaw, msg.twist))
         tmin = t - self.odom_buffer_sec
         while self.odom_buf and self.odom_buf[0][0] < tmin:
             self.odom_buf.popleft()
 
     def cb_cones(self, msg: PointCloud2):
-        # drop stale frames if sim is lagging
-        t_c = RclTime.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        t_now = self.get_clock().now().nanoseconds * 1e-9
-
-        if (t_now - t_c) > 0.2:
-            return
-        if (t_now - t_c) > self.cones_max_age:
-            return
-
-        # parse cones
         try:
             meas_body = [(float(bx), float(by), int(cls_id))
                          for (bx, by, _bz, cls_id) in pc2.read_points(
@@ -475,17 +466,40 @@ class PFSlamNode(Node):
         except Exception as e:
             self.get_logger().warn(f"[pf_slam] Error parsing cones PointCloud2: {e}")
             return
+        self._update_from_cones(msg.header.stamp, meas_body)
 
-        if not meas_body:
-            # still age out local tracks over time
-            self._prune_tracks(t_c)
-            self._publish_map_cones(t_c)
+    def cb_ground_truth_cones(self, msg: ConeArrayWithCovariance):
+        frame = msg.header.frame_id.lstrip("/")
+        if frame not in ("base_footprint", "base_link"):
+            self.get_logger().warn(
+                f"[pf_slam] Expected vehicle-frame cones, received frame {frame!r}",
+                throttle_duration_sec=5.0,
+            )
+            return
+        groups = (msg.blue_cones, msg.yellow_cones, msg.orange_cones, msg.big_orange_cones)
+        meas_body = [
+            (cone.point.x, cone.point.y, cls_id)
+            for cls_id, cones in enumerate(groups)
+            for cone in cones
+            if math.isfinite(cone.point.x) and math.isfinite(cone.point.y)
+        ]
+        self._update_from_cones(msg.header.stamp, meas_body)
+
+    def _update_from_cones(self, stamp, meas_body):
+        t_c = RclTime.from_msg(stamp).nanoseconds * 1e-9
+        t_now = self.get_clock().now().nanoseconds * 1e-9
+        if (t_now - t_c) > self.cones_max_age:
+            return
+
+        self._prune_tracks(t_c)
+        if not meas_body and not self.slam_initialised:
+            self._publish_map_cones(stamp)
             return
 
         pose_now = self._pose_at(t_c)
         if pose_now is None:
             return
-        x_o, y_o, yaw_o = pose_now
+        x_o, y_o, yaw_o, twist = pose_now
 
         # --------- PF motion (BODY-FRAME increments) ---------
         if not self.slam_initialised or self.last_cone_odom_pose is None:
@@ -515,30 +529,21 @@ class PFSlamNode(Node):
         if best is None:
             return
 
-        # corrected pose BEFORE snap-back attempt
         x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
+        if meas_body:
+            self._try_snap_back(t_c, x_pub, y_pub, yaw_pub, meas_body)
+            x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
+            obs_map = self._obs_body_to_map(x_pub, y_pub, yaw_pub, meas_body)
+            self._update_tracks_from_obs_map(t_c, obs_map)
 
-        # Build obs in corrected map frame using corrected pose
-        obs_map = self._obs_body_to_map(x_pub, y_pub, yaw_pub, meas_body)
-
-        # Update rolling local tracks (association + 5s aging)
-        self._update_tracks_from_obs_map(t_c, obs_map)
-
-        # snap-back: align obs to local tracks (or PF map fallback)
-        self._try_snap_back(t_c, x_pub, y_pub, yaw_pub, meas_body)
-
-        # corrected pose AFTER snap-back (corr may have changed)
-        x_pub, y_pub, yaw_pub = self._apply_corr_to_pose(float(best.x), float(best.y), float(best.yaw))
-
-        # publish corrected odom + rolling map
-        self._publish_slam_odom(t_c, x_pub, y_pub, yaw_pub)
-        self._publish_map_cones(t_c)
+        self._publish_slam_odom(stamp, x_pub, y_pub, yaw_pub, twist)
+        self._publish_map_cones(stamp)
 
     # ---------------------- Publishers ----------------------
 
-    def _publish_slam_odom(self, t: float, x: float, y: float, yaw: float):
+    def _publish_slam_odom(self, stamp, x: float, y: float, yaw: float, twist):
         od = Odometry()
-        od.header.stamp = stamp_from_float_seconds(t)
+        od.header.stamp = stamp
         od.header.frame_id = "map"
         od.child_frame_id = "base_link"
 
@@ -552,11 +557,12 @@ class PFSlamNode(Node):
         od.pose.pose.orientation.z = math.sin(half_yaw)
         od.pose.pose.orientation.w = math.cos(half_yaw)
 
+        od.twist = twist
         self.pub_slam_odom.publish(od)
 
-    def _publish_map_cones(self, t: float):
+    def _publish_map_cones(self, stamp):
         msg = ConeArrayWithCovariance()
-        msg.header.stamp = stamp_from_float_seconds(t)
+        msg.header.stamp = stamp
         msg.header.frame_id = "map"
 
         if self.local_enable and self.tracks:

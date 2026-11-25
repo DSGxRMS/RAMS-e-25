@@ -22,6 +22,10 @@ setup(
         'console_scripts': [
             'pp_node_skidpad = pathplanning.pp_node_skidpad:main',
             'pp_debug = pathplanning.pp_debug.skidpad_debug:main',
+            'pp_virtual = pathplanning.pp_virtual:main',
+            'pp_v2 = pathplanning.pp_v2:main',  
+            'pp_viz = pathplanning.pp_debug.sim_viz_combined:main',
+            'one_virtual = pathplanning.one_virtual:main', 
         ],
     },
 )
