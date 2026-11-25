@@ -637,6 +637,9 @@ class MPPIController:
             self._vr_lp += 0.15 * (vr_raw - self._vr_lp)
         else:
             self._vr_lp += 0.6 * (vr_raw - self._vr_lp)
+        if speed_cap is not None:
+            # Apply the bridge ceiling to the filtered target as well as its input.
+            self._vr_lp = min(self._vr_lp, float(speed_cap))
         vr_eff = float(self._vr_lp)
 
         # ---- arc-length reference horizon (marches at the planning speed) ----

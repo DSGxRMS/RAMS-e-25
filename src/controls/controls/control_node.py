@@ -70,6 +70,8 @@ RECOVER_RATIO = 3.0
 # latch, no handback, no creep. Trigger early so the car never runs the
 # buffer dry in the first place.
 PSEUDO_TRIGGER_M = 6.0       # feed when smoothed path-ahead drops below this
+BRIDGE_SPEED_MPS = 1.5
+BRIDGE_RELEASE_MPS2 = 0.75    # raise the speed ceiling in simulation time
 
 # P18-b PP-SILENCE UNLOCK: the one_sided dominance gate blocks the bridge
 # exactly where BOTH walls stay visible yet PP delivers nothing usable
@@ -208,6 +210,8 @@ def main():
     last_ahead_eff = 99.0     # previous cycle's MPPI smoothed path-ahead (pseudo trigger)
     last_path_bad = False     # previous cycle's MPPI bad-path flag (pseudo trigger)
     last_reject_print = 0.0   # throttle for the [PSEUDO] no-fit diagnostic
+    bridge_cap = None
+    bridge_was_fresh = False
 
     if VIZ:
         plt.ion()
@@ -220,6 +224,9 @@ def main():
         dt = dt_nano / 1e9
         last_ros_time = current_ros_time
 
+        if dt_nano < 0:
+            bridge_cap = None
+            bridge_was_fresh = False
         if dt < 0.001:
             time.sleep(0.001)
             continue
@@ -308,11 +315,14 @@ def main():
             # this compute does exactly that, and only that.
             fresh = node.bridge_fresh()
             one_sided_for_compute = one_sided and not fresh
-            # P15: while on a fresh bridge the target speed is capped -- the
-            # bridge is a straight-line guess; taking it at 4-5 m/s risks
-            # leaving the track. The cap lifts ~1.5 s after the last feed
-            # (i.e. once real PP points have taken over).
-            bridge_cap = 1.5 if fresh else None
+            if fresh:
+                bridge_cap = BRIDGE_SPEED_MPS
+            elif bridge_cap is not None and not bridge_was_fresh:
+                bridge_cap += BRIDGE_RELEASE_MPS2 * dt
+                if bridge_cap >= mppi.V_MAX:
+                    bridge_cap = None
+            # Hold the crawl cap on the first cycle after the bridge expires.
+            bridge_was_fresh = fresh
             steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
                                                   one_sided=one_sided_for_compute,
                                                   speed_cap=bridge_cap)
