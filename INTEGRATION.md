@@ -1,6 +1,6 @@
 # Run the RAMS-e-25 stack in Gazebo
 
-Use branch `abh_soum_integration` for the ground-truth EUFS Small Track stack, with Abhi's path planner and Soumil's mirror-symmetric Exp13 Neural ODE MPPI. This guide uses the Gazebo GUI. All commands below are for Bash in Ubuntu 20.04, including Ubuntu 20.04 under WSL 2.
+Use branch `abh_soum_integration` for the ground-truth EUFS Small Track stack, with Abhi's path planner and Soumil's mirror-symmetric Exp13 Neural ODE MPPI. This guide uses the Gazebo GUI. All commands below are for Bash in Ubuntu 20.04, including Ubuntu 20.04 under WSL 2. For controller changes, verification and upcoming objectives, see the [controls changelog](changes-controls.md).
 
 ## 1. Set up ROS and EUFS once
 
