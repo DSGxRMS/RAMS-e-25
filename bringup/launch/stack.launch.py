@@ -1,3 +1,5 @@
+"""Launch the TLS planner stack with `bash bringup/run.sh` from the checkout."""
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
@@ -47,7 +49,7 @@ def generate_launch_description():
         # 3) Path planning
         Node(
             package="pathplanning",
-            executable="pp_node_skidpad",
+            executable="pp_tls",
             name="pp",
             output="screen",
             parameters=common + [{"topics.odom_in": "/slam/odom_raw"}],
