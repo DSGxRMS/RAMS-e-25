@@ -6,7 +6,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
-from eufs_msgs.msg import ConeArrayWithCovariance   # /slam/map_cones
+from eufs_msgs.msg import ConeArrayWithCovariance, WheelSpeedsStamped
 from controls.control_utils import local_closest_index, cross_track_error
 from controls.path_reference import OrderedReference
 import math
@@ -22,7 +22,7 @@ class ROSInterface(Node):
     # live and — per the branch design — 100% accurate).
     def __init__(self, odom_topic="/slam/odom_raw", cmd_topic="/cmd", path_topic="/path_points",
                  gt_odom_topic="/ground_truth/odom", cones_topic="/slam/map_cones",
-                 ordered_reference=False):
+                 ordered_reference=False, wheel_feedback=False):
         super().__init__('ros_interface')
 
         self.cx, self.cy, self.yaw, self.speed = 0.0, 0.0, 0.0, 0.0
@@ -165,8 +165,18 @@ class ROSInterface(Node):
         self.create_subscription(ConeArrayWithCovariance, cones_topic, self._cones_cb, self.qos_best_effort)
         # P16 frame-split guard: PF pose in the cone-map's frame (BEST_EFFORT, same as everything else)
         self.create_subscription(Odometry, "/slam/odom", self._slam_odom_cb, self.qos_best_effort)
+        self.applied_steering = None
+        if wheel_feedback:
+            self.create_subscription(WheelSpeedsStamped, "/ground_truth/wheel_speeds",
+                                     self._wheel_cb, self.qos_best_effort)
 
         self.pub = self.create_publisher(AckermannDriveStamped, cmd_topic, 10)
+
+    def _wheel_cb(self, msg):
+        angle = float(msg.speeds.steering)
+        stamp = msg.header.stamp
+        if math.isfinite(angle):
+            self.applied_steering = stamp.sec + stamp.nanosec * 1e-9, angle
 
     def _odom_cb(self, msg: Odometry):
         self.cx = float(msg.pose.pose.position.x)
@@ -604,4 +614,7 @@ class ROSInterface(Node):
         if speed is not None:
             msg.drive.speed = float(speed)
 
+        published_at = self.get_clock().now()
+        msg.header.stamp = published_at.to_msg()
         self.pub.publish(msg)
+        return published_at.nanoseconds

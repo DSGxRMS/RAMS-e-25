@@ -31,6 +31,7 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
 from controls.mppi_controller import MPPIController
+from controls.steering_actuator import SteeringActuator, steering_actuator_enabled
 from nav_msgs.msg import Path as PathMsg
 from geometry_msgs.msg import PoseStamped, Point
 from std_msgs.msg import String
@@ -72,8 +73,9 @@ if VIZ:
 
 
 def main():
+    model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
     rclpy.init()
-    node = ROSInterface(ordered_reference=True)
+    node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator)
 
     # CRITICAL: Sync with Simulator Clock
     node.set_parameters([
@@ -102,6 +104,7 @@ def main():
 
     # ---- initialise MPPI ----
     mppi = MPPIController()
+    steering_actuator = SteeringActuator()
 
     # ---- live debug publishers (for controls/debug/pseudo_debug.py) ----
     pseudo_pub = node.create_publisher(PathMsg, "/debug/pseudo_path", 10)
@@ -121,6 +124,7 @@ def main():
             "model": os.environ.get("MPPI_MODEL", "exp13"),
             "mode": mode,
             "sim_ns": current_ros_time.nanoseconds,
+            "command_publish_sim_ns": command_publish_sim_ns,
             "cycle_ms": (time.perf_counter() - cycle_begin) * 1000,
             "pose_used": [cx, cy, yaw],
             "speed_used": speed,
@@ -137,6 +141,16 @@ def main():
         msg = String()
         msg.data = json.dumps(row, separators=(",", ":"), allow_nan=False)
         audit_pub.publish(msg)
+
+    def publish_command(steering, speed, acceleration, *, solved=False):
+        published = node.send_command(steering=steering, speed=speed, accel=acceleration)
+        if model_actuator:
+            decision = current_ros_time.nanoseconds
+            if published < decision:
+                return published  # the main loop clears the old queue on the clock reset
+            steering_actuator.observe_command(
+                published * 1e-9, steering, decision * 1e-9, solved=solved)
+        return published
 
     def _to_path_msg(pts):
         m = PathMsg()
@@ -210,6 +224,7 @@ def main():
         last_ros_time = current_ros_time
 
         if dt_nano < 0:
+            steering_actuator.reset()
             bridge_cap = None
             bridge_was_fresh = False
             rejected_planner = None
@@ -241,8 +256,8 @@ def main():
             prefer_recovery = False
             bridge_cap = BRIDGE_SPEED_MPS
             bridge_was_fresh = True
-            node.send_command(steering=last_steer, speed=0.0,
-                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+            command_publish_sim_ns = publish_command(last_steer, 0.0,
+                                                      -COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             _audit_command("frame_split", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
                            frame_split_m=node.frame_split_distance())
             now_s = time.perf_counter()
@@ -312,9 +327,14 @@ def main():
                     bridge_cap = None
             # Hold the crawl cap on the first cycle after the bridge expires.
             bridge_was_fresh = fresh
+            steering_prediction = None
+            if model_actuator:
+                steering_prediction = steering_actuator.prediction(
+                    now, node.applied_steering, mppi.DT_EFF, mppi.T_MAX)
             steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
                                                   one_sided=one_sided_for_compute,
-                                                  speed_cap=bridge_cap)
+                                                  speed_cap=bridge_cap,
+                                                  steering_prediction=steering_prediction)
             last_path_bad  = bool(info.get("path_bad", False))
             if path_source == "planner":
                 rejected_planner = planner_path if last_path_bad else None
@@ -331,8 +351,8 @@ def main():
             # PP dropout with nothing to fit (no lone wall either): hold last
             # steer and coast down gently (senior's spec). MPPI's own guards
             # (vr caps, STOP_PATH_M) handle every partial-path case.
-            node.send_command(steering=last_steer, speed=0.0,
-                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+            command_publish_sim_ns = publish_command(last_steer, 0.0,
+                                                      -COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             _audit_command("no_path", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
                            blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
                            pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
@@ -395,7 +415,8 @@ def main():
                 last_viz_update_real = time.perf_counter()
 
         # ---- actuation ----
-        node.send_command(steering=steer, speed=target_speed, accel=accel_cmd)
+        command_publish_sim_ns = publish_command(steer, target_speed, accel_cmd,
+                                                  solved=not last_path_bad)
         if audit_pub is not None:
             if last_path_bad:
                 audit_mode = "path_rejected"

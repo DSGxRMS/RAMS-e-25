@@ -61,6 +61,8 @@ Exp13 is the default. Press Ctrl+C in this terminal and wait for the report path
 
 The seed repeats the controller's sampling sequence when the device and sequence of solves are the same. The GUI simulator, scheduling and message arrival can still vary.
 
+Exp13 models the Small Track EUFS steering actuator by default. Its rollouts start from the measured wheel angle when fresh, replay commands already in flight over the 0.20 s simulator delay plus estimated solve latency, and limit wheel travel to 1.04 rad/s. The recent command history supplies an estimate when wheel feedback is unavailable. These constants match the dry DynamicBicycle vehicle. Use `MPPI_STEERING_ACTUATOR=0 MPPI_SEED=42 ros2 run controls control_node` for the A/B baseline and `MPPI_STEERING_ACTUATOR=1 MPPI_SEED=42 ros2 run controls control_node` for the candidate. The mode is recorded in `run.json`. The report plots requested and applied steering, and `applied_steering.csv` contains the full-rate stamped wheel samples when Gazebo publishes them.
+
 To see actual planner paths and MPPI rollouts, run `python3 src/controls/controls/debug/pseudo_debug.py` from a sourced terminal.
 
 ## Shared interface

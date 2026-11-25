@@ -67,7 +67,7 @@ const rel = t => t - t0;
 const text = (id, value) => { $(id).textContent = value; };
 const series = [
   ["Speed (m/s)", [["target_speed","Command target","#72e2b3"],["vx","Ground truth","#83baff"],["raw_target_speed","Before smoothing","#ecc489"]]],
-  ["Steering and acceleration", [["accel","Commanded accel (m/s²)","#fdb05c"],["actual_accel_mps2","Measured dVx/dt (m/s²)","#83baff"],["steering","Steering (rad), right axis","#e38df8","right"]]],
+  ["Steering and acceleration", [["accel","Commanded accel (m/s²)","#fdb05c"],["actual_accel_mps2","Measured dVx/dt (m/s²)","#83baff"],["steering","Requested steer (rad), right axis","#e38df8","right"],["applied_steering","Applied steer (rad), right axis","#90e6ac","right"]]],
   ["Tracking error (m)", [["cte","Controller CTE","#72e2b3"],["actual_to_course_m","Fixed course CTE","#ffc857"],["best_to_future_car_rms_m","Candidate vs later car","#fa87ac"]]],
   ["Path supply", [["pp_points","Latest PP points","#85add2"],["buffer_points","Accepted buffer points","#66e3ed"],["ahead_eff","Usable ahead (m)","#ffc857"]]],
   ["Latency (ms)", [["cycle_ms","Control cycle","#ffd166"],["roll_ms","Rollout compute","#6ea8fe"]]],

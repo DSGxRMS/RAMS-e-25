@@ -11,6 +11,7 @@ import threading
 import time
 
 from controls.random_seed import sampling_seed
+from controls.steering_actuator import steering_actuator_enabled
 
 
 def default_runs_root():
@@ -68,10 +69,12 @@ def main():
     model = env.get("MPPI_MODEL", "exp13")
     try:
         seed = sampling_seed()
+        model_actuator = steering_actuator_enabled(model)
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 2
     env["MPPI_SEED"] = str(seed)
+    env["MPPI_STEERING_ACTUATOR"] = "1" if model_actuator else "0"
     stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     runs = Path(env.get("MPPI_RUNS_DIR", str(default_runs_root()))).expanduser().resolve()
     runs.mkdir(parents=True, exist_ok=True)
@@ -84,6 +87,7 @@ def main():
     status = {
         "model": model,
         "mppi_seed": seed,
+        "mppi_steering_actuator": model_actuator,
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
         "ros_domain_id": env.get("ROS_DOMAIN_ID", "0"),

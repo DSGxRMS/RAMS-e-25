@@ -37,6 +37,7 @@ from scipy.interpolate import splprep, splev
 
 from controls.path_reference import project_reference
 from controls.random_seed import sampling_seed
+from controls.steering_actuator import SteeringActuator, steering_actuator_enabled
 
 # =========================================================================
 # Checkpoints are package data, available in source and colcon installs.
@@ -278,6 +279,9 @@ class MPPIController:
 
         # ---- load checkpoint (weights AND norm buffers) ----
         model_name = os.environ.get("MPPI_MODEL", "exp13")
+        self.steering_actuator_enabled = steering_actuator_enabled(model_name)
+        print(f"[MPPI] EUFS steering actuator model={'on' if self.steering_actuator_enabled else 'off'}",
+              flush=True)
         if model_name == "exp13":
             cp = ckpt_path or _find_ckpt("exp13_stage1_pretrained.pt")
             state = torch.load(str(cp), map_location="cpu", weights_only=True)
@@ -300,6 +304,9 @@ class MPPIController:
         dev = self.dev
         TM = self.T_MAX
         self._A      = torch.zeros(self.K, TM, device=dev)  # steer samples
+        self._wheel_angle = torch.zeros((), device=dev)
+        self._steer_index = torch.arange(TM, device=dev)
+        self._queued_steer = torch.zeros(TM, device=dev)
         self._refE   = torch.zeros(TM, device=dev)
         self._refN   = torch.zeros(TM, device=dev)
         self._nE     = torch.zeros(TM, device=dev)
@@ -371,20 +378,52 @@ class MPPIController:
     #  Rollout — reads ONLY the static buffers, writes self._cost.
     #  This whole method is captured into a CUDA graph (one per horizon).
     # =====================================================================
+    def _set_steering_schedule(self, wheel_angle, queued, solve_s):
+        steps = np.arange(self.T_MAX)
+        offset = steps - len(queued)
+        # Hold the first candidate command for one estimated command interval.
+        hold_steps = max(1, round(solve_s / self.DT_EFF))
+        indices = np.where(offset < 0, -1, np.maximum(offset - hold_steps + 1, 0))
+        queued_full = np.zeros(self.T_MAX, dtype=np.float32)
+        queued_full[:len(queued)] = queued
+        self._wheel_angle.fill_(wheel_angle)
+        self._steer_index.copy_(torch.as_tensor(indices, device=self.dev))
+        self._queued_steer.copy_(torch.as_tensor(queued_full, device=self.dev))
+
+    def _scheduled_steer(self, horizon):
+        indices = self._steer_index[:horizon]
+        candidates = self._A.index_select(1, indices.clamp_min(0))
+        if self.K_FF:
+            candidates = candidates + self.K_FF * self._ff.index_select(0, indices.clamp_min(0))
+        return torch.where(indices < 0, self._queued_steer[:horizon], candidates)
+
     @torch.no_grad()
-    def _rollout(self, horizon):
+    def _rollout(self, horizon, model_actuator=False):
         K = self.K
         dev  = self.dev
         xk = self._x0.unsqueeze(0).expand(K, 6).contiguous()      # (K,6)
         pe = self._p0[0].expand(K).contiguous()
         pn = self._p0[1].expand(K).contiguous()
         cost = torch.zeros(K, device=dev)
+        if model_actuator:
+            requested_steer = self._scheduled_steer(horizon)
+            wheel = self._wheel_angle.expand(K)
+            max_travel = SteeringActuator.RATE_RAD_S * self.DT_EFF
 
         for t in range(horizon):
             vx   = xk[:, VX_I]
             smax = (self.STEER_MAX
                     - (self.STEER_MAX - 0.14) * (vx - 13.0) / 5.0).clamp(0.14, self.STEER_MAX)
-            steer = (self.K_FF * self._ff[t] + self._A[:, t]).clamp(-smax, smax)
+            if model_actuator:
+                # Pending requests were already clipped when issued. Only limit
+                # new candidates using predicted speed.
+                requested = requested_steer[:, t]
+                target = torch.where(self._steer_index[t] < 0, requested,
+                                     requested.clamp(-smax, smax))
+                wheel = wheel + (target - wheel).clamp(-max_travel, max_travel)
+                steer = wheel
+            else:
+                steer = (self.K_FF * self._ff[t] + self._A[:, t]).clamp(-smax, smax)
             lon   = (self.KP_ROLL * (self._vtgt[t] - vx)).clamp(-1.0, 1.0)
             u     = torch.stack([steer, lon], dim=1)
             # NOTE: no kinematic yaw injection — yaw evolves from the learned model
@@ -415,21 +454,23 @@ class MPPIController:
 
         self._cost.copy_(cost / horizon)
 
-    def _capture_graph(self, horizon):
+    def _capture_graph(self, horizon, model_actuator=None):
         """Capture _rollout(horizon) into a CUDA graph (once per horizon;
         warmup in a side stream)."""
+        if model_actuator is None:
+            model_actuator = self.steering_actuator_enabled
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                self._rollout(horizon)
+                self._rollout(horizon, model_actuator)
         torch.cuda.current_stream().wait_stream(s)
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            self._rollout(horizon)
+            self._rollout(horizon, model_actuator)
         torch.cuda.synchronize()
-        self._graphs[horizon] = g
+        self._graphs[horizon, model_actuator] = g
         print(f"[MPPI] CUDA graph captured (horizon={horizon} "
               f"= {horizon * self.DT_EFF:.1f}s)")
 
@@ -515,7 +556,8 @@ class MPPIController:
     # =====================================================================
     #  compute — one MPPI planning step
     # =====================================================================
-    def compute(self, x, y, yaw, speed, dt_ros, one_sided=True, speed_cap=None):
+    def compute(self, x, y, yaw, speed, dt_ros, one_sided=True, speed_cap=None,
+                steering_prediction=None):
         """Returns (steer, accel, info). `one_sided` = only one cone colour
         visible (from control_node's FOV counts); gates the bad-path guard.
         `speed_cap` = optional hard cap (m/s) on the speed target -- used to
@@ -686,17 +728,21 @@ class MPPIController:
         self._p0.copy_(torch.tensor([x, y], dtype=torch.float32, device=dev))
 
         # ---- rollout (CUDA graph replay, or plain call on CPU) ----
+        model_actuator = self.steering_actuator_enabled and steering_prediction is not None
+        if model_actuator:
+            wheel_angle, queued, solve_s, measured_wheel = steering_prediction
+            self._set_steering_schedule(wheel_angle, queued, solve_s)
         _t_roll = time.perf_counter()
         if self.use_graph:
-            g = self._graphs.get(horizon)
+            g = self._graphs.get((horizon, model_actuator))
             if g is None:
-                self._capture_graph(horizon)
-                g = self._graphs[horizon]
+                self._capture_graph(horizon, model_actuator)
+                g = self._graphs[horizon, model_actuator]
             g.replay()
             if self.dev.type == "cuda":
                 torch.cuda.synchronize()
         else:
-            self._rollout(horizon)
+            self._rollout(horizon, model_actuator)
         roll_ms = (time.perf_counter() - _t_roll) * 1000.0
         cost = self._cost
 
@@ -802,6 +848,11 @@ class MPPIController:
                 "cur": self.cur,
                 "N": pd["N"],
             }
+            if model_actuator:
+                audit.update(wheel_angle_seed_rad=wheel_angle,
+                             wheel_seed_from_feedback=measured_wheel,
+                             steering_publish_delay_estimate_s=solve_s,
+                             steering_prefix_steps=len(queued))
 
         return steer_out, accel_out, {
             "audit": audit,
