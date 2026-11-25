@@ -36,6 +36,7 @@ import torch.nn as nn
 from scipy.interpolate import splprep, splev
 
 from controls.path_reference import project_reference
+from controls.random_seed import sampling_seed
 
 # =========================================================================
 # Checkpoints are package data, available in source and colcon installs.
@@ -270,6 +271,10 @@ class MPPIController:
             self.dev  = torch.device("cpu")
             self.use_graph = False
             print("[MPPI] CPU mode (no CUDA graph)")
+
+        self.seed = sampling_seed()
+        self._rng = torch.Generator(device=self.dev).manual_seed(self.seed)
+        print(f"[MPPI] sampling seed={self.seed}", flush=True)
 
         # ---- load checkpoint (weights AND norm buffers) ----
         model_name = os.environ.get("MPPI_MODEL", "exp13")
@@ -657,8 +662,8 @@ class MPPIController:
         vtgt_t = _interp_1d(pd["s"], pd["vt"], s_tgt)
 
         # ---- steer samples: sustained per-sample bias + fine jitter ----
-        bias = self.SIG_BIAS  * torch.randn(self.K, 1, device=dev)
-        jit  = self.SIG_STEER * torch.randn(self.K, self.T_MAX, device=dev)
+        bias = self.SIG_BIAS  * torch.randn(self.K, 1, device=dev, generator=self._rng)
+        jit  = self.SIG_STEER * torch.randn(self.K, self.T_MAX, device=dev, generator=self._rng)
         eps  = bias + jit
         A    = (self.nom + eps).clamp(-self.STEER_MAX, self.STEER_MAX)
 

@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 
+from controls.random_seed import sampling_seed
+
 
 def default_runs_root():
     for directory in Path(__file__).resolve().parents:
@@ -64,6 +66,12 @@ def write_status(target, status):
 def main():
     env = os.environ.copy()
     model = env.get("MPPI_MODEL", "exp13")
+    try:
+        seed = sampling_seed()
+    except ValueError as exc:
+        print(f"[run] {exc}", file=sys.stderr)
+        return 2
+    env["MPPI_SEED"] = str(seed)
     stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     runs = Path(env.get("MPPI_RUNS_DIR", str(default_runs_root()))).expanduser().resolve()
     runs.mkdir(parents=True, exist_ok=True)
@@ -75,6 +83,7 @@ def main():
     env["ROS_LOG_DIR"] = str(run / "ros")
     status = {
         "model": model,
+        "mppi_seed": seed,
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
         "ros_domain_id": env.get("ROS_DOMAIN_ID", "0"),
