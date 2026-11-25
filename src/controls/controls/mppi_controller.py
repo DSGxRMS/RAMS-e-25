@@ -578,6 +578,9 @@ class MPPIController:
         # (nom warm start, _vr_lp, I_spd) so handback resumes from the last
         # good plan. control_node's recovery takes the returned command over.
         if path_is_bad:
+            audit = {}
+            if self.audit_enabled:
+                audit["spline"] = np.column_stack((pd["rx_np"], pd["ry_np"])).tolist()
             return 0.0, 0.0, {
                 "target_speed": 0.0,
                 "cte":          cte_val,
@@ -585,6 +588,7 @@ class MPPIController:
                 "mean_traj":    [],
                 "path_bad":     True,
                 "hd_bad":       bool(hd_bad),
+                "audit":        audit,
             }
 
         # ---- speed target: corner profile, then caps, then rate limit ----

@@ -141,7 +141,7 @@ def main():
             "buffer": new_path,
             "command": {"steering_angle": steering, "speed": target, "acceleration": acceleration},
         }
-        for key in ("cte", "heading_err", "path_bad", "path_exhausted", "ahead_eff",
+        for key in ("cte", "heading_err", "hd_bad", "path_bad", "path_exhausted", "ahead_eff",
                     "n_eff", "ff_part", "mppi_part"):
             row[key] = info.get(key)
         # Map non-finite numerical diagnostics to null for strict JSON readers.
@@ -318,6 +318,9 @@ def main():
                                                   speed_cap=bridge_cap)
             last_ahead_eff = float(info.get("ahead_eff", 99.0))
             last_path_bad  = bool(info.get("path_bad", False))
+            if last_path_bad:
+                # A zero speed target alone leaves Gazebo coasting in acceleration mode.
+                accel_cmd = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
             tt = info.get("top_trajs")
             if tt:
                 _publish_rollouts(tt)
@@ -391,7 +394,7 @@ def main():
         # ---- actuation ----
         node.send_command(steering=steer, speed=target_speed, accel=accel_cmd)
         if audit_pub is not None:
-            if info.get("path_bad"):
+            if last_path_bad:
                 audit_mode = "path_rejected"
             elif info.get("path_exhausted"):
                 audit_mode = "path_exhausted"
@@ -401,7 +404,8 @@ def main():
                 audit_mode = "tracking"
             _audit_command(audit_mode, steer, target_speed, accel_cmd, info,
                            blue_in_fov=nb, yellow_in_fov=ny, pp_silent=pp_silent,
-                           bridge_fresh=fresh, pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
+                           bridge_fresh=fresh, one_sided_for_compute=one_sided_for_compute,
+                           pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
 
         # No artificial sleep here: the MPPI rollout already takes ~110 ms, so this loop
         # runs as fast as the compute allows. The old 50 ms sleep dropped the control rate
