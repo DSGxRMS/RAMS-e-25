@@ -10,6 +10,9 @@ import tempfile
 import threading
 import time
 
+from controls.random_seed import sampling_seed
+from controls.steering_actuator import steering_actuator_enabled, steering_option
+
 
 def default_runs_root():
     for directory in Path(__file__).resolve().parents:
@@ -64,6 +67,18 @@ def write_status(target, status):
 def main():
     env = os.environ.copy()
     model = env.get("MPPI_MODEL", "exp13")
+    try:
+        seed = sampling_seed()
+        model_actuator = steering_actuator_enabled(model)
+        align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
+        elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
+    except ValueError as exc:
+        print(f"[run] {exc}", file=sys.stderr)
+        return 2
+    env["MPPI_SEED"] = str(seed)
+    env["MPPI_STEERING_ACTUATOR"] = "1" if model_actuator else "0"
+    env["MPPI_STEERING_SYNC"] = "1" if align_steering else "0"
+    env["MPPI_ELAPSED_WARM_START"] = "1" if elapsed_warm_start else "0"
     stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     runs = Path(env.get("MPPI_RUNS_DIR", str(default_runs_root()))).expanduser().resolve()
     runs.mkdir(parents=True, exist_ok=True)
@@ -75,6 +90,10 @@ def main():
     env["ROS_LOG_DIR"] = str(run / "ros")
     status = {
         "model": model,
+        "mppi_seed": seed,
+        "mppi_steering_actuator": model_actuator,
+        "mppi_steering_sync": align_steering,
+        "mppi_elapsed_warm_start": elapsed_warm_start,
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
         "ros_domain_id": env.get("ROS_DOMAIN_ID", "0"),

@@ -145,7 +145,7 @@ def main():
 
     import rclpy
     from ackermann_msgs.msg import AckermannDriveStamped
-    from eufs_msgs.msg import ConeArrayWithCovariance
+    from eufs_msgs.msg import ConeArrayWithCovariance, WheelSpeedsStamped
     from nav_msgs.msg import Odometry, Path as PathMsg
     from rclpy.executors import ExternalShutdownException
     from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -193,6 +193,8 @@ def main():
     sub(AckermannDriveStamped, "/cmd", "cmd",
         lambda m: {k: finite(getattr(m.drive, k))
                    for k in ("speed", "acceleration", "steering_angle", "steering_angle_velocity", "jerk")})
+    sub(WheelSpeedsStamped, "/ground_truth/wheel_speeds", "gt_steering",
+        lambda m: {"steering_angle": finite(m.speeds.steering)})
     sub(ConeArrayWithCovariance, "/ground_truth/cones", "gt_cones", cones)
     sub(ConeArrayWithCovariance, "/slam/map_cones", "map_cones", cones)
     sub(String, "/debug/mppi_cycle", "cycle", lambda m: json.loads(m.data))

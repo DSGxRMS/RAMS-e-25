@@ -204,7 +204,8 @@ def analyze(args):
     streams, invalid_rows = load_archive(args.run / "events.jsonl")
     meta = next((r["data"] for r in streams["meta"]), {})
     lookup = {name: Lookup(streams[name]) for name in
-              ("gt", "pp", "buffer", "pseudo", "rollouts", "cmd", "map_cones", "odom_raw", "odom_slam")}
+              ("gt", "pp", "buffer", "pseudo", "rollouts", "cmd", "map_cones",
+               "odom_raw", "odom_slam", "gt_steering")}
     legacy_csv = read_mppi(args.run / "mppi.csv")
     reference = read_reference(args.reference)
     contacts = contact_episodes(streams, meta, args.contact_gap)
@@ -245,6 +246,7 @@ def analyze(args):
                   if row["kind"] == "cmd" else {})
         actual = lookup["gt"].get(t, .5)
         gt = actual.get("data", {})
+        wheel = lookup["gt_steering"].get(t, .25)
         cmd = cycle.get("command") or (row["data"] if row["kind"] == "cmd" else {})
         pp = lookup["pp"].get(t)
         path_raw = points(pp.get("data", {}).get("points", []))
@@ -293,6 +295,8 @@ def analyze(args):
                       ground_truth_age_s=t - actual["t"] if actual else None,
                       target_speed=target, speed_error=speed_error,
                       steering=cmd.get("steering_angle"), accel=cmd.get("acceleration"),
+                      applied_steering=wheel.get("data", {}).get("steering_angle"),
+                      applied_steering_stamp_ns=wheel.get("stamp_ns"),
                       actual_accel_mps2=actual_accel,
                       pp_age_s=pp_age, pp_points=len(path_raw) if pp else None, pp_usable=int(pp_usable),
                       pp_length_m=path_length(path_raw) if pp else None, buffer_points=len(buffered),
@@ -308,7 +312,11 @@ def analyze(args):
                     "cost_min", "cost_max", "temperature", "a0_std", "I_spd", "ff_part", "mppi_part",
                     "blue_in_fov", "yellow_in_fov", "path_exhausted", "path_bad", "bridge_fresh", "pp_silent",
                     "pseudo_reject", "pseudo_added", "cur", "N", "path_speed_cap", "braking_speed_cap",
-                    "lookahead_m", "v_plan", "yaw_rate_seed", "frame_split_m"):
+                    "lookahead_m", "v_plan", "yaw_rate_seed", "frame_split_m", "path_source",
+                    "planner_available", "command_publish_sim_ns", "wheel_angle_seed_rad",
+                    "wheel_seed_from_feedback", "steering_publish_delay_estimate_s",
+                    "steering_prefix_steps", "pose_stamp_sim_s", "steering_state_sim_s",
+                    "wheel_feedback_stamp_sim_s", "steering_warm_start_elapsed_steps"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.
@@ -393,6 +401,11 @@ def analyze(args):
         event.update(vx=at.get("vx"), x=(at.get("xy") or [None, None])[0], y=(at.get("xy") or [None, None])[1])
     save_csv(args.run / "timeline.csv", timeline)
     save_csv(args.run / "ground_truth.csv", gt_frames)
+    if streams["gt_steering"]:
+        wheel_frames = [dict(t=r["t"], sim_ns=r.get("sim_ns"), stamp_ns=r.get("stamp_ns"),
+                             applied_steering=r["data"].get("steering_angle"))
+                        for r in streams["gt_steering"]]
+        save_csv(args.run / "applied_steering.csv", wheel_frames)
     save_csv(args.run / "cone_contacts.csv", contacts,
              ["t", "end", "cone", "vehicle_collision", "cone_collision", "samples", "sources", "sim_ns", "vx", "x", "y"])
     save_csv(args.run / "pp_dropouts.csv", intervals, ["start", "end", "duration"])
