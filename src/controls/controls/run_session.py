@@ -94,6 +94,7 @@ def main():
         "mppi_steering_actuator": model_actuator,
         "mppi_steering_sync": align_steering,
         "mppi_elapsed_warm_start": elapsed_warm_start,
+        "mppi_worker_python": env.get("MPPI_WORKER_PYTHON"),
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
         "ros_domain_id": env.get("ROS_DOMAIN_ID", "0"),

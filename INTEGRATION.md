@@ -67,6 +67,29 @@ For a timing A/B comparison, leave the actuator enabled and restart the simulati
 
 To see actual planner paths and MPPI rollouts, run `python3 src/controls/controls/debug/pseudo_debug.py` from a sourced terminal.
 
+## Run Exp13 on an RTX 50-series GPU with Galactic
+
+Galactic's Ubuntu packages use Python 3.8. A Blackwell-capable PyTorch wheel can run in a separate Python environment. The ROS controller, Gazebo and the planner continue using their existing environments. The optional worker runs the same Exp13 checkpoint and MPPI solver over a local socket. It requires usable CUDA and keeps the usual ROS topics and run recorder.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. In WSL, create the GPU environment once:
+
+```bash
+uv venv --python 3.11 "$HOME/.venvs/rams-mppi-gpu"
+uv pip install --python "$HOME/.venvs/rams-mppi-gpu/bin/python" \
+  --index-url https://download.pytorch.org/whl/cu128 torch==2.7.1
+uv pip install --python "$HOME/.venvs/rams-mppi-gpu/bin/python" numpy scipy
+"$HOME/.venvs/rams-mppi-gpu/bin/python" -c 'import torch; print(torch.__version__, torch.cuda.get_device_name(0)); print(torch.ones(8, device="cuda").sum().item())'
+```
+
+Source and build the controls package in the usual Galactic workspace. In the controller terminal with the existing Galactic virtual environment active:
+
+```bash
+MPPI_WORKER_PYTHON="$HOME/.venvs/rams-mppi-gpu/bin/python" MPPI_SEED=42 \
+  ros2 run --prefix "$VIRTUAL_ENV/bin/python3" controls control_node
+```
+
+The controller log should show the GPU and both CUDA graph captures before it sends driving commands. The worker interpreter is saved in `run.json`. Run this only for the controller terminal. The planner and Gazebo use their usual launch commands.
+
 ## Shared interface
 
 The planner uses `/slam/odom_raw` and `/slam/map_cones`. It publishes `/path_points` in `map`, with ego position first followed by ordered forward points. Controls subscribes using best-effort QoS and publishes `/cmd`. Before enabling controls, verify that `/ground_truth/odom`, `/ground_truth/cones` and `/path_points` are publishing.

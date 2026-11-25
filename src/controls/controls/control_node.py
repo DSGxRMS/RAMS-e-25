@@ -17,6 +17,7 @@ Run:  ros2 run controls control_node
 """
 import json
 import os
+from contextlib import ExitStack
 import rclpy
 from rclpy.time import Time
 import threading, time, math
@@ -30,7 +31,7 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
-from controls.mppi_controller import MPPIController
+from controls.mppi_worker import MPPIWorker
 from controls.steering_actuator import (
     SteeringActuator, steering_actuator_enabled, steering_option, steering_state_time,
     wheel_at_or_before,
@@ -76,6 +77,11 @@ if VIZ:
 
 
 def main():
+    with ExitStack() as resources:
+        _run(resources)
+
+
+def _run(resources):
     model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
     align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
     rclpy.init()
@@ -88,6 +94,14 @@ def main():
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
+
+    def shutdown():
+        executor.shutdown(timeout_sec=2.0)
+        executor_thread.join(timeout=2.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
     def spin():
         try:
             executor.spin()
@@ -96,6 +110,7 @@ def main():
 
     executor_thread = threading.Thread(target=spin, daemon=True)
     executor_thread.start()
+    resources.callback(shutdown)
 
     # ---- wait for first odometry ----
     print("Waiting for first odometry message...", flush=True)
@@ -106,8 +121,14 @@ def main():
             break
         time.sleep(0.1)
 
-    # ---- initialise MPPI ----
-    mppi = MPPIController()
+    worker_python = os.environ.get("MPPI_WORKER_PYTHON")
+    if worker_python:
+        mppi = resources.enter_context(MPPIWorker(worker_python))
+    else:
+        from controls.mppi_controller import MPPIController
+
+        mppi = MPPIController()
+
     steering_actuator = SteeringActuator()
 
     # ---- live debug publishers (for controls/debug/pseudo_debug.py) ----
@@ -465,11 +486,6 @@ def main():
                              pseudo_events, rec_ff, rec_mppi, off_pts=pseudo_pts)
         except Exception as e:
             print(f"[plot] failed: {e}", flush=True)
-        executor.shutdown(timeout_sec=2.0)
-        executor_thread.join(timeout=2.0)
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
 
 
 def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
