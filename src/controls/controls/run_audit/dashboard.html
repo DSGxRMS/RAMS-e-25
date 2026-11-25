@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MPPI Run Analysis</title>
+<style>
+:root{color-scheme:dark;--ink:#eaf2fa;--muted:#a4b5c8;--panel:#101d2b;--line:#263b50;--mint:#72e2b3}
+*{box-sizing:border-box}body{margin:0;background:#08121e;color:var(--ink);font:15px system-ui,sans-serif}
+main{max-width:1520px;margin:auto;padding:28px}h1{font-size:clamp(29px,4vw,48px);margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}
+p{margin:8px 0;color:var(--muted)}strong{color:var(--ink)}small{color:var(--muted)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:10px;margin:22px 0}
+.card,.pane{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:16px}
+.value{font-size:24px;font-weight:720;display:block;margin-top:6px} .accent{color:var(--mint)}
+.layout{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px}
+.replay{display:flex;align-items:center;gap:12px;margin-bottom:14px}.replay input{flex:1;accent-color:var(--mint)}
+button,select{background:#233950;color:var(--ink);border:1px solid #405870;border-radius:8px;padding:7px 10px}
+button{cursor:pointer}canvas{width:100%;display:block;background:#0a1523;border-radius:8px;cursor:crosshair}
+#map{height:500px;cursor:default}.chart{height:138px;margin-bottom:6px}
+.legend{display:flex;flex-wrap:wrap;gap:5px 13px;margin:10px 0;font-size:12px;color:#c7d4e3}
+.legend label{cursor:pointer}.legend input{vertical-align:middle}.swatch{display:inline-block;border-radius:4px;width:11px;height:4px;vertical-align:middle;margin-right:5px}
+.detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:10px 15px;margin:14px 0;font-variant-numeric:tabular-nums}
+.detail b{display:block;color:var(--mint);font-size:13px}.tables{margin-top:14px}.table-scroll{max-height:270px;overflow:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}td,th{text-align:left;border-bottom:1px solid var(--line);padding:8px}
+th{color:var(--muted);font-size:13px}.links{margin:20px 0;display:flex;gap:12px;flex-wrap:wrap}a{color:#82ceff}
+@media(max-width:850px){.layout{grid-template-columns:1fr}main{padding:14px}#map{height:420px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>MPPI run analysis</h1>
+  <p id="intro"></p>
+  <div class="cards" id="cards"></div>
+  <section class="pane replay" aria-label="Replay controls">
+    <button id="play">Play</button><input id="seek" type="range" min="0" value="0" aria-label="Run position">
+    <output id="at"></output>
+  </section>
+  <div class="layout">
+    <section class="pane">
+      <h2>Track replay</h2>
+      <canvas id="map" aria-label="Vehicle, cones, reference paths and candidate rollouts"></canvas>
+      <div id="layers" class="legend"></div>
+      <div id="detail" class="detail"></div>
+      <p>Rollout #1 is the cheapest sampled candidate. The applied steering comes from a weighted blend of samples. Future-car error also includes replanning and simulator response.</p>
+    </section>
+    <section class="pane" id="charts"><h2>Signals over time</h2>
+      <small>Click a plot to seek. Amber bands mark raw planner dropouts. Red marks represent observed car–cone contacts.</small>
+    </section>
+  </div>
+  <div class="layout tables">
+    <section class="pane"><h2>Observed cone contacts</h2><p id="contact-note"></p><div class="table-scroll" id="contacts"></div></section>
+    <section class="pane"><h2>Planner dropouts</h2><p id="pp-note"></p><div class="table-scroll" id="gaps"></div></section>
+  </div>
+  <section class="pane tables"><h2>Largest overshoots and path departures</h2><p id="event-note"></p><div class="table-scroll" id="events"></div></section>
+  <section class="pane tables"><h2>Capture coverage</h2><p id="coverage"></p></section>
+  <nav class="links" aria-label="Raw exports"><a href="timeline.csv">Cycle timeline CSV</a><a href="ground_truth.csv">Full-rate odometry CSV</a><a href="cone_contacts.csv">Contact CSV</a><a href="pp_dropouts.csv">Dropout CSV</a><a href="excursions.csv">Excursion CSV</a><a href="summary.json">Summary JSON</a><a href="events.jsonl">Raw event archive</a></nav>
+</main>
+<script id="payload" type="application/json">/*__RUN_DATA__*/</script>
+<script>
+"use strict";
+const run = JSON.parse(document.getElementById("payload").textContent);
+const {summary:s, timeline:rows, frames, trail, contacts, gaps, reference, anomalies} = run;
+const $ = id => document.getElementById(id);
+const format = (v, digits=2) => Number.isFinite(v) ? v.toFixed(digits) : "—";
+const t0 = rows[0].t, span = Math.max(.001, rows[rows.length-1].t - t0);
+const rel = t => t - t0;
+const text = (id, value) => { $(id).textContent = value; };
+const series = [
+  ["Speed (m/s)", [["target_speed","Command target","#72e2b3"],["vx","Ground truth","#83baff"],["raw_target_speed","Before smoothing","#ecc489"]]],
+  ["Steering and acceleration", [["accel","Commanded accel (m/s²)","#fdb05c"],["actual_accel_mps2","Measured dVx/dt (m/s²)","#83baff"],["steering","Steering (rad), right axis","#e38df8","right"]]],
+  ["Tracking error (m)", [["cte","Controller CTE","#72e2b3"],["actual_to_course_m","Fixed course CTE","#ffc857"],["best_to_future_car_rms_m","Candidate vs later car","#fa87ac"]]],
+  ["Path supply", [["pp_points","Latest PP points","#85add2"],["buffer_points","Accepted buffer points","#66e3ed"],["ahead_eff","Usable ahead (m)","#ffc857"]]],
+  ["Latency (ms)", [["cycle_ms","Control cycle","#ffd166"],["roll_ms","Rollout compute","#6ea8fe"]]],
+  ["Sampling and heading", [["n_eff","Effective sample count","#7ce5b5"],["heading_err","Heading error (rad), right axis","#f3a7c6","right"]]]
+];
+const layerList = [
+  ["trail","Driven path","#698daa"],["reference","Fixed course","#c5a3fd"],["pp","Fresh raw PP","#9faec2"],
+  ["buffer","Buffered path","#61dfef"],["spline","MPPI spline","#479cfa"],["desired","Scored reference","#ffd166"],
+  ["pseudo","Pseudo path","#ff9c55"],["rollouts","Sampled rollouts","#66e0a4"],["cones","SLAM cones","#dfcd5d"],
+  ["contacts","Contact at car position","#ff6c80"]
+];
+const layers = Object.fromEntries(layerList.map(([key])=>[key,true]));
+let selected=0, timer=null;
+text("intro", [s.model ? s.model.toUpperCase() : "Unlabelled controller", format(s.observed_seconds,1)+" s of capture", rows.length+" "+s.sample_basis+" records", s.clean_end ? "Clean stop" : "Capture may be truncated"].join(" · "));
+const cards = [["Distance",format(s.distance_m,1)+" m"],["Peak speed",format(s.peak_actual_speed)+" m/s"],
+  ["Speed RMSE",format(s.speed_error_mps.rms)+" m/s"],["P95 |CTE|",format(s.cross_track_m.p95)+" m"],
+  ["P95 rollout",format(s.rollout_ms.p95,0)+" ms"],["Usable PP",s.pp.valid_messages+"/"+s.pp.messages],
+  ["Observed cone hits",s.contact.unique_cones ?? "Unknown"]];
+for (const [label,value] of cards) {
+  const box = document.createElement("div"); box.className="card";
+  const name = document.createElement("small"); name.textContent=label;
+  const num = document.createElement("span"); num.className="value accent"; num.textContent=value;
+  box.append(name,num); $("cards").append(box);
+}
+function swatch(color) {
+  const span = document.createElement("span"); span.className="swatch"; span.style.background=color; return span;
+}
+for (const [key,label,color] of layerList) {
+  const entry=document.createElement("label"), toggle=document.createElement("input");
+  toggle.type="checkbox"; toggle.checked=true;
+  toggle.onchange=()=>{layers[key]=toggle.checked; drawMap();};
+  entry.append(toggle,swatch(color),document.createTextNode(label)); $("layers").append(entry);
+}
+const chartObjects = series.map(([title,keys])=>{
+  const label=document.createElement("div"); label.className="legend"; label.append(document.createTextNode(title+" · "));
+  for (const [,name,color] of keys) {
+    const item=document.createElement("span"); item.append(swatch(color),document.createTextNode(name)); label.append(item);
+  }
+  const canvas=document.createElement("canvas"); canvas.className="chart"; canvas.setAttribute("aria-label",title);
+  canvas.onclick=e=>seekTime(t0+span*Math.max(0,Math.min(1,(e.offsetX-49)/(canvas.clientWidth-60))));
+  $("charts").append(label,canvas);
+  return {canvas,keys};
+});
+function context(canvas) {
+  const width=canvas.clientWidth, height=canvas.clientHeight, dpr=window.devicePixelRatio||1;
+  if (canvas.width!==Math.round(width*dpr)||canvas.height!==Math.round(height*dpr)) {
+    canvas.width=Math.round(width*dpr); canvas.height=Math.round(height*dpr);
+  }
+  const ctx=canvas.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,width,height);
+  return [ctx,width,height];
+}
+function stroke(ctx, xs, color, width, transform, dash=[]) {
+  if(xs.length<2)return;
+  ctx.strokeStyle=color;ctx.lineWidth=width;ctx.setLineDash(dash);ctx.beginPath();
+  let moved=false;
+  for (const point of xs) {
+    if (!Number.isFinite(point[0])||!Number.isFinite(point[1])) {moved=false;continue;}
+    const [x,y]=transform(point);
+    if(moved)ctx.lineTo(x,y);else ctx.moveTo(x,y);
+    moved=true;
+  }
+  ctx.stroke();ctx.setLineDash([]);
+}
+const extents = (()=>{
+  const bounds=[Infinity,Infinity,-Infinity,-Infinity];
+  for(const p of [...trail.map(r=>r.slice(1)),...reference]) {
+    bounds[0]=Math.min(bounds[0],p[0]);bounds[1]=Math.min(bounds[1],p[1]);
+    bounds[2]=Math.max(bounds[2],p[0]);bounds[3]=Math.max(bounds[3],p[1]);
+  }
+  return Number.isFinite(bounds[0])?bounds:[-1,-1,1,1];
+})();
+function drawMap() {
+  const [ctx,w,h]=context($("map")), f=frames[selected], row=rows[selected];
+  const [x0,y0,x1,y1]=extents, pad=3;
+  const scale=Math.min(w/(x1-x0+2*pad),h/(y1-y0+2*pad));
+  const center=[(x0+x1)/2,(y0+y1)/2];
+  const project=([x,y])=>[w/2+(x-center[0])*scale,h/2-(y-center[1])*scale];
+  const colors=Object.fromEntries(layerList.map(([k,,c])=>[k,c]));
+  for(let x=Math.floor((x0-pad)/5)*5;x<=x1+pad;x+=5)stroke(ctx,[[x,y0-pad],[x,y1+pad]],"#1a2a3e",1,project);
+  for(let y=Math.floor((y0-pad)/5)*5;y<=y1+pad;y+=5)stroke(ctx,[[x0-pad,y],[x1+pad,y]],"#1a2a3e",1,project);
+  if (layers.trail) {
+    stroke(ctx,trail.map(r=>r.slice(1)),"#29435a",2,project);
+    stroke(ctx,trail.filter(r=>r[0]<=row.t).map(r=>r.slice(1)),colors.trail,2.3,project);
+  }
+  for(const key of ["reference","pp","buffer","spline","desired","pseudo"]) {
+    if(layers[key])stroke(ctx,key==="reference"?reference:f[key],colors[key],key==="desired"?3:1.8,project,key==="pseudo"?[5,4]:[]);
+  }
+  if(layers.rollouts) {
+    for(const path of f.rollouts.slice(1))stroke(ctx,path,"#66e0a44d",1,project);
+    if(f.rollouts.length)stroke(ctx,f.rollouts[0],colors.rollouts,3,project);
+  }
+  function dot(point,color,radius) {
+    if(!Number.isFinite(point[0])||!Number.isFinite(point[1]))return;
+    const [x,y]=project(point);ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y,radius,0,2*Math.PI);ctx.fill();
+  }
+  if(layers.cones){
+    const coneColors={blue:"#55aaff",yellow:"#ffda68",orange:"#fa9767",big_orange:"#f0723e"};
+    for(const [name,points] of Object.entries(f.cones))for(const p of points)dot(p,coneColors[name]||"#9cadbd",2.5);
+  }
+  if(layers.contacts)for(const contact of contacts)dot([contact.x,contact.y],colors.contacts,4);
+  if(Number.isFinite(row.x)&&Number.isFinite(row.y)) {
+    dot([row.x,row.y],"#f9fdff",4.5);
+    if(Number.isFinite(row.yaw))stroke(ctx,[[row.x,row.y],[row.x+.9*Math.cos(row.yaw),row.y+.9*Math.sin(row.yaw)]],"#f9fdff",3,project);
+  }
+  ctx.font="12px system-ui";ctx.fillStyle="#a4b5c8";ctx.fillText("Map grid 5 m",12,h-12);
+}
+function range(keys,axis) {
+  let veryLow=0,veryHigh=0;
+  for(const [key,,,a] of keys)if((a||"left")===axis)for(const row of rows)if(Number.isFinite(row[key])) {
+    veryLow=Math.min(veryLow,row[key]);veryHigh=Math.max(veryHigh,row[key]);
+  }
+  return [veryLow,Math.max(veryLow+.0001,veryHigh)];
+}
+for (const chart of chartObjects) {
+  chart.left = range(chart.keys,"left");
+  chart.right = chart.keys.some(k=>k[3]==="right") ? range(chart.keys,"right") : null;
+}
+function drawCharts() {
+  for(const {canvas,keys,left,right} of chartObjects) {
+    const [ctx,w,h]=context(canvas), a=49,b=w-(right?41:11), c=9,d=h-22;
+    const x=t=>a+(b-a)*rel(t)/span;
+    ctx.fillStyle="#fdb05c25";
+    for(const g of gaps)ctx.fillRect(x(g.start),c,x(g.end)-x(g.start),d-c);
+    ctx.font="11px system-ui";
+    for(let i=0;i<=4;i++) {
+      const y=d-i*(d-c)/4;
+      stroke(ctx,[[a,y],[b,y]],"#293b51",1,p=>p);
+      ctx.fillStyle="#a4b5c8";ctx.fillText(format(left[0]+i*(left[1]-left[0])/4,1),5,y+4);
+      if(right)ctx.fillText(format(right[0]+i*(right[1]-right[0])/4,1),b+5,y+4);
+      ctx.fillText(format(i*span/4,1)+"s",Math.min(w-34,a+i*(b-a)/4),h-5);
+    }
+    for(const [key,,color,axis] of keys) {
+      const [lo,hi]=axis==="right"?right:left;
+      stroke(ctx,rows.map(r=>[r.t,r[key]]),color,1.35,p=>[x(p[0]),d-(p[1]-lo)/(hi-lo)*(d-c)]);
+    }
+    for(const hit of contacts)if(hit.t>=t0&&rel(hit.t)<=span)stroke(ctx,[[x(hit.t),c],[x(hit.t),d]],"#f47488",1,p=>p);
+    const cursor=x(rows[selected].t);stroke(ctx,[[cursor,c],[cursor,d]],"#f2f7ff",1,p=>p,[3,3]);
+  }
+}
+function choose(i) {
+  selected=Math.max(0,Math.min(rows.length-1,i));$("seek").value=selected;
+  const r=rows[selected], error=r.speed_error;
+  text("at",format(rel(r.t),1)+" s");
+  const stats=[["Mode",r.mode||"—"],["Speed actual / target",format(r.vx)+" / "+format(r.target_speed)+" m/s"],
+    ["Overspeed",format(error)+" m/s"],["Steer / accel",format(r.steering)+" / "+format(r.accel)],
+    ["PP points / age",(r.pp_points??"—")+" / "+format(r.pp_age_s)+" s"],
+    ["Buffered path",r.buffer_points+" points"],["Ahead / CTE",format(r.ahead_eff)+" / "+format(r.cte)+" m"],
+    ["Horizon / roll time",(r.horizon??"—")+" / "+format(r.roll_ms,0)+" ms"],
+    ["Blue / yellow in FOV",(r.blue_in_fov??"—")+" / "+(r.yellow_in_fov??"—")],
+    ["Nearest cone center",format(r.cone_center_distance_m)+" m"]];
+  $("detail").replaceChildren();
+  for(const [label,value] of stats) {
+    const box=document.createElement("div"), name=document.createElement("small"), data=document.createElement("b");
+    name.textContent=label;data.textContent=value;box.append(name,data);$("detail").append(box);
+  }
+  drawMap();drawCharts();
+}
+function seekTime(t) {
+  let low=0,high=rows.length-1;
+  while(low<high){const mid=(low+high)>>1;if(rows[mid].t<t)low=mid+1;else high=mid;}
+  choose(low);
+}
+$("seek").max=rows.length-1;$("seek").oninput=e=>choose(Number(e.target.value));
+$("play").onclick=()=>{
+  if(timer!==null){clearInterval(timer);timer=null;text("play","Play");return;}
+  if(selected===rows.length-1)choose(0);
+  const start=rows[selected].t, now=performance.now();text("play","Pause");
+  timer=setInterval(()=>{seekTime(start+(performance.now()-now)/1000);if(selected===rows.length-1)$("play").click();},60);
+};
+function makeTable(id,headers,list) {
+  const table=document.createElement("table"), top=table.insertRow();
+  for(const header of headers){const th=document.createElement("th");th.textContent=header;top.append(th);}
+  for(const [t,...columns] of list){
+    const row=table.insertRow(), cell=row.insertCell(), jump=document.createElement("button");
+    jump.textContent=format(rel(t),2)+" s";jump.onclick=()=>seekTime(t);cell.append(jump);
+    for(const value of columns)row.insertCell().textContent=value;
+  }
+  $(id).append(table);
+}
+text("contact-note",s.contact.episodes === null ?
+  "No physics contact payload observed. Total contacts are unknown." :
+  s.contact.unique_cones+" distinct collision entities and "+s.contact.episodes+
+  " contact episodes observed. Counts are lower bounds unless capture coverage is confirmed.");
+makeTable("contacts",["Start","Entity","Duration","Actual speed"],
+  contacts.map(x=>[x.t,x.cone,format(x.end-x.t)+" s",format(x.vx)+" m/s"]));
+text("pp-note",s.pp.unique_valid_geometry+" distinct usable PP geometries. "+
+  format(s.pp.unavailable_seconds,1)+" s without fresh usable raw PP during timeline. "+
+  "Usable means "+s.pp.minimum_points+" or more points and age ≤ "+s.pp.freshness_s+" s.");
+makeTable("gaps",["Start","Duration"],gaps.map(x=>[x.start,format(x.duration)+" s"]));
+text("event-note",s.overshoot.episodes+" overspeed episodes at ≥ "+s.overshoot.threshold_mps+
+  " m/s above target. "+s.overshoot.samples_braking+" overspeed samples while braking was commanded. "+
+  s.deviation.episodes+" episodes at ≥ "+s.deviation.threshold_m+" m absolute controller CTE.");
+const worst = ["Overspeed","Cross-track"].flatMap(k=>anomalies.filter(a=>a.kind===k).sort((a,b)=>b.peak-a.peak).slice(0,8));
+makeTable("events",["At peak","Finding","Peak","Mode","Map position"],
+  worst.map(a=>[a.peak_t,a.kind,format(a.peak)+" "+a.unit,a.mode||"—",format(a.x,1)+", "+format(a.y,1)]));
+text("coverage",Object.entries(s.message_counts).map(([k,v])=>k+" "+v).join(" · ") +
+  (s.invalid_json_rows ? " · malformed rows "+s.invalid_json_rows : "") +
+  (s.clock_resets ? " · clock resets "+s.clock_resets+" (future pose matching disabled)" : ""));
+let resize;
+window.onresize=()=>{clearTimeout(resize);resize=setTimeout(()=>choose(selected),100);};
+choose(0);
+</script>
+</body>
+</html>

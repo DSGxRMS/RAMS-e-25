@@ -99,6 +99,18 @@ class PFSlamNode(Node):
         self.declare_parameter("lc.min_map_cones", 20)   # lowered because we now use local tracks
         self.declare_parameter("lc.min_obs_cones", 8)
 
+        # --- P17: GT PASSTHROUGH MODE ---------------------------------------
+        # While the stack runs on the simulator's ground truth, bypass the
+        # particle filter entirely:
+        #   /slam/odom      = the GT pose (relay of /slam/odom_raw)
+        #   /slam/map_cones = the GT cones transformed into the world using
+        #                     that same GT pose
+        # WHY: the PF world frame is a free gauge -- nothing after the first
+        # frame anchors it to the simulator's world, and it wandered 1-3 m
+        # from GT (measured 2026-08-25), displacing every path built on the
+        # map. Flip this OFF when moving to real perception.
+        self.declare_parameter("gt_passthrough", False)
+
         gp = self.get_parameter
         self.odom_topic = str(gp("topics.odom_in").value)
         self.cones_topic = str(gp("topics.cones_in").value)
@@ -128,6 +140,7 @@ class PFSlamNode(Node):
         self.lc_max_trans = float(gp("lc.max_trans_m").value)
         self.lc_min_map_cones = int(gp("lc.min_map_cones").value)
         self.lc_min_obs_cones = int(gp("lc.min_obs_cones").value)
+        self.gt_passthrough = bool(gp("gt_passthrough").value)
 
         qos = QoSProfile(
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -178,6 +191,11 @@ class PFSlamNode(Node):
             f"[pf_slam] odom_in={self.odom_topic}, cones_in={self.cones_topic}, "
             f"slam_odom_out={self.slam_odom_topic}, map_cones_out={self.map_cones_topic}"
         )
+        if self.gt_passthrough:
+            self.get_logger().info(
+                "[pf_slam] GT PASSTHROUGH: /slam/odom = GT pose relay, "
+                "/slam/map_cones = GT cones in world (PF + snap-back bypassed)"
+            )
 
     # ---------------------- Odom buffer helper ----------------------
 
@@ -477,6 +495,12 @@ class PFSlamNode(Node):
             return
 
         if not meas_body:
+            if self.gt_passthrough:
+                out = ConeArrayWithCovariance()
+                out.header.stamp = stamp_from_float_seconds(t_c)
+                out.header.frame_id = "map"
+                self.pub_map_cones.publish(out)
+                return
             # still age out local tracks over time
             self._prune_tracks(t_c)
             self._publish_map_cones(t_c)
@@ -485,7 +509,37 @@ class PFSlamNode(Node):
         pose_now = self._pose_at(t_c)
         if pose_now is None:
             return
-        x_o, y_o, yaw_o = pose_now
+
+        # --------- P17: GT PASSTHROUGH (PF + snap-back bypassed) ---------
+        # The simulator's cones + the simulator's pose ARE the map. Transform
+        # the body-frame observations to the world with the GT pose and
+        # publish; no PF, no tracks, no snap-back, no drift.
+        if self.gt_passthrough:
+            self._publish_slam_odom(t_c, pose_now[0], pose_now[1], pose_now[2])
+            out = ConeArrayWithCovariance()
+            out.header.stamp = stamp_from_float_seconds(t_c)
+            out.header.frame_id = "map"
+            cyw, syw = math.cos(pose_now[2]), math.sin(pose_now[2])
+            for (bx, by, cls_id) in meas_body:
+                cone = ConeWithCovariance()
+                cone.point.x = pose_now[0] + cyw * bx - syw * by
+                cone.point.y = pose_now[1] + syw * bx + cyw * by
+                cone.point.z = 0.0
+                if cls_id == 0:
+                    out.yellow_cones.append(cone)
+                elif cls_id == 1:
+                    out.blue_cones.append(cone)
+                elif cls_id == 2:
+                    out.orange_cones.append(cone)
+                elif cls_id == 3:
+                    out.big_orange_cones.append(cone)
+                else:
+                    try:
+                        out.unknown_color_cones.append(cone)
+                    except AttributeError:
+                        pass
+            self.pub_map_cones.publish(out)
+            return
 
         # --------- PF motion (BODY-FRAME increments) ---------
         if not self.slam_initialised or self.last_cone_odom_pose is None:

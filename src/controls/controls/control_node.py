@@ -15,6 +15,7 @@ Headless: set MPPI_VIZ=0 (and MPLBACKEND=Agg) to run without the telemetry plot
 Run:  ros2 run controls control_node
       MPPI_VIZ=0 ros2 run controls control_node   # headless
 """
+import json
 import os
 import rclpy
 from rclpy.time import Time
@@ -30,42 +31,54 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
 from controls.mppi_controller import MPPIController
+from nav_msgs.msg import Path as PathMsg
+from geometry_msgs.msg import PoseStamped, Point
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
 
 # ================================
 # Control Constants
 # ================================
-MAX_VELOCITY        = 4.0    # m/s  — NN lower training bound (real steering authority)
+MAX_VELOCITY        = 5.0    # m/s  — target cruise velocity matched to MPPIController.V_MAX
 WHEELBASE_M         = 1.5
 MAX_STEER_RAD       = 0.349  # model training limit; EUFS hardware cap is 0.7
-ROUTE_IS_LOOP       = False
-STOP_SPEED_THRESHOLD = -10.1
 
 # ================================
 # Visualization (optional / headless)
 # ================================
 # Default OFF: the live Tk telemetry window is laggy and crashes on Ctrl+C.
 # The exit trajectory plot (_plot_trajectory, Agg backend) is the useful one and
-# always saves to D:\RAMS-e-25\mppi_trajectory.png. Set MPPI_VIZ=1 to force live.
+# Set MPPI_VIZ=1 to force live plotting.
 VIZ = os.environ.get("MPPI_VIZ", "0") == "1"
 VIZ_UPDATE_HZ = 20
 
-# PP-dropout behaviour (senior's spec): if PP stops publishing a usable path,
-# DON'T hard-brake — hold the last steer command and coast down gently until PP recovers.
+# PP-dropout behaviour (senior's spec): if PP stops publishing a path entirely,
+# DON'T hard-brake — hold the last steer command and coast down gently.
 COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel while waiting
 
-# ONE-SIDED-CONE RECOVERY (senior's option c): when the path is unusable (PP gave nothing,
-# OR it points the wrong way — the one-sided-cone heading flip) AND only one cone colour is
-# in view, steer a fixed gentle angle toward the MISSING wall at a slow creep until PP
-# recovers, then hand back to MPPI. FS convention: blue=LEFT edge, yellow=RIGHT edge.
-#   blue (left) DOMINATES   -> turn RIGHT  (steer < 0)
-#   yellow (right) DOMINATES -> turn LEFT   (steer > 0)
-# We use a DOMINANCE RATIO, not "exactly zero of the other colour": in a 12 m radius
-# there's almost always >=1 cone of each colour, so the old "ny==0" test never fired and
-# the car just coasted to a stop. Now if one colour outnumbers the other by RECOVER_RATIO
-# (and has >=2 cones), we treat that wall as the only usable one and steer off it.
-RECOVER_STEER = 0.20         # rad (gentle, not full lock)
-RECOVER_SPEED = 1.0          # m/s creep during recovery
-RECOVER_RATIO = 3.0          # one colour must outnumber the other by this to act
+# ONE-SIDED cone evidence: one colour must outnumber the other by this ratio
+# (and have >=2 cones) to count as "only one wall visible". FS convention:
+# blue = LEFT edge, yellow = RIGHT edge. Feeds both the pseudo-path trigger
+# and MPPI's bad-path guard.
+RECOVER_RATIO = 3.0
+
+# P14 ONE-WALL PSEUDO CENTRELINE (replaces the old REC + EXH state machines):
+# when the rolling buffer is starving (or the path is garbage) AND only one
+# wall is in view, synthesize centreline points from that wall (line fit +
+# half-track offset, see ros_connect.pseudo_wall_path) and feed them into the
+# SAME rolling buffer. MPPI keeps driving the whole time — no mode switch, no
+# latch, no handback, no creep. Trigger early so the car never runs the
+# buffer dry in the first place.
+PSEUDO_TRIGGER_M = 6.0       # feed when smoothed path-ahead drops below this
+
+# P18-b PP-SILENCE UNLOCK: the one_sided dominance gate blocks the bridge
+# exactly where BOTH walls stay visible yet PP delivers nothing usable
+# (measured 2026-08-25 lap-2 descent: fov ~4-5 vs ~3-4 all section long, zero
+# feeds, buffer eaten to cur=38/40 -> permanent STOP_PATH_M park). When no
+# real PP point has been accepted for this many sim-seconds AND the buffer is
+# starving, let the bridge fire on the larger wall WITHOUT the majority rule;
+# ros_connect.pseudo_wall_path then applies its extra straightness gate.
+PSEUDO_UNLOCK_SILENT_S = 3.0
 
 if VIZ:
     import matplotlib.pyplot as plt
@@ -83,7 +96,14 @@ def main():
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
-    threading.Thread(target=executor.spin, daemon=True).start()
+    def spin():
+        try:
+            executor.spin()
+        except rclpy.executors.ExternalShutdownException:
+            pass
+
+    executor_thread = threading.Thread(target=spin, daemon=True)
+    executor_thread.start()
 
     # ---- wait for first odometry ----
     print("Waiting for first odometry message...", flush=True)
@@ -97,22 +117,97 @@ def main():
     # ---- initialise MPPI ----
     mppi = MPPIController()
 
+    # ---- live debug publishers (for controls/debug/pseudo_debug.py) ----
+    pseudo_pub = node.create_publisher(PathMsg, "/debug/pseudo_path", 10)
+    buffer_pub = node.create_publisher(PathMsg, "/debug/buffer_path", 10)
+    rollout_pub = node.create_publisher(MarkerArray, "/debug/rollouts", 10)
+    audit_pub = (node.create_publisher(String, "/debug/mppi_cycle", 10)
+                 if mppi.audit_enabled else None)
+
+    def _audit_command(mode, steering, target, acceleration, info=None, **details):
+        """Record the command issued this cycle, including fallback branches."""
+        if audit_pub is None:
+            return
+        info = info or {}
+        row = {
+            **info.get("audit", {}),
+            **details,
+            "model": os.environ.get("MPPI_MODEL", "exp13"),
+            "mode": mode,
+            "sim_ns": current_ros_time.nanoseconds,
+            "cycle_ms": (time.perf_counter() - cycle_begin) * 1000,
+            "pose_used": [cx, cy, yaw],
+            "speed_used": speed,
+            "buffer": new_path,
+            "command": {"steering_angle": steering, "speed": target, "acceleration": acceleration},
+        }
+        for key in ("cte", "heading_err", "path_bad", "path_exhausted", "ahead_eff",
+                    "n_eff", "ff_part", "mppi_part"):
+            row[key] = info.get(key)
+        # Map non-finite numerical diagnostics to null for strict JSON readers.
+        encoded = json.dumps(row, separators=(",", ":"))
+        row = json.loads(encoded, parse_constant=lambda _: None)
+        msg = String()
+        msg.data = json.dumps(row, separators=(",", ":"), allow_nan=False)
+        audit_pub.publish(msg)
+
+    def _to_path_msg(pts):
+        m = PathMsg()
+        m.header.frame_id = "map"
+        m.header.stamp = node.get_clock().now().to_msg()
+        for (px, py) in pts:
+            ps = PoseStamped()
+            ps.header = m.header
+            ps.pose.position.x = float(px)
+            ps.pose.position.y = float(py)
+            m.poses.append(ps)
+        return m
+
+    def _publish_rollouts(top_trajs):
+        """P14-c: the 10 cheapest MPPI rollouts, best first, as LINE_STRIP
+        markers. Rank 0 (lowest cost) is drawn bright green and thick; the
+        rest fade out with rank."""
+        marr = MarkerArray()
+        stamp = node.get_clock().now().to_msg()
+        for rank, traj in enumerate(top_trajs):
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = stamp
+            m.ns = "rollouts"
+            m.id = rank
+            m.type = Marker.LINE_STRIP
+            m.action = Marker.ADD
+            m.scale.x = 0.14 if rank == 0 else 0.04
+            m.color.a = 0.95 if rank == 0 else max(0.12, 0.45 - 0.045 * rank)
+            if rank == 0:
+                m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.3
+            else:
+                m.color.r, m.color.g, m.color.b = 1.0, 0.55, 0.1
+            for (px, py) in traj:
+                p = Point()
+                p.x, p.y, p.z = float(px), float(py), 0.06
+                m.points.append(p)
+            marr.markers.append(m)
+        rollout_pub.publish(marr)
+
     # ---- state initialisation ----
     last_ros_time        = node.get_clock().now()
     last_viz_update_real = time.perf_counter()
 
-    cur_idx   = 0
-    viz       = None
+    viz        = None
     last_steer = 0.0          # held during PP dropout
-    was_recovering = False     # one-sided-cone recovery state (for transition logging)
 
     # ---- trajectory recorder (for the exit plot) ----
     rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte = [], [], [], [], []
     rec_neff, rec_tgt_spd, rec_act_spd = [], [], []   # MPPI diversity + speed tracking
+    rec_ff, rec_mppi = [], []                         # steer breakdown: FF part vs MPPI part
     rec_path_pts = []         # snapshots of (route_x, route_y) every N cycles
+    pseudo_pts = []           # (x, y) car positions where a pseudo feed fired (exit plot)
     rec_ctr = 0
-    rec_episodes = 0          # how many times REC took over (one-sided-cone recovery)
-    rec_seconds  = 0.0        # total sim-time spent in REC
+    pseudo_events = 0         # how many times the pseudo centreline extended the buffer
+    last_ahead_eff = 99.0     # previous cycle's MPPI smoothed path-ahead (pseudo trigger)
+    last_path_bad = False     # previous cycle's MPPI bad-path flag (pseudo trigger)
+    last_reject_print = 0.0   # throttle for the [PSEUDO] no-fit diagnostic
 
     if VIZ:
         plt.ion()
@@ -129,68 +224,114 @@ def main():
             time.sleep(0.001)
             continue
 
+        cycle_begin = time.perf_counter()
+        pseudo_added = 0
+        pseudo_reject = None
+
         # ---- get path and state ----
-        new_path   = node.get_path()
+        new_path = node.get_path()
         cx, cy, yaw, speed, have_odom = node.get_state()
+
+        # ---- P16: frame-split guard ----
+        # The cone map lives in the SLAM-corrected frame; we plan in the GT
+        # frame. When snap-back splits them (~5 m measured), every cone, the
+        # buffer and any bridge are displaced garbage -> hold a safe stop and
+        # drop the poisoned buffer until the frames re-converge.
+        if not node.frame_ok():
+            node.invalidate_buffer()
+            node.send_command(steering=last_steer, speed=0.0,
+                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+            _audit_command("frame_split", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
+                           frame_split_m=node.frame_split_distance())
+            now_s = time.perf_counter()
+            if now_s - last_reject_print > 2.0:
+                last_reject_print = now_s
+                print(f"[FRAME] SLAM map split from GT pose by "
+                      f"{node.frame_split_distance():.1f} m (snap-back?) "
+                      f"-> buffer dropped, holding stop", flush=True)
+            time.sleep(0.05)
+            continue
+
+        if new_path:
+            buffer_pub.publish(_to_path_msg(new_path))
+
+        # ---- cone evidence (same FOV wedge PP plans on) ----
+        nb, ny = node.get_local_cone_counts()
+        one_sided = ((nb >= 2 and (ny == 0 or nb >= RECOVER_RATIO * ny)) or
+                     (ny >= 2 and (nb == 0 or ny >= RECOVER_RATIO * nb)) or
+                     (nb == 0 and ny == 0))
+
+        # ---- P14: ONE-WALL PSEUDO CENTRELINE (replaces REC + EXH) ----
+        # PP is stateless: with one wall out of its view it publishes nothing
+        # usable and the rolling buffer runs dry (the old REC/EXH rescue
+        # lottery). Instead: when the buffer is starving or the path is
+        # garbage AND only one wall is visible, synthesize centreline points
+        # from that wall and feed them into the SAME buffer. The trigger uses
+        # the PREVIOUS cycle's MPPI signals (1 cycle ~110 ms lag is ~0.5 m at
+        # 5 m/s) so the pseudo points are already in the path MPPI plans on.
+        starving = ((not new_path)
+                    or last_path_bad
+                    or last_ahead_eff < PSEUDO_TRIGGER_M)
+        # P18-b: unlock when PP has gone SILENT (no newly accepted real point
+        # for a while) even if both walls are technically visible -- the gate
+        # must not deadlock the buffer there. At a standstill ahead_eff is
+        # tiny, so starving holds and this same path restarts the car.
+        pp_silent = node.seconds_since_real_points() > PSEUDO_UNLOCK_SILENT_S
+        if starving and (one_sided or pp_silent):
+            pseudo = node.pseudo_wall_path(allow_both_walls=(not one_sided))
+            pseudo_added = node.feed_pseudo_points(pseudo) if pseudo else 0
+            if pseudo_added:
+                pseudo_events += 1
+                pseudo_pts.append((cx, cy))
+                new_path = node.get_path()
+                pseudo_pub.publish(_to_path_msg(pseudo))
+                wall = "blue" if nb > ny else "yellow"
+                mode = "UNLOCK" if (pp_silent and not one_sided) else "one-sided"
+                print(f"[PSEUDO] feed #{pseudo_events}: {wall} wall ({mode}), "
+                      f"+{len(pseudo)} pts, nb={nb} ny={ny} (speed cap 1.5)",
+                      flush=True)
+            elif not pseudo:
+                pseudo_reject = node.last_pseudo_reject
+                now_s = time.perf_counter()
+                if now_s - last_reject_print > 2.0:
+                    last_reject_print = now_s
+                    print(f"[PSEUDO] no fit: {node.last_pseudo_reject}", flush=True)
 
         # Push new path into MPPI (no-op if path hasn't changed)
         mppi.update_path(new_path)
 
-        # ---- decide if the path is usable ----
-        # Two failure modes count as "PP not giving a path":
-        #   (1) empty path, or
-        #   (2) MPPI flags path_bad (one-sided-cone heading flip — points the wrong way).
-        info = None
-        steer = accel_cmd = None
-        path_unusable = (not new_path)
-        if not path_unusable:
-            steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt)
-            path_unusable = bool(info.get("path_bad", False))
-
-        if path_unusable:
-            # tally REC usage for the exit plot: one episode per entry, plus dwell time
-            if not was_recovering:
-                rec_episodes += 1
-            rec_seconds += dt
-            # ---- ONE-SIDED-CONE RECOVERY (cone-colour dominance) ----
-            # The SLAM blue/yellow swap is now fixed, so the cone colours are CORRECT and
-            # this reads the right wall. FS convention: blue = LEFT edge, yellow = RIGHT.
-            #   blue dominates  (car near left wall)  -> steer RIGHT (-RECOVER_STEER)
-            #   yellow dominates (car near right wall) -> steer LEFT  (+RECOVER_STEER)
-            # Counts come from the same sector FOV the planner uses (get_local_cone_counts).
-            nb, ny = node.get_local_cone_counts()
-            if nb >= 2 and (ny == 0 or nb >= RECOVER_RATIO * ny):
-                rsteer = -RECOVER_STEER          # blue (left) dominates -> turn right
-                recovering = True
-            elif ny >= 2 and (nb == 0 or ny >= RECOVER_RATIO * nb):
-                rsteer = +RECOVER_STEER          # yellow (right) dominates -> turn left
-                recovering = True
-            else:
-                recovering = False               # both walls balanced -> can't tell side
-
-            if recovering:
-                racc = float(np.clip(0.6 * (RECOVER_SPEED - speed),
-                                     -mppi.ACCEL_MAX, mppi.ACCEL_MAX))
-                node.send_command(steering=rsteer, speed=RECOVER_SPEED, accel=racc)
-                last_steer = rsteer
-                if not was_recovering:
-                    side = "blue->RIGHT" if rsteer < 0 else "yellow->LEFT"
-                    print(f"[REC] one-sided cones ({side}) nb={nb} ny={ny} "
-                          f"steer={rsteer:+.2f} creep={RECOVER_SPEED:.1f} m/s", flush=True)
-            else:
-                # both walls balanced / no cones -> safe coast, hold last steer
-                node.send_command(steering=last_steer, speed=0.0,
-                                  accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
-                if not was_recovering:
-                    print(f"[REC] path unusable, side ambiguous nb={nb} ny={ny} -> coast/stop",
-                          flush=True)
-            was_recovering = True
+        if new_path:
+            # P14-c: a freshly fed bridge is TRUSTED -- it was synthesized from
+            # live cones this cycle, so the one-sided-garbage veto (path_is_bad,
+            # which fires exactly when a corner bridge turns >80 deg off the
+            # nose) must not eat it. Withholding the one_sided evidence for
+            # this compute does exactly that, and only that.
+            fresh = node.bridge_fresh()
+            one_sided_for_compute = one_sided and not fresh
+            # P15: while on a fresh bridge the target speed is capped -- the
+            # bridge is a straight-line guess; taking it at 4-5 m/s risks
+            # leaving the track. The cap lifts ~1.5 s after the last feed
+            # (i.e. once real PP points have taken over).
+            bridge_cap = 1.5 if fresh else None
+            steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
+                                                  one_sided=one_sided_for_compute,
+                                                  speed_cap=bridge_cap)
+            last_ahead_eff = float(info.get("ahead_eff", 99.0))
+            last_path_bad  = bool(info.get("path_bad", False))
+            tt = info.get("top_trajs")
+            if tt:
+                _publish_rollouts(tt)
+        else:
+            # PP dropout with nothing to fit (no lone wall either): hold last
+            # steer and coast down gently (senior's spec). MPPI's own guards
+            # (vr caps, STOP_PATH_M) handle every partial-path case.
+            node.send_command(steering=last_steer, speed=0.0,
+                              accel=-COAST_DECEL_FRAC * mppi.ACCEL_MAX)
+            _audit_command("no_path", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
+                           blue_in_fov=nb, yellow_in_fov=ny, pp_silent=pp_silent,
+                           pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
             time.sleep(0.05)
             continue
-
-        if was_recovering:
-            print("[REC] PP recovered -> back to MPPI", flush=True)
-            was_recovering = False
 
         path_points = np.array(new_path)
         route_x, route_y = path_points[:, 0], path_points[:, 1]
@@ -212,6 +353,8 @@ def main():
         rec_neff.append(info.get("n_eff", float('nan')))
         rec_tgt_spd.append(info.get("target_speed", float('nan')))
         rec_act_spd.append(info.get("actual_speed", speed))
+        rec_ff.append(info.get("ff_part", float('nan')))
+        rec_mppi.append(info.get("mppi_part", float('nan')))
         rec_ctr += 1
         if rec_ctr % 5 == 1:                      # snapshot the PP path occasionally
             rec_path_pts.append((route_x.copy(), route_y.copy()))
@@ -247,13 +390,25 @@ def main():
 
         # ---- actuation ----
         node.send_command(steering=steer, speed=target_speed, accel=accel_cmd)
+        if audit_pub is not None:
+            if info.get("path_bad"):
+                audit_mode = "path_rejected"
+            elif info.get("path_exhausted"):
+                audit_mode = "path_exhausted"
+            elif fresh:
+                audit_mode = "pseudo_bridge"
+            else:
+                audit_mode = "tracking"
+            _audit_command(audit_mode, steer, target_speed, accel_cmd, info,
+                           blue_in_fov=nb, yellow_in_fov=ny, pp_silent=pp_silent,
+                           bridge_fresh=fresh, pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
 
-        # ---- stop condition ----
-        if (not ROUTE_IS_LOOP) and cur_idx >= len(route_x) - 5 and speed < STOP_SPEED_THRESHOLD:
-            print("End of route.", flush=True)
-            break
-
-        time.sleep(0.05)
+        # No artificial sleep here: the MPPI rollout already takes ~110 ms, so this loop
+        # runs as fast as the compute allows. The old 50 ms sleep dropped the control rate
+        # to ~4.7 Hz (0.64 m of travel per cycle at 3 m/s) — a huge steering delay that
+        # made the car overshoot and zig-zag. Odom/path callbacks run in a separate
+        # executor thread, so the loop needs no spin here. (~1 ms yield keeps CPU sane.)
+        time.sleep(0.001)
     except KeyboardInterrupt:
         print("\n[control_node] stopped by user.", flush=True)
     finally:
@@ -261,15 +416,19 @@ def main():
         try:
             _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts,
                              rec_neff, rec_tgt_spd, rec_act_spd, mppi.K,
-                             rec_episodes, rec_seconds)
+                             pseudo_events, rec_ff, rec_mppi, off_pts=pseudo_pts)
         except Exception as e:
             print(f"[plot] failed: {e}", flush=True)
-        rclpy.shutdown()
+        executor.shutdown(timeout_sec=2.0)
+        executor_thread.join(timeout=2.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
                      neff=None, tgt_spd=None, act_spd=None, K=1024,
-                     rec_episodes=0, rec_seconds=0.0):
+                     pseudo_events=0, ff=None, mppi=None, off_pts=None):
     """Save GT car trajectory vs the PP path snapshots + diagnostics on exit.
     Uses the Agg backend so it ALWAYS saves to a PNG (never blocks/crashes on
     a second Ctrl+C). Saved to the D drive so it's visible from Windows."""
@@ -281,8 +440,8 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
         print("[plot] not enough data", flush=True)
         return
     cx = np.array(cx); cy = np.array(cy)
-    fig = plt.figure(figsize=(15, 10))
-    gs = fig.add_gridspec(5, 2, width_ratios=[2, 1], hspace=0.55, wspace=0.25)
+    fig = plt.figure(figsize=(15, 12))
+    gs = fig.add_gridspec(6, 2, width_ratios=[2, 1], hspace=0.6, wspace=0.25)
 
     # main XY: car path + all PP path snapshots
     ax = fig.add_subplot(gs[:, 0])
@@ -290,12 +449,15 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
         ax.plot(px, py, '-', color='lightblue', lw=0.6, alpha=0.5)
     if path_snaps:
         ax.plot([], [], '-', color='lightblue', label='PP path snapshots')
+    if off_pts:
+        ax.scatter([p[0] for p in off_pts], [p[1] for p in off_pts],
+                   c='red', s=8, zorder=4, label='pseudo-path feed positions')
     sc = ax.scatter(cx, cy, c=np.arange(len(cx)), cmap='viridis', s=10, zorder=3)
     ax.plot(cx, cy, '-', color='gray', lw=0.5, alpha=0.5)
     ax.scatter([cx[0]], [cy[0]], c='lime', s=140, marker='o', edgecolor='k', zorder=5, label='start')
     ax.scatter([cx[-1]], [cy[-1]], c='red', s=140, marker='X', edgecolor='k', zorder=5, label='end')
     ax.set_title(f'Car trajectory (GT) vs PP path\n'
-                 f'one-sided-cone REC: fired {rec_episodes}x, {rec_seconds:.1f}s total',
+                 f'pseudo-path feeds: {pseudo_events}',
                  fontsize=11)
     ax.set_xlabel('E (m)'); ax.set_ylabel('N (m)')
     ax.axis('equal'); ax.grid(alpha=0.3); ax.legend(fontsize=8)
@@ -320,13 +482,24 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
         a5.plot(t, np.array(tgt_spd), '-', color='green', label='target')
         a5.plot(t, np.array(act_spd), '-', color='black', lw=0.9, label='actual')
         a5.legend(fontsize=7, loc='upper right')
-    a5.set_title('speed: target vs actual (m/s)'); a5.set_xlabel('step'); a5.grid(alpha=0.3)
+    a5.set_title('speed: target vs actual (m/s)'); a5.grid(alpha=0.3)
 
-    # save to the D drive so it's visible from Windows (\\wsl... or D:\)
-    out = "/mnt/d/RAMS-e-25/mppi_trajectory.png"
+    # STEER BREAKDOWN: who is steering? net = FF part + MPPI part (before clip).
+    # If 'net' tracks 'FF' -> feedforward drives; if it tracks 'MPPI' -> MPPI drives.
+    a6 = fig.add_subplot(gs[5, 1])
+    if ff is not None and len(ff):
+        a6.axhline(0, color='gray', lw=0.5)
+        a6.plot(t, np.array(ff),    '-', color='tab:blue',   lw=1.0, label='FF part (K_FF·ff0)')
+        a6.plot(t, np.array(mppi),  '-', color='tab:red',    lw=1.0, label='MPPI part')
+        a6.plot(t, np.array(steer), '-', color='k',          lw=1.2, alpha=0.8, label='net steer')
+        a6.legend(fontsize=6, loc='upper right', ncol=1)
+    a6.set_title('steer breakdown (rad): FF vs MPPI vs net'); a6.set_xlabel('step'); a6.grid(alpha=0.3)
+
+    # The run session supplies a per-run path.
+    out = os.environ.get("MPPI_TRAJECTORY_PNG", "mppi_trajectory.png")
     try:
         plt.savefig(out, dpi=120, bbox_inches='tight')
-        print(f"[plot] saved {out}  (Windows: D:\\RAMS-e-25\\mppi_trajectory.png)", flush=True)
+        print(f"[plot] saved {out}", flush=True)
     except Exception as e:
         print(f"[plot] save failed: {e}", flush=True)
 

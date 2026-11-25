@@ -8,11 +8,12 @@ Compares three rollout strategies, all on GPU, all K=1024, T=200, RK4:
   3. (sanity) graphed result must equal plain result (same math)
 
 Run inside WSL:
-  cd /mnt/d/RAMS-e-25 && source install/setup.bash && python3 src/controls/controls/bench_cudagraph.py
+  python3 src/controls/controls/debug/bench_cudagraph.py
 """
 import sys, time, math, os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-sys.path.insert(0, "/mnt/d/RAMS-e-25/src/controls")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 import torch.nn as nn
 from controls.mppi_controller import _GB, CKPT_PATH, VX_I, VY_I, YR_I, SIN_I, COS_I, SLIP_I

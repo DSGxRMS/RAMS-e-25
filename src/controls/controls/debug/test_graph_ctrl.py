@@ -1,6 +1,7 @@
 """Verify CUDA-graph MPPIController: speed + steer correctness."""
 import sys, time, math
-sys.path.insert(0, "/mnt/d/RAMS-e-25/src/controls")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 from controls.mppi_controller import MPPIController
 

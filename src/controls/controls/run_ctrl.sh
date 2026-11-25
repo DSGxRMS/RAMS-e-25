@@ -1,7 +1,7 @@
 #!/bin/bash
-source /opt/ros/galactic/setup.bash
-source ~/eufs_ws/install/setup.bash
-source /mnt/d/RAMS-e-25/install/setup.bash
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+source "$root/scripts/setup_integration.sh" || exit 1
+source "${RAMS_INSTALL_SETUP:-$root/install/setup.bash}" || exit 1
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export PYTHONUNBUFFERED=1
 

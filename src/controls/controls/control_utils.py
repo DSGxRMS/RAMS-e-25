@@ -31,12 +31,7 @@ BRAKE_GAIN = 0.7
 
 STOP_SPEED_THRESHOLD = 0.1
 
-# Jerk-limited velocity profile defaults
-
-V_MIN = 5.0
-A_MAX = 1.0
 D_MAX = 20.0
-J_MAX = 70.0
 CURVATURE_MAX = 0.9
 
 # -------------------- Utility Functions --------------------
@@ -177,44 +172,6 @@ def path_heading(xs, ys, idx, loop=True):
     dy = ys[i2] - ys[idx]
     return math.atan2(dy, dx)
 
-def jerk_limited_velocity_profile(v_limit, ds, v0, vf, v_min, v_max, a_max, d_max, j_max):
-    v_limit = np.asarray(v_limit, dtype=float)
-    ds = np.asarray(ds, dtype=float)
-    N = len(v_limit)
-    if N == 0:
-        return np.array([])
-    if len(ds) != N:
-        raise ValueError("ds length must equal v_limit length (ds[0] is 0 for the first point)")
-    # Forward pass (acceleration limited)
-    v_forward = np.zeros(N, dtype=float)
-    v_forward[0] = min(max(v0, 0.0), v_limit[0], v_max)
-    a_prev = 0.0
-    for i in range(1, N):
-        ds_i = max(ds[i], 1e-9)
-        v_avg = max(v_min, v_forward[i - 1])
-        dt = ds_i / max(v_avg, 1e-6)
-        a_curr = min(a_prev + j_max * dt, a_max)
-        v_possible = math.sqrt(max(0.0, v_forward[i - 1] ** 2 + 2.0 * a_curr * ds_i))
-        v_forward[i] = min(v_possible, v_limit[i], v_max)
-        a_prev = (v_forward[i] ** 2 - v_forward[i - 1] ** 2) / (2.0 * ds_i)
-    # Backward pass (deceleration limited)
-    v_profile = v_forward.copy()
-    v_profile[-1] = min(v_profile[-1], max(0.0, vf))
-    a_prev = 0.0
-    for i in range(N - 2, -1, -1):
-        ds_i = max(ds[i + 1], 1e-9)
-        v_avg = max(v_min, v_profile[i + 1])
-        dt = ds_i / max(v_avg, 1e-6)
-        a_curr = min(a_prev + j_max * dt, d_max)
-        v_possible = math.sqrt(max(0.0, v_profile[i + 1] ** 2 + 2.0 * a_curr * ds_i))
-        v_profile[i] = min(v_profile[i], v_possible, v_max)
-        a_prev = (v_profile[i + 1] ** 2 - v_profile[i] ** 2) / (2.0 * ds_i)
-    v_profile = np.minimum(v_profile, v_max)
-    if N > 1:
-        v_profile[:-1] = np.maximum(v_profile[:-1], v_min)
-    if vf <= 0.0:
-        v_profile[-1] = 0.0
-    return v_profile
 
 # --- Simple PID helpers (kept as you had them) ---
 
@@ -343,94 +300,4 @@ def calculate_trajectory_cost(pred_x, pred_y, pred_yaw, path_x, path_y, path_yaw
     w_head = 2.5 
     
     cost = (w_cte * error_dist) + (w_head * error_yaw)
-    return cost, match_idx
-
-# -------------------- Physics-Based Velocity Profiler --------------------
-
-def generate_velocity_profile(route_x, route_y, yaw_arr=None):
-    """
-    Generates a velocity profile based on vehicle physics (Friction + Aero)
-    and input constraints (Accel/Braking limits).
-    """
-    # --- Vehicle Physical Constants (From your specs) ---
-    MASS = 225.0
-    G = 9.81
-    MU = 1.60       # Tire D coefficient
-    C_DOWN = 1.9    # Downforce coefficient
-    
-    # Input Constraints
-    V_MAX_HARD = 30.0   # m/s
-    ACCEL_MAX = 3.0     # m/s^2
-    DECEL_MAX = -10.0   # m/s^2 (Note: Negative)
-    
-    # 1. Pre-process path
-    dx = np.gradient(route_x)
-    dy = np.gradient(route_y)
-    dist = np.hypot(dx, dy)
-    dist = np.where(dist < 1e-6, 1e-6, dist) # Avoid div/0
-    
-    # Calculate Curvature (Kappa)
-    ddx = np.gradient(dx)
-    ddy = np.gradient(dy)
-    curvature = (dx * ddy - dy * ddx) / np.power(dx*dx + dy*dy, 1.5)
-    curvature = np.abs(curvature)
-    
-    # 2. PASS 1: Lateral Physics Limit (The "Ceiling")
-    # Balance: Centripetal Force = Max Friction Force
-    # m * v^2 * k = MU * (m * g + C_DOWN * v^2)
-    # v^2 * (m * k - MU * C_DOWN) = MU * m * g
-    
-    v_limit = np.zeros_like(curvature)
-    
-    for i in range(len(curvature)):
-        k = max(curvature[i], 1e-6)
-        
-        # Denominator: (m * k) - (mu * C_down)
-        # If this is negative or zero, it means Downforce > Centripetal Force
-        # effectively giving infinite grip (limited only by engine V_MAX)
-        denom = (MASS * k) - (MU * C_DOWN)
-        
-        if denom <= 0:
-            v_phys = V_MAX_HARD
-        else:
-            numerator = MU * MASS * G
-            v_phys = math.sqrt(numerator / denom)
-            
-        v_limit[i] = min(V_MAX_HARD, v_phys)
-
-    # 3. PASS 2: Backward Pass (Braking Zones)
-    # Ensure we can stop in time for the corners
-    # v_i = sqrt(v_{i+1}^2 + 2 * a_brake * distance)
-    # Note: DECEL_MAX is negative, so (-2 * decel) adds to velocity
-    
-    v_backward = v_limit.copy()
-    # We assume the end speed is 0 if not looping, or same as start if looping
-    v_backward[-1] = 0.0 
-    
-    for i in range(len(v_limit) - 2, -1, -1):
-        ds = np.hypot(route_x[i+1]-route_x[i], route_y[i+1]-route_y[i])
-        max_reachable_sq = v_backward[i+1]**2 - (2 * DECEL_MAX * ds)
-        v_backward[i] = min(v_limit[i], math.sqrt(max_reachable_sq))
-
-    # 4. PASS 3: Forward Pass (Acceleration Limits)
-    # Ensure we don't accelerate faster than the engine allows
-    
-    v_final = v_backward.copy()
-    v_final[0] = 0.0 # Start from stop
-    
-    for i in range(1, len(v_limit)):
-        ds = np.hypot(route_x[i]-route_x[i-1], route_y[i]-route_y[i-1])
-        max_reachable_sq = v_final[i-1]**2 + (2 * ACCEL_MAX * ds)
-        v_final[i] = min(v_backward[i], math.sqrt(max_reachable_sq))
-        
-    # 5. Smoothing (Simulated Jerk Limiting)
-    # A simple moving average removes sharp jagged edges in the accel profile
-    window_size = 5
-    kernel = np.ones(window_size) / window_size
-    v_smooth = np.convolve(v_final, kernel, mode='same')
-    
-    # Restore endpoints after smoothing
-    v_smooth[0] = v_final[0]
-    v_smooth[-1] = v_final[-1]
-    
-    return v_smooth
+    return cost, match_idx

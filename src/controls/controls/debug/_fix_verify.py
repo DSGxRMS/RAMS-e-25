@@ -1,6 +1,8 @@
 """Verify: loading model_state_dict makes the rollout respond to steering."""
 import torch, torch.nn as nn, math
-CKPT="/mnt/d/RAMS-e-25/src/controls/controls/fs_model/best_model_600.pt"
+from pathlib import Path
+
+CKPT = Path(__file__).resolve().parents[1] / "fs_model" / "best_model_600.pt"
 VX_I,VY_I,YR_I,SIN_I,COS_I,SLIP_I=0,1,2,3,4,5
 class _Func(nn.Module):
     def __init__(s):

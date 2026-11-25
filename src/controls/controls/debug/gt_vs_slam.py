@@ -12,8 +12,8 @@ GT yaw changing), or is SLAM reporting a frozen/wrong yaw while the car drives n
 Run:
   source /opt/ros/galactic/setup.bash
   source ~/eufs_ws/install/setup.bash
-  source /mnt/d/RAMS-e-25/install/setup.bash
-  python3 /mnt/d/RAMS-e-25/src/controls/controls/gt_vs_slam.py
+  source install/setup.bash
+  python3 src/controls/controls/debug/gt_vs_slam.py
 """
 import math, time
 import rclpy

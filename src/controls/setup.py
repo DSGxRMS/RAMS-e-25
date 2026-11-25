@@ -9,7 +9,7 @@ setup(
     package_data={
         # ship the Neural ODE checkpoint with the package so it is present in
         # the install tree (colcon would otherwise drop the .pt file).
-        package_name: ['fs_model/*.pt'],
+        package_name: ['fs_model/*.pt', 'run_audit/*.py', 'run_audit/dashboard.html'],
     },
     include_package_data=True,
     data_files=[
@@ -26,7 +26,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'control_node = controls.control_node:main',
+            'control_node = controls.run_session:main',
+            'control_node_gru = controls.control_node_gru:main',
         ],
     },
 )

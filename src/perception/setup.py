@@ -26,6 +26,7 @@ setup(
             'camera_debug = perception.debug.camera_debug:main',
             'fusion_node = perception.fusion_node:main',
             'fusion_debug = perception.debug.fusion_debug:main',
+            'extract_cone_dataset = perception.extract_cone_dataset:main',
         ],
     },
 )

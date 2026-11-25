@@ -41,7 +41,7 @@ def generate_launch_description():
             executable="slam_node",
             name="slam",
             output="screen",
-            parameters=common,
+            parameters=common + [{"gt_passthrough": True}],  # P17: on GT, bypass the PF
         ),
 
         # 3) Path planning
@@ -50,7 +50,7 @@ def generate_launch_description():
             executable="pp_node_skidpad",
             name="pp",
             output="screen",
-            parameters=common,
+            parameters=common + [{"topics.odom_in": "/slam/odom_raw"}],
         ),
 
         # # 4) Controls

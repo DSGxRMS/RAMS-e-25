@@ -1,6 +1,13 @@
 /build
 /install
 /log
+/build_*
+/install_*
+/log_*
+/runs
+/.venv
+/mppi_trace.csv
+/slam_diag.csv
 
 __pycache__/
 *.pyc
