@@ -1,4 +1,6 @@
 from setuptools import setup
+from glob import glob
+import os
 
 package_name = 'perception'
 
@@ -10,8 +12,14 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'numpy',
+        'scikit-learn',
+        'pypatchworkpp==1.4.1',
+    ],
     zip_safe=True,
     maintainer='armaanm',
     maintainer_email='armaanmahajanbg@gmail.com',

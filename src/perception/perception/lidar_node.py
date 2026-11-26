@@ -9,11 +9,13 @@ Subscribes:
 
 Pipeline per frame:
   - PC2 -> Nx3 float32
+  - Ground removal selected with ``ground_removal_method``:
+      - Patchwork++ (default; full cloud before crop)
+      - Vectorized RANSAC (crop before plane fitting)
   - Box crop:
       X: [0.2, 30] m  (forward)
       Y: [-8, +8] m   (lateral)
       Z: [-2, 2] m    (height band)
-  - Ground removal using RANSAC plane fit
   - 2D DBSCAN clustering on XY of non-ground points
   - Publish one point per cluster centroid as 2D:
       - x, y from cluster centroid
@@ -35,6 +37,13 @@ from sensor_msgs_py import point_cloud2 as pc2
 
 from sklearn.cluster import DBSCAN
 
+from perception.ground_removal import (
+    GroundRemovalMethod,
+    PatchworkGroundRemover,
+    default_cluster_eps,
+    vectorized_ransac,
+)
+
 
 class LidarCropGround2DNode(Node):
     def __init__(self):
@@ -43,6 +52,7 @@ class LidarCropGround2DNode(Node):
         # -------- Parameters --------
         self.declare_parameter("input_topic", "/velodyne_points")
         self.declare_parameter("output_topic", "/perception/cones")
+        self.declare_parameter("ground_removal_method", "patchwork")
 
         # Box limits (meters)
         # X forward, Y left/right, Z up from ground
@@ -57,28 +67,99 @@ class LidarCropGround2DNode(Node):
         self.declare_parameter("ground_thresh", 0.05)  # meters
         self.declare_parameter("min_ground_inliers", 30)
 
+        # Patchwork++ parameters validated on the EUFS single-lap benchmark.
+        self.declare_parameter("patchwork_sensor_height", 1.08)
+        self.declare_parameter("patchwork_min_range", 0.2)
+        self.declare_parameter("patchwork_max_range", 80.0)
+        self.declare_parameter("patchwork_distance_threshold", 0.04)
+        self.declare_parameter("patchwork_enable_rnr", False)
+
         # DBSCAN clustering parameters (2D on XY)
-        self.declare_parameter("cluster_eps", 1.0)          # meters
+        # <= 0 selects 0.50 m for Patchwork++ and 1.00 m for RANSAC.
+        self.declare_parameter("cluster_eps", 0.0)          # meters
         self.declare_parameter("cluster_min_points", 1)
         self.declare_parameter("cluster_max_points", 50)    # reject huge blobs
 
         # -------- Read parameters --------
-        self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
-        self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
+        self.input_topic = (
+            self.get_parameter("input_topic")
+            .get_parameter_value().string_value
+        )
+        self.output_topic = (
+            self.get_parameter("output_topic")
+            .get_parameter_value().string_value
+        )
+        method_value = self.get_parameter(
+            "ground_removal_method"
+        ).get_parameter_value().string_value
+        self.ground_removal_method = GroundRemovalMethod.parse(method_value)
 
-        self.x_min = self.get_parameter("x_min").get_parameter_value().double_value
-        self.x_max = self.get_parameter("x_max").get_parameter_value().double_value
-        self.y_abs_max = self.get_parameter("y_abs_max").get_parameter_value().double_value
-        self.z_min = self.get_parameter("z_min").get_parameter_value().double_value
-        self.z_max = self.get_parameter("z_max").get_parameter_value().double_value
+        self.x_min = (
+            self.get_parameter("x_min").get_parameter_value().double_value
+        )
+        self.x_max = (
+            self.get_parameter("x_max").get_parameter_value().double_value
+        )
+        self.y_abs_max = (
+            self.get_parameter("y_abs_max").get_parameter_value().double_value
+        )
+        self.z_min = (
+            self.get_parameter("z_min").get_parameter_value().double_value
+        )
+        self.z_max = (
+            self.get_parameter("z_max").get_parameter_value().double_value
+        )
 
-        self.ransac_iters = self.get_parameter("ransac_iters").get_parameter_value().integer_value
-        self.ground_thresh = self.get_parameter("ground_thresh").get_parameter_value().double_value
-        self.min_ground_inliers = self.get_parameter("min_ground_inliers").get_parameter_value().integer_value
+        self.ransac_iters = (
+            self.get_parameter("ransac_iters")
+            .get_parameter_value().integer_value
+        )
+        self.ground_thresh = (
+            self.get_parameter("ground_thresh")
+            .get_parameter_value().double_value
+        )
+        self.min_ground_inliers = self.get_parameter(
+            "min_ground_inliers"
+        ).get_parameter_value().integer_value
 
-        self.cluster_eps = self.get_parameter("cluster_eps").get_parameter_value().double_value
-        self.cluster_min_points = self.get_parameter("cluster_min_points").get_parameter_value().integer_value
-        self.cluster_max_points = self.get_parameter("cluster_max_points").get_parameter_value().integer_value
+        self.patchwork_sensor_height = self.get_parameter(
+            "patchwork_sensor_height"
+        ).get_parameter_value().double_value
+        self.patchwork_min_range = self.get_parameter(
+            "patchwork_min_range"
+        ).get_parameter_value().double_value
+        self.patchwork_max_range = self.get_parameter(
+            "patchwork_max_range"
+        ).get_parameter_value().double_value
+        self.patchwork_distance_threshold = self.get_parameter(
+            "patchwork_distance_threshold"
+        ).get_parameter_value().double_value
+        self.patchwork_enable_rnr = self.get_parameter(
+            "patchwork_enable_rnr"
+        ).get_parameter_value().bool_value
+
+        self.cluster_eps = (
+            self.get_parameter("cluster_eps")
+            .get_parameter_value().double_value
+        )
+        if self.cluster_eps <= 0.0:
+            self.cluster_eps = default_cluster_eps(self.ground_removal_method)
+        self.cluster_min_points = self.get_parameter(
+            "cluster_min_points"
+        ).get_parameter_value().integer_value
+        self.cluster_max_points = self.get_parameter(
+            "cluster_max_points"
+        ).get_parameter_value().integer_value
+
+        self.patchwork = None
+        if self.ground_removal_method is GroundRemovalMethod.PATCHWORK:
+            self.patchwork = PatchworkGroundRemover(
+                sensor_height=self.patchwork_sensor_height,
+                minimum_range=self.patchwork_min_range,
+                maximum_range=self.patchwork_max_range,
+                distance_threshold=self.patchwork_distance_threshold,
+                enable_rnr=self.patchwork_enable_rnr,
+            )
 
         # -------- ROS I/O (best-effort QoS) --------
         self.sub = self.create_subscription(
@@ -94,21 +175,40 @@ class LidarCropGround2DNode(Node):
             qos_profile_sensor_data,
         )
 
-        self.get_logger().info(f"[LidarCropGround2D] Subscribing to: {self.input_topic} (best-effort)")
-        self.get_logger().info(f"[LidarCropGround2D] Publishing to: {self.output_topic} (best-effort)")
+        self.get_logger().info(
+            f"[LidarCropGround2D] Subscribing to: {self.input_topic} "
+            "(best-effort)"
+        )
+        self.get_logger().info(
+            f"[LidarCropGround2D] Publishing to: {self.output_topic} "
+            "(best-effort)"
+        )
         self.get_logger().info(
             f"[LidarCropGround2D] Crop box: X∈[{self.x_min},{self.x_max}] m, "
             f"|Y|≤{self.y_abs_max} m, "
             f"Z∈[{self.z_min},{self.z_max}] m"
         )
         self.get_logger().info(
-            f"[LidarCropGround2D] RANSAC: iters={self.ransac_iters}, "
-            f"ground_thresh={self.ground_thresh} m, "
-            f"min_ground_inliers={self.min_ground_inliers}"
+            f"[LidarCropGround2D] Ground removal: "
+            f"{self.ground_removal_method.value}"
         )
+        if self.ground_removal_method is GroundRemovalMethod.RANSAC:
+            self.get_logger().info(
+                f"[LidarCropGround2D] RANSAC: iters={self.ransac_iters}, "
+                f"ground_thresh={self.ground_thresh} m, "
+                f"min_ground_inliers={self.min_ground_inliers}"
+            )
+        else:
+            self.get_logger().info(
+                f"[LidarCropGround2D] Patchwork++: "
+                f"sensor_height={self.patchwork_sensor_height} m, "
+                f"distance_threshold={self.patchwork_distance_threshold} m, "
+                f"RNR={self.patchwork_enable_rnr}"
+            )
         self.get_logger().info(
             f"[LidarCropGround2D] DBSCAN: eps={self.cluster_eps} m, "
-            f"min_points={self.cluster_min_points}, max_points={self.cluster_max_points}"
+            f"min_points={self.cluster_min_points}, "
+            f"max_points={self.cluster_max_points}"
         )
 
         self._frames = 0
@@ -125,27 +225,30 @@ class LidarCropGround2DNode(Node):
 
             if n_in == 0:
                 # publish empty cones
-                out_msg = pc2.create_cloud_xyz32(msg.header, np.empty((0, 3), dtype=np.float32))
+                out_msg = pc2.create_cloud_xyz32(
+                    msg.header, np.empty((0, 3), dtype=np.float32)
+                )
                 self.pub.publish(out_msg)
                 self._log_stats(n_in, 0, 0, 0, time.time() - t0)
                 return
 
-            # 2) Box crop
+            # 2) Crop statistics and selectable ground removal. Patchwork++
+            # needs full-scan spatial context; RANSAC keeps the old crop-first
+            # behaviour.
             P_crop = self._box_crop(P)
             n_crop = P_crop.shape[0]
 
-            if n_crop == 0:
-                out_msg = pc2.create_cloud_xyz32(msg.header, np.empty((0, 3), dtype=np.float32))
-                self.pub.publish(out_msg)
-                self._log_stats(n_in, n_crop, 0, 0, time.time() - t0)
-                return
-
-            # 3) Ground removal via RANSAC
-            P_ng = self._remove_ground_ransac(P_crop)
-
-            # Fallback: if RANSAC fails or removes "everything", keep cropped
-            if P_ng is None or P_ng.shape[0] == 0:
-                P_ng = P_crop
+            if self.ground_removal_method is GroundRemovalMethod.PATCHWORK:
+                P_ng = self.patchwork.remove(P)
+                P_ng = self._box_crop(P_ng)
+            else:
+                if n_crop == 0:
+                    P_ng = P_crop
+                else:
+                    P_ng = self._remove_ground_ransac(P_crop)
+                    # Preserve the previous RANSAC fallback.
+                    if P_ng is None or P_ng.shape[0] == 0:
+                        P_ng = P_crop
 
             n_ng = P_ng.shape[0]
 
@@ -198,7 +301,7 @@ class LidarCropGround2DNode(Node):
         )
         return P[mask]
 
-    # ---------- RANSAC ground removal ----------
+    # ---------- Vectorized RANSAC ground removal ----------
     def _remove_ground_ransac(self, P: np.ndarray) -> np.ndarray:
         """
         RANSAC plane fit, remove inliers (ground).
@@ -206,64 +309,19 @@ class LidarCropGround2DNode(Node):
         Returns:
           nonground_points: Mx3, or None on failure
         """
-        n = P.shape[0]
-        if n < 3:
-            return None
-
-        max_iters = max(1, self.ransac_iters)
-        thresh = float(self.ground_thresh)
-        min_inliers = max(3, int(self.min_ground_inliers))
-
-        best_inliers = None
-        best_count = 0
-
-        P_vec = P.astype(np.float32)
-
-        for _ in range(max_iters):
-            idx = np.random.choice(n, 3, replace=False)
-            p1, p2, p3 = P_vec[idx]
-
-            # Two vectors on plane
-            v1 = p2 - p1
-            v2 = p3 - p1
-
-            # Normal = v1 x v2
-            normal = np.cross(v1, v2)
-            norm = np.linalg.norm(normal)
-            if norm < 1e-3:
-                continue  # degenerate
-
-            normal /= norm
-            a, b, c = normal
-            d = -np.dot(normal, p1)
-
-            # Enforce plane normal roughly vertical (ground)
-            # |c| large -> plane normal mostly along z-axis
-            if abs(c) < 0.7:
-                continue
-
-            # Distances of all points to plane
-            dist = np.abs(P_vec @ normal + d)
-            inliers = np.where(dist < thresh)[0]
-            cnt = inliers.size
-
-            if cnt > best_count:
-                best_count = cnt
-                best_inliers = inliers
-
-        if best_inliers is None or best_count < min_inliers:
-            # No good ground plane found
+        retained = vectorized_ransac(
+            P,
+            iterations=self.ransac_iters,
+            threshold=self.ground_thresh,
+            minimum_inliers=self.min_ground_inliers,
+        )
+        if retained is None:
             self.get_logger().warn(
-                f"[LidarCropGround2D] RANSAC failed or too few ground inliers (best={best_count}). "
+                "[LidarCropGround2D] RANSAC failed or found too few ground "
+                "inliers. "
                 f"Skipping ground removal for this frame."
             )
-            return None
-
-        mask = np.ones(n, dtype=bool)
-        mask[best_inliers] = False  # remove ground inliers
-        nonground = P_vec[mask]
-
-        return nonground
+        return retained
 
     # ---------- 2D DBSCAN clustering ----------
     def _cluster_2d(self, P: np.ndarray):
@@ -297,7 +355,10 @@ class LidarCropGround2DNode(Node):
 
             idxs = np.where(labels == lbl)[0]
             count = idxs.size
-            if count < self.cluster_min_points or count > self.cluster_max_points:
+            if (
+                count < self.cluster_min_points
+                or count > self.cluster_max_points
+            ):
                 continue
 
             cluster_xy = xy[idxs]
@@ -311,7 +372,10 @@ class LidarCropGround2DNode(Node):
         return np.vstack(centroids).astype(np.float32), n_clusters
 
     # ---------- Logging ----------
-    def _log_stats(self, n_in: int, n_crop: int, n_ng: int, n_clusters: int, dt: float):
+    def _log_stats(
+        self, n_in: int, n_crop: int, n_ng: int,
+        n_clusters: int, dt: float
+    ):
         self._frames += 1
         now = time.time()
         if now - self._last_log > 1.5:

@@ -1,0 +1,20 @@
+lidar_crop_ground_2d:
+  ros__parameters:
+    # Available values: patchwork, ransac
+    ground_removal_method: patchwork
+
+    patchwork_sensor_height: 1.08
+    patchwork_min_range: 0.2
+    patchwork_max_range: 80.0
+    patchwork_distance_threshold: 0.04
+    patchwork_enable_rnr: false
+
+    ransac_iters: 50
+    ground_thresh: 0.05
+    min_ground_inliers: 30
+
+    # A value <= 0 selects the benchmarked method-specific default:
+    # Patchwork++: 0.50 m; RANSAC: 1.00 m.
+    cluster_eps: 0.0
+    cluster_min_points: 1
+    cluster_max_points: 50
