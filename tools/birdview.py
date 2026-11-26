@@ -20,6 +20,11 @@ Shows
                      (magenta diamonds), virtual cones (white circles), Delaunay
                      midpoints (cyan dots); NORMAL/FALLBACK modes: Delaunay edges
                      mode + reason + measured track width in the panel
+    steering gauge   dial under the status panel: commanded steering (/cmd, orange needle) and
+                     the wheel angle the simulator actually applied (/ground_truth/wheel_speeds,
+                     white needle), with the controller cap (20 deg) and the EUFS lock (29.8 deg)
+    front wheels     drawn on the car at the applied (else commanded) angle, plus the arc the
+                     car would drive at the commanded steering (dashed orange, R = L / tan(delta))
     status panel     speed, steering + accel command (/cmd), topic rates,
                      path length, lap count + lap times, distance driven,
                      closest cone (warns when < 0.6 m)
@@ -28,6 +33,7 @@ Keys (click the plot window first)
     f   follow car  <->  whole track
     + / -   zoom in / out (follow mode)
     r   rollouts on / off
+    w   steering arc on / off
     p   planner insides on / off
     t   clear trail + laps
     s   save a PNG screenshot to the current folder
@@ -64,6 +70,10 @@ try:
     from visualization_msgs.msg import MarkerArray
 except ImportError:
     MarkerArray = None
+try:
+    from eufs_msgs.msg import WheelSpeedsStamped
+except ImportError:
+    WheelSpeedsStamped = None
 
 # ---------------------------------------------------------------- settings
 ODOM_TOPIC = "/slam/odom_raw"
@@ -74,6 +84,10 @@ CONE_WARN = 0.6               # [m] car centre to cone: "close to a cone"
 LAP_MIN_DIST = 60.0           # [m] driven before a return to the start counts as a lap
 LAP_RADIUS = 3.0              # [m]
 REDRAW_HZ = 15.0
+WHEELBASE = 1.58              # [m] EUFS ADS-DV
+STEER_CAP_DEG = 20.0          # controller limit (mppi_controller.py STEER_MAX = 0.349 rad)
+STEER_LOCK_DEG = 29.8         # EUFS steering lock (0.52 rad)
+ARC_LEN = 8.0                 # [m] length of the drawn steering arc
 
 
 def yaw_of(q):
@@ -117,9 +131,10 @@ class BirdViewNode(Node):
         self.pseudo = np.zeros((0, 2))
         self.rollouts = []
         self.cmd = None                 # (steer, accel)
+        self.wheel = None               # applied front-wheel angle [rad], + = left
         self.pp = {}                    # ns -> (N,2) points, from /pp/debug_markers
         self.pp_mode = None             # dict from /pp/mode
-        self.rate = {k: Rate() for k in ("odom", "map", "path", "buffer", "cmd", "ppdbg")}
+        self.rate = {k: Rate() for k in ("odom", "map", "path", "buffer", "cmd", "ppdbg", "wheel")}
         self.dist = 0.0
         self.lap_start = None           # (x, y, sim_t, dist_at_start)
         self.laps = []
@@ -131,6 +146,8 @@ class BirdViewNode(Node):
         self.create_subscription(Path, "/debug/pseudo_path", self.cb_pseudo, qos)
         if AckermannDriveStamped is not None:
             self.create_subscription(AckermannDriveStamped, "/cmd", self.cb_cmd, qos)
+        if WheelSpeedsStamped is not None:
+            self.create_subscription(WheelSpeedsStamped, "/ground_truth/wheel_speeds", self.cb_wheel, qos)
         if MarkerArray is not None:
             self.create_subscription(MarkerArray, "/debug/rollouts", self.cb_rollouts, qos)
             self.create_subscription(MarkerArray, "/pp/debug_markers", self.cb_pp_markers, qos)
@@ -195,6 +212,11 @@ class BirdViewNode(Node):
             self.rate["cmd"].tick()
             self.cmd = (m.drive.steering_angle, m.drive.acceleration)
 
+    def cb_wheel(self, m):
+        with self.lock:
+            self.rate["wheel"].tick()
+            self.wheel = float(m.speeds.steering)
+
     def cb_rollouts(self, m):
         lines = []
         for mk in m.markers:
@@ -225,7 +247,7 @@ class BirdViewNode(Node):
             return dict(cones={k: v.copy() for k, v in self.cones.items()}, car=self.car,
                         trail=np.array(self.trail, float).reshape(-1, 3), path=self.path.copy(),
                         buffer=self.buffer.copy(), pseudo=self.pseudo.copy(),
-                        rollouts=list(self.rollouts), cmd=self.cmd,
+                        rollouts=list(self.rollouts), cmd=self.cmd, wheel=self.wheel,
                         pp=dict(self.pp), pp_mode=self.pp_mode, dist=self.dist,
                         laps=list(self.laps), lap_start=self.lap_start,
                         rate={k: (r.hz(), r.age()) for k, r in self.rate.items()})
@@ -243,6 +265,7 @@ class BirdView:
         self.zoom = FOLLOW_RADIUS
         self.show_roll = True
         self.show_pp = True
+        self.show_arc = True
         self.running = True
 
         plt.rcParams["toolbar"] = "None"
@@ -280,6 +303,12 @@ class BirdView:
         self.path, = ax.plot([], [], ".-", color="#ff3030", lw=1.4, ms=3, label="planner /path_points", zorder=7)
         self.car = Polygon(np.zeros((3, 2)), closed=True, facecolor="white", edgecolor="black", lw=1.0, zorder=10)
         ax.add_patch(self.car)
+        self.wheels = [Polygon(np.zeros((4, 2)), closed=True, facecolor="#111111", edgecolor="#ffb000",
+                               lw=0.8, zorder=11) for _ in range(4)]
+        for w in self.wheels:
+            ax.add_patch(w)
+        self.steer_arc, = ax.plot([], [], "--", color="#ffb000", lw=1.8, alpha=0.9, zorder=9,
+                                  label="arc at commanded steering")
         self.warn = ax.text(0.5, 0.97, "", transform=ax.transAxes, ha="center", va="top",
                             color="white", fontsize=12, weight="bold",
                             bbox=dict(facecolor="#c0001a", edgecolor="none", alpha=0.0))
@@ -290,8 +319,74 @@ class BirdView:
         cb.ax.tick_params(colors="#cccccc", labelsize=7)
         self.txt = self.hud.text(0.04, 0.98, "", va="top", ha="left", family="monospace",
                                  fontsize=9.5, color="#e8e8e8", transform=self.hud.transAxes)
+        self._build_gauge()
         self.fig.canvas.mpl_connect("key_press_event", self.on_key)
         self.fig.canvas.mpl_connect("close_event", lambda e: setattr(self, "running", False))
+
+    # ---- steering gauge (dial). Front-wheel angle, + = left. The dial is stretched
+    #      (1 deg of steering = DIAL_GAIN deg of dial) so small angles are visible.
+    DIAL_GAIN = 2.6
+    DIAL_MAX = 34.0                       # [deg] steering at the end of the scale
+
+    def _dial(self, deg, r):
+        a = math.radians(90.0 + self.DIAL_GAIN * float(np.clip(deg, -self.DIAL_MAX, self.DIAL_MAX)))
+        return r * math.cos(a), r * math.sin(a)
+
+    def _build_gauge(self):
+        g = self.fig.add_axes([0.755, 0.085, 0.23, 0.27])
+        g.set_xlim(-1.15, 1.15); g.set_ylim(-0.62, 1.18); g.set_aspect("equal"); g.axis("off")
+        self.gauge = g
+        th = lambda d: 90.0 + self.DIAL_GAIN * d
+        M, C, K = self.DIAL_MAX, STEER_CAP_DEG, STEER_LOCK_DEG
+        # zones: green inside the controller cap, amber cap..lock, red beyond the lock
+        for lo, hi, col in ((-C, C, "#2e5e3a"), (C, K, "#8a6a12"), (-K, -C, "#8a6a12"),
+                            (K, M, "#7a1e1e"), (-M, -K, "#7a1e1e")):
+            g.add_patch(Wedge((0, 0), 1.0, th(lo), th(hi), width=0.16, facecolor=col, edgecolor="none"))
+        for d in range(-30, 31, 5):
+            r0 = 0.80 if d % 10 else 0.74
+            x0, y0 = self._dial(d, r0); x1, y1 = self._dial(d, 0.84)
+            g.plot([x0, x1], [y0, y1], color="#cccccc", lw=1.0 if d % 10 else 1.6)
+            if d % 10 == 0:
+                xt, yt = self._dial(d, 0.62)
+                g.text(xt, yt, f"{abs(d)}", color="#cccccc", fontsize=7, ha="center", va="center")
+        for d in (C, -C):
+            x0, y0 = self._dial(d, 0.84); x1, y1 = self._dial(d, 1.06)
+            g.plot([x0, x1], [y0, y1], color="#ffb000", lw=1.4)
+        for d in (K, -K):
+            x0, y0 = self._dial(d, 0.84); x1, y1 = self._dial(d, 1.06)
+            g.plot([x0, x1], [y0, y1], color="#ff4040", lw=1.4)
+        g.text(-1.1, 1.12, "LEFT", color="#cccccc", fontsize=8, ha="left", va="top")
+        g.text(1.1, 1.12, "RIGHT", color="#cccccc", fontsize=8, ha="right", va="top")
+        g.text(0, 1.14, "steering (front wheels)", color="#e8e8e8", fontsize=8.5, ha="center", va="top")
+        self.n_cmd, = g.plot([0, 0], [0, 0.9], color="#ffb000", lw=3.0, solid_capstyle="round", zorder=5)
+        self.n_act, = g.plot([0, 0], [0, 0.78], color="#ffffff", lw=1.8, solid_capstyle="round", zorder=6)
+        g.add_patch(plt.Circle((0, 0), 0.06, color="#dddddd", zorder=7))
+        self.g_big = g.text(0, -0.18, "", color="#ffffff", fontsize=15, weight="bold", ha="center", va="center")
+        self.g_small = g.text(0, -0.43, "", color="#cccccc", fontsize=7.5, ha="center", va="center",
+                              family="monospace")
+
+    def _update_gauge(self, cmd_rad, act_rad):
+        def setn(line, rad, r):
+            if rad is None:
+                line.set_data([], [])
+            else:
+                x, y = self._dial(math.degrees(rad), r); line.set_data([0, x], [0, y])
+        setn(self.n_cmd, cmd_rad, 0.9)
+        setn(self.n_act, act_rad, 0.78)
+        main = cmd_rad if cmd_rad is not None else act_rad
+        if main is None:
+            self.g_big.set_text("no steering data"); self.g_big.set_fontsize(10); self.g_small.set_text("")
+            return
+        d = math.degrees(main)
+        side = "STRAIGHT" if abs(d) < 0.5 else ("\u25c0 LEFT" if d > 0 else "RIGHT \u25b6")
+        self.g_big.set_fontsize(15)
+        self.g_big.set_text(f"{side}  {abs(d):4.1f}\u00b0" if abs(d) >= 0.5 else side)
+        col = "#ffffff" if abs(d) < STEER_CAP_DEG - 1.5 else ("#ffb000" if abs(d) < STEER_LOCK_DEG else "#ff4040")
+        self.g_big.set_color(col)
+        R = WHEELBASE / math.tan(abs(main)) if abs(main) > 1e-3 else float("inf")
+        rtxt = f"R {R:5.1f} m" if R < 999 else "R   inf"
+        atxt = f"applied {math.degrees(act_rad):+5.1f}\u00b0" if act_rad is not None else "applied   -"
+        self.g_small.set_text(f"cmd {d:+5.1f}\u00b0  {atxt}\n{rtxt}   orange=cmd white=applied\ncap {STEER_CAP_DEG:.0f}\u00b0 (amber)  lock {STEER_LOCK_DEG}\u00b0 (red)")
 
     def on_key(self, e):
         k = e.key
@@ -299,6 +394,7 @@ class BirdView:
         elif k in ("+", "="): self.zoom = max(6.0, self.zoom / 1.3)
         elif k in ("-", "_"): self.zoom = min(120.0, self.zoom * 1.3)
         elif k == "r": self.show_roll = not self.show_roll
+        elif k == "w": self.show_arc = not self.show_arc
         elif k == "p": self.show_pp = not self.show_pp
         elif k == "t": self.node.clear_trail()
         elif k == "s":
@@ -343,7 +439,30 @@ class BirdView:
             x, y, yaw, v, _ = car
             c, sn = math.cos(yaw), math.sin(yaw)
             shape = np.array([[1.6, 0.0], [-0.9, 0.75], [-0.9, -0.75]])
-            self.car.set_xy(shape @ np.array([[c, sn], [-sn, c]]) + [x, y])
+            Rm = np.array([[c, sn], [-sn, c]])
+            self.car.set_xy(shape @ Rm + [x, y])
+            cmd_st = s["cmd"][0] if s["cmd"] is not None else None
+            wst = s["wheel"] if s["wheel"] is not None else (cmd_st if cmd_st is not None else 0.0)
+            hw = WHEELBASE / 2
+            for w, (ax_x, ax_y, steer) in zip(self.wheels, ((hw, 0.62, wst), (hw, -0.62, wst),
+                                                             (-hw, 0.62, 0.0), (-hw, -0.62, 0.0))):
+                cs, ss = math.cos(steer), math.sin(steer)
+                tyre = np.array([[0.26, 0.1], [-0.26, 0.1], [-0.26, -0.1], [0.26, -0.1]])
+                tyre = tyre @ np.array([[cs, ss], [-ss, cs]]) + [ax_x, ax_y]
+                w.set_xy(tyre @ Rm + [x, y])
+            if self.show_arc and cmd_st is not None:
+                rear = np.array([x, y]) - hw * np.array([c, sn])
+                u = np.linspace(0.0, ARC_LEN, 40)
+                if abs(cmd_st) < 1e-3:
+                    A = rear + u[:, None] * np.array([c, sn])
+                else:
+                    Rt = WHEELBASE / math.tan(cmd_st)                 # signed, + = left
+                    ctr = rear + Rt * np.array([-sn, c])
+                    ang = yaw - math.pi / 2 + u / Rt
+                    A = ctr + abs(Rt) * np.c_[np.cos(ang), np.sin(ang)] * (1 if Rt > 0 else -1)
+                self.steer_arc.set_data(A[:, 0], A[:, 1])
+            else:
+                self.steer_arc.set_data([], [])
             self.fov.set_center((x + FOV_VERTEX * c, y + FOV_VERTEX * sn))
             self.fov.set_theta1(math.degrees(yaw) - FOV_ANGLE / 2)
             self.fov.set_theta2(math.degrees(yaw) + FOV_ANGLE / 2)
@@ -380,8 +499,6 @@ class BirdView:
             st, ac = s["cmd"]
             L.append(f"steer cmd  {math.degrees(st):+6.1f} deg")
             L.append(f"accel cmd  {ac:+6.2f} m/s2")
-            bar = int(round(np.clip(st / 0.52, -1, 1) * 10))
-            L.append("  L " + "".join("#" if (bar > 0 and 10 - bar <= i < 10) or (bar < 0 and 10 < i <= 10 - bar) else ("|" if i == 10 else ".") for i in range(21)) + " R")
         else:
             L.append("no /cmd yet (controls off?)")
         L.append("")
@@ -395,6 +512,17 @@ class BirdView:
             if M.get("mode") == "PCD":
                 L.append(f"track width   {float(M.get('width', 0)):.2f} m")
                 L.append(f"left wall     {M.get('left')}")
+            if M.get("mode") == "SKIDPAD":
+                L.append(f"phase         {M.get('phase')}")
+                L.append(f"layout        {M.get('layout', 'LOCKED' if M.get('locked') else 'fitting')}")
+                sx, sy = M.get("sigma_xy_m"), M.get("sigma_yaw_deg")
+                if sx is not None and sy is not None:
+                    L.append(f"1-sigma       {100 * sx:.1f} cm  {sy:.2f} deg")
+                L.append(f"arc cover     {M.get('arc_deg')}  colour {M.get('colour')}")
+                rms = M.get("fit_rms_m")
+                L.append(f"fit rms       {rms:.3f} m" if rms is not None else "fit rms       -")
+                L.append(f"cones used    {M.get('cones_used')}")
+                L.append(f"progress      {M.get('s_m', 0):.0f}/{M.get('total_m', 0):.0f} m")
         else:
             L.append("planner mode  - (no /pp/mode:")
             L.append("  team planner or old PCD file)")
@@ -419,10 +547,12 @@ class BirdView:
         L.append("")
         L.append("keys: f follow/whole  +/- zoom")
         L.append("      r rollouts  p planner insides")
+        L.append("      w steering arc")
         L.append("      t clear trail")
         L.append("      s screenshot  q quit")
         L.append(f"view: {'FOLLOW' if self.follow else 'WHOLE TRACK'}")
         self.txt.set_text("\n".join(L))
+        self._update_gauge(s["cmd"][0] if s["cmd"] is not None else None, s["wheel"])
 
 
 def main():

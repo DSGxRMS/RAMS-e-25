@@ -22,6 +22,8 @@ setup(
         'console_scripts': [
             'pp_node_skidpad = pathplanning.pp_node_skidpad:main',
             'pp_tls = pathplanning.pp_tls:main',
+            'pp_tels_new = pathplanning.pp_tels_new:main',
+            'pp_skidpad_tels = pathplanning.pp_skidpad_tels:main',
             'pp_debug = pathplanning.pp_debug.skidpad_debug:main',
         ],
     },
