@@ -4,6 +4,7 @@ import argparse
 import bisect
 import collections
 import csv
+import html
 import json
 import math
 import re
@@ -200,6 +201,75 @@ def save_csv(path, rows, columns=None):
             writer.writerows(rows)
 
 
+def shutdown_metrics(path, ground_truth, clock_resets):
+    if not path.is_file():
+        return None
+    result = json.loads(path.read_text(encoding="utf-8"))
+    first, stop = result["first_brake_sim_ns"], result["standstill_confirmed_sim_ns"]
+    if first is None or clock_resets:
+        return result
+    samples = [row for row in ground_truth if row["stamp_ns"] is not None]
+    stamps = [row["stamp_ns"] for row in samples]
+    start = bisect.bisect_left(stamps, first)
+    if start == len(samples) or stamps[start] - first > 100_000_000:
+        return result
+    initial = samples[start]
+    initial_speed = math.hypot(initial["vx"], initial["vy"])
+    result["initial_planar_speed_mps"] = initial_speed
+    if stop is None:
+        return result
+    end = bisect.bisect_left(stamps, stop, lo=start)
+    if end == len(samples) or stamps[end] - stop > 100_000_000:
+        return result
+    result["time_to_confirmation_s"] = (stop - first) * 1e-9
+    result["distance_to_confirmation_m"] = samples[end]["distance"] - initial["distance"]
+    if initial_speed >= .15:
+        onset = next((row["stamp_ns"] for row in samples[start:end + 1]
+                      if math.hypot(row["vx"], row["vy"]) < initial_speed - .10), None)
+        if onset is not None:
+            result["first_speed_drop_0_1_mps_s"] = (onset - first) * 1e-9
+    return result
+
+
+def static_summary(summary):
+    """Render a readable summary even in previews that block scripts."""
+    model = (summary["model"] or "Unlabelled controller").upper()
+    peak = summary["peak_actual_speed"]
+    peak_text = f"{peak:.2f} m/s" if peak is not None else "unavailable"
+    pp = summary["pp"]
+    contact = summary["contact"]["unique_cones"]
+    contacts = "Unknown coverage" if contact is None else f"{contact} recorded (coverage partial)"
+    entries = [
+        ("Controller", model), ("Recorded distance", f"{summary['distance_m']:.2f} m"),
+        ("Peak forward speed", peak_text),
+        ("Usable planner packets", f"{pp['valid_messages']}/{pp['messages']}"),
+        ("Cone contacts", contacts),
+    ]
+    stop = summary.get("shutdown_brake")
+    if stop is not None:
+        entries.append(("Shutdown", "Standstill confirmed" if stop["status"] == "confirmed"
+                        else f"Standstill unconfirmed ({stop['status']})"))
+        distance = stop.get("distance_to_confirmation_m")
+        elapsed = stop.get("time_to_confirmation_s")
+        if distance is not None and elapsed is not None:
+            entries.append(("Brake request to confirmation", f"{distance:.2f} m in {elapsed:.2f} simulator s"))
+    cells = "".join(f"<div><small>{label}</small><b>{html.escape(value)}</b></div>"
+                    for label, value in entries)
+    return f'<h2>Run summary</h2><div class="detail">{cells}</div>'
+
+
+def report_links(directory):
+    exports = (
+        ("trajectory.png", "Trajectory plot"), ("timeline.csv", "Cycle timeline CSV"),
+        ("ground_truth.csv", "Full-rate odometry CSV"), ("cone_contacts.csv", "Contact CSV"),
+        ("pp_dropouts.csv", "Dropout CSV"), ("excursions.csv", "Excursion CSV"),
+        ("shutdown.json", "Shutdown JSON"), ("summary.json", "Summary JSON"),
+        ("events.jsonl", "Raw event archive"),
+    )
+    return "".join(f'<a href="{name}">{label}</a>' for name, label in exports
+                   if (directory / name).is_file())
+
+
 def analyze(args):
     streams, invalid_rows = load_archive(args.run / "events.jsonl")
     meta = next((r["data"] for r in streams["meta"]), {})
@@ -214,7 +284,9 @@ def analyze(args):
     if not basis:
         raise SystemExit("Capture has no controller cycles, /cmd messages or ground-truth odometry.")
     start, end = basis[0]["t"], basis[-1]["t"]
-    intervals = pp_dropouts(streams["pp"], start, end, args.pp_age, args.min_pp_points)
+    driving_end = next((r["t"] for r in reversed(basis)
+                        if r["data"].get("mode") != "shutdown_brake"), end)
+    intervals = pp_dropouts(streams["pp"], start, driving_end, args.pp_age, args.min_pp_points)
     anchor = next((r["sim_ns"] for r in basis if r.get("sim_ns") is not None), None)
     frames = []
     timeline = []
@@ -364,24 +436,26 @@ def analyze(args):
     native_payload = any(item.get("native_contact_payload") for item in coverage)
     ros_payload = bool(streams["contact_ros"])
     observed_contact_stream = native_payload or ros_payload
-    overshoots = excursions(timeline, "speed_error", args.overshoot_mps)
+    driving = [row for row in timeline if row["mode"] != "shutdown_brake"]
+    overshoots = excursions(driving, "speed_error", args.overshoot_mps)
     deviations = excursions(timeline, "cte", args.cte_event_m, absolute=True)
     anomalies = ([dict(kind="Overspeed", unit="m/s", **item) for item in overshoots] +
                  [dict(kind="Cross-track", unit="m", **item) for item in deviations])
     anomalies.sort(key=lambda item: item["start"])
-    paired_speeds = [r for r in timeline if r["speed_error"] is not None]
-    steering = [r["steering"] for r in timeline if r["steering"] is not None]
+    paired_speeds = [r for r in driving if r["speed_error"] is not None]
+    steering = [r["steering"] for r in driving if r["steering"] is not None]
     summary = dict(
         model=next((row["model"] for row in timeline if row["model"]), None),
         observed_seconds=end-start, clock_resets=clock_resets, invalid_json_rows=invalid_rows,
         clean_end=bool(streams["end"]), sample_basis=basis[0]["kind"],
         message_counts={name: len(rows) for name, rows in sorted(streams.items())},
-        distance_m=distance, speed_error_mps=metrics([r["speed_error"] for r in timeline]),
+        distance_m=distance, speed_error_mps=metrics([r["speed_error"] for r in paired_speeds]),
         cross_track_m=metrics([abs(r["cte"]) for r in timeline if r["cte"] is not None]),
         peak_actual_speed=metrics([r["vx"] for r in timeline])["max"],
         rollout_ms=metrics([r["roll_ms"] for r in timeline]),
-        cycle_ms=metrics([r["cycle_ms"] for r in timeline]),
-        command_interval_ms=metrics([(b["t"] - a["t"]) * 1000 for a, b in zip(commands, commands[1:])]),
+        cycle_ms=metrics([r["cycle_ms"] for r in driving]),
+        command_interval_ms=metrics([(b["t"] - a["t"]) * 1000 for a, b in zip(commands, commands[1:])
+                                     if b["t"] <= driving_end or len(driving) == len(timeline)]),
         overshoot=dict(threshold_mps=args.overshoot_mps, episodes=len(overshoots),
                        samples_braking=sum(r["speed_error"] >= args.overshoot_mps and
                                            r["accel"] is not None and r["accel"] < 0 for r in paired_speeds)),
@@ -405,6 +479,10 @@ def analyze(args):
             check_ms=metrics([r["clearance_ms"] for r in clearance_rows]),
             feasible_rollouts=metrics([r["clearance_feasible_count"] for r in clearance_rows]))
 
+    shutdown = shutdown_metrics(args.run / "shutdown.json", gt_frames, clock_resets)
+    if shutdown is not None:
+        summary["shutdown_brake"] = shutdown
+
     for event in contacts:
         at = lookup["gt"].nearest(event["t"], .25).get("data", {})
         event.update(vx=at.get("vx"), x=(at.get("xy") or [None, None])[0], y=(at.get("xy") or [None, None])[1])
@@ -424,8 +502,10 @@ def analyze(args):
                    gaps=intervals, reference=reference, trail=trail[::stride])
     encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).replace("<", "\\u003c")
     template = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
-    (args.run / "report.html").write_text(template.replace("/*__RUN_DATA__*/", encoded),
-                                         encoding="utf-8")
+    page = (template.replace("<!--__RUN_SUMMARY__-->", static_summary(summary))
+            .replace("<!--__RUN_LINKS__-->", report_links(args.run))
+            .replace("/*__RUN_DATA__*/", encoded))
+    (args.run / "report.html").write_text(page, encoding="utf-8")
     print(args.run / "report.html")
     print(f"{len(timeline)} timeline rows, {len(gt_frames)} ground-truth poses, "
           f"{len(pp_valid)} usable PP messages, "

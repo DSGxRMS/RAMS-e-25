@@ -120,6 +120,7 @@ class ROSInterface(Node):
         # We take POSITION/yaw from /slam/odom (PP's frame) but SPEED from GT.
         self.gt_speed = 0.0
         self.have_gt  = False
+        self.gt_motion_sample = None         # Stamped planar speed for shutdown confirmation.
 
         # --- P1: GT-speed staleness guard ---------------------------------
         # have_gt latches True forever, so if /ground_truth/odom dies the old
@@ -219,7 +220,11 @@ class ROSInterface(Node):
         # Ground-truth carries the REAL vehicle velocity in its twist.
         # Use FORWARD velocity (body x) only. hypot(vx,vy) would inflate the
         # reading when the car slides sideways, poisoning the planner.
-        self.gt_speed = float(msg.twist.twist.linear.x)
+        linear = msg.twist.twist.linear
+        self.gt_speed = float(linear.x)
+        stamp = msg.header.stamp
+        self.gt_motion_sample = (stamp.sec * 1_000_000_000 + stamp.nanosec,
+                                 math.hypot(linear.x, linear.y))
         self.have_gt = True
 
         # P1: refresh the freshness stamp; if this message ends a stale

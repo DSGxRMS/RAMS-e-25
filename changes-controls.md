@@ -6,6 +6,16 @@ The active controller is the mirror-symmetric Exp13 Stage 1 Neural ODE with MPPI
 
 ## Next objectives
 
+### Telson corner-speed preview · 26 November 2026
+
+The local Telson build uses a 6 m/s maximum. Enable `MPPI_CORNER_PREVIEW=1` alongside `MPPI_CORNER_BRAKING=1` to test sharp turns. For an A/B run keep braking enabled and toggle preview alone. In `src/controls/controls/mppi_controller.py`, the braking profile now accepts curvature above 0.3 per metre when the path tangent over a wheelbase supports the same bend. The preview takes the lowest speed ceiling within the distance travelled in one proportional speed-loop time constant (0.67 s). The steering cap remains 0.349 rad and the physical minimum turning radius is approximately 4.3 m. A requested radius below that still needs a feasible line. `src/controls/controls/run_session.py` records the switch, and `src/controls/test/test_corner_braking.py` covers both turn directions, the intervening apex, stopping, and the disabled baseline.
+
+On the longer Boa recording, the ceiling fell by over 0.25 m/s on 150 of 418 moving tracking samples. In the comp_2021 left-hairpin window it fell on all 55 samples by a median 1.50 m/s using the published planner path as a proxy for the controller buffer. These offline results measure speed ceilings. Verify cone contacts, gate time, actual entry speed and overslowing in matched GUI runs.
+
+Telson's separate 26 November Boa run recorded 16 native contact episodes involving 12 distinct cones. The first right-front-wheel hit occurred during tracking at 3.93 m/s against a 3.93 m/s raw target. His moving skidpad run recorded 34 episodes involving 21 cones, including repeated blue-side contacts at roughly 0.48 m cross-track error. Inspect the swept wheel and body clearance of both the reference and the chosen rollout at the first contact. The second skidpad recording stayed stationary with 825 one-point paths.
+
+**Current Telson baseline.** The 6.0 m/s Small Track run `20261125-203828-oelkohd_` completed a 20.71 s lap averaging 5.22 m/s. The later run `20261125-224833-u5hfpg30` verified CTRL-19 in Gazebo. The opt-in CTRL-20 corner braking change passed fixed-input replay and is ready for a matched GUI comparison. Then test slower and braking alternatives with the cone-clearance check before evaluating Shield-MPPI. The table below records the earlier shared-branch plan.
+
 | Order | Objective | What to build or test | Evidence to collect |
 | --- | --- | --- | --- |
 | 1 | **Check the whole car against cones** · CTRL-04 | Implemented as an opt-in Small Track experiment. The recorded geometry passed offline verification. Compare enabled and disabled runs in fresh GUI sessions. This is the geometric first step toward [Shield-MPPI](https://arxiv.org/abs/2302.11719). | Check clearance through the two return-gate scenarios, feasible candidate counts, false stops, physical braking and p95 solve overhead. |
@@ -18,6 +28,32 @@ The active controller is the mirror-symmetric Exp13 Stage 1 Neural ODE with MPPI
 | Later | **Test robustness and maintain diagnostics** · CTRL-05, 07, 10–12 | Use measured model error to decide whether [Robust MPPI](https://arxiv.org/abs/2102.09027) or [Tube-MPPI](https://arxiv.org/abs/2110.07744) adds value. Repair the legacy smoke test and topic diagnostic. Track active legacy callers before changing old buffer and tangent helpers. Keep full shutdown logs for any distinct exit traceback. | Compare under measured disturbances. Confirm the smoke test runs with the active interface and the diagnostic shows the actual pose and speed topics. |
 
 ## Implemented changes
+
+### CTRL-20 · Apply a lower corner-entry speed target immediately
+
+**Why.** In Boa Constrictor run `20261125-231353-me0ekac4`, the raw target fell from 5.99 to 2.88 m/s at 1.598 s after first motion. The issued target was still 5.53 m/s and the controller asked for +1.31 m/s². Its first braking request came 205 ms later. The planner path was available.
+
+**What changed.** With `MPPI_CORNER_BRAKING=1`, the controller applies the computed speed ceiling immediately when it falls. The target can rise by up to 3.0 m/s per simulation second, based on the existing acceleration limit. While speed exceeds the target, stored positive PI throttle cannot reduce the proportional braking request. The issued target still caps the rollout speed profile. The clearance check and PP recovery retain their existing interfaces. Use `MPPI_CORNER_BRAKING=0` for the original speed filter and PI behavior.
+
+**Files.** [mppi_controller.py](src/controls/controls/mppi_controller.py) applies the target and PI changes. [run_session.py](src/controls/controls/run_session.py) records the toggle. [test_corner_braking.py](src/controls/test/test_corner_braking.py) covers the target step, throttle integral, rebound and recovery cap.
+
+**Verification.** The opt-out replay reproduced the original recorded speed targets and acceleration commands exactly on both Boa runs and the Small Track shutdown run. With the new policy enabled, the worst Boa entrance sample changes from +1.31 to −2.66 m/s² on the same inputs. On the longer Boa recording, 13 cycles of positive acceleration more than 0.25 m/s above the raw target dropped to zero. Tracking requests at or below −2.99 m/s² rose from 3 to 16. The replay holds speed and raw targets fixed, so this counts requests under recorded inputs. Twenty-six targeted controls tests passed, and the rebuilt Exp13 checkpoint smoke test verified the issued and rollout targets. Verify actual corner-entry speed, time spent braking, steering, clearance and lap time in fresh matched GUI runs.
+
+### CTRL-19 · Brake before controller shutdown in EUFS
+
+**Why.** The last tracking command in the Telson Small Track run requested positive acceleration. After the command, the car traveled another 14.31 m in 2.69 simulation seconds and was still moving at 4.04 m/s at the end of recording.
+
+**What changed.** On normal Ctrl+C or SIGTERM, the controller keeps its ROS interface active, discards the next tracking command if a solve was in progress, and requests zero target speed and `-3.0 m/s²` while holding the last published steering angle. It confirms standstill from advancing ground-truth planar speed samples no faster than 0.05 m/s for 0.20 simulation seconds after the steering actuator delay. It reports an unconfirmed stop if the simulator resets, ROS closes, or the 60 s wall-time bound expires. The recorder stays active through braking and plotting.
+
+**Files.** [control_node.py](src/controls/controls/control_node.py) handles signals and brake commands. [shutdown_brake.py](src/controls/controls/shutdown_brake.py) verifies the stop with stamped planar feedback from [ros_connect.py](src/controls/controls/ros_connect.py). [run_session.py](src/controls/controls/run_session.py) keeps the recorder active and saves `shutdown.json`. [report.py](src/controls/controls/run_audit/report.py) and [dashboard.html](src/controls/controls/run_audit/dashboard.html) display standstill and recorded travel. [Regression tests](src/controls/test/test_shutdown_brake.py) cover standstill, feedback gaps, duplicates, pauses and resets.
+
+**Verification.** Twenty controls regression tests passed in Galactic WSL. In an isolated ROS domain, the installed Exp13 node drove the normal `ros2 run` entry point, received SIGINT after three tracking commands, published braking, and saved an HTML report and trajectory plot. Scripted GT fell from 2.00 m/s to rest and the report computed 1.06 s and 1.06 m from the first brake request to confirmation. Measure Gazebo brake onset and stopping distance in a GUI run with the same planner, seed and speed cap as the Telson baseline.
+
+**Gazebo verification.** Small Track run `20261125-224833-u5hfpg30` used Telson PP, Exp13 seed 42, a 6.0 m/s cap and clearance off. Shutdown began at 5.02 m/s on the left-side turn. Ground-truth speed had fallen by 0.10 m/s after 257 ms, reached zero after 1.85 simulation seconds, and standstill was confirmed at 2.03 s. Full-rate GT shows approximately 5.17 m of travel after the first brake request. The 30 shutdown commands requested −3.0 m/s², with no positive acceleration command during shutdown. Native cone contact coverage was unavailable. This verifies the normal stop in that run.
+
+### Run report can be read in script-blocking previews
+
+**Why.** A report could appear blank when opened through a preview that blocks scripts. The original file rendered in Chrome. **What changed.** [report.py](src/controls/controls/run_audit/report.py) now generates the key statistics and working export links as HTML. [dashboard.html](src/controls/controls/run_audit/dashboard.html) displays the summary until the interactive view has loaded. **Verification.** Chrome rendered six charts and the final shutdown frame from the regenerated run. With scripts disabled, it displayed a readable stop summary and export links.
 
 ### CTRL-04 · Check swept cone clearance in the Exp13 rollouts
 

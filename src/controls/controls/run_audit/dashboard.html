@@ -23,12 +23,19 @@ button{cursor:pointer}canvas{width:100%;display:block;background:#0a1523;border-
 .detail b{display:block;color:var(--mint);font-size:13px}.tables{margin-top:14px}.table-scroll{max-height:270px;overflow:auto}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}td,th{text-align:left;border-bottom:1px solid var(--line);padding:8px}
 th{color:var(--muted);font-size:13px}.links{margin:20px 0;display:flex;gap:12px;flex-wrap:wrap}a{color:#82ceff}
+#summary-content:empty ~ #replay-hint,#summary-content:not(:empty) ~ #template-hint{display:none}
 @media(max-width:850px){.layout{grid-template-columns:1fr}main{padding:14px}#map{height:420px}}
 </style>
 </head>
 <body>
 <main>
   <h1>MPPI run analysis</h1>
+  <section class="pane" id="static-run-summary" aria-label="Run summary">
+    <div id="summary-content"><!--__RUN_SUMMARY__--></div>
+    <p id="template-hint">This is the dashboard template. Open the generated <code>report.html</code> inside your run folder. Its path appears after <code>[run] Report</code> in the controller terminal.</p>
+    <p id="replay-hint">Open this file in a browser with JavaScript enabled to use replay and charts.</p>
+  </section>
+  <div id="interactive-report" hidden>
   <p id="intro"></p>
   <div class="cards" id="cards"></div>
   <section class="pane replay" aria-label="Replay controls">
@@ -53,11 +60,13 @@ th{color:var(--muted);font-size:13px}.links{margin:20px 0;display:flex;gap:12px;
   </div>
   <section class="pane tables"><h2>Largest overshoots and path departures</h2><p id="event-note"></p><div class="table-scroll" id="events"></div></section>
   <section class="pane tables"><h2>Capture coverage</h2><p id="coverage"></p></section>
-  <nav class="links" aria-label="Raw exports"><a href="timeline.csv">Cycle timeline CSV</a><a href="ground_truth.csv">Full-rate odometry CSV</a><a href="cone_contacts.csv">Contact CSV</a><a href="pp_dropouts.csv">Dropout CSV</a><a href="excursions.csv">Excursion CSV</a><a href="summary.json">Summary JSON</a><a href="events.jsonl">Raw event archive</a></nav>
+  </div>
+  <nav class="links" aria-label="Raw exports"><!--__RUN_LINKS__--></nav>
 </main>
 <script id="payload" type="application/json">/*__RUN_DATA__*/</script>
 <script>
 "use strict";
+if (document.getElementById("summary-content").childElementCount) {
 const run = JSON.parse(document.getElementById("payload").textContent);
 const {summary:s, timeline:rows, frames, trail, contacts, gaps, reference, anomalies} = run;
 const $ = id => document.getElementById(id);
@@ -81,7 +90,15 @@ const layerList = [
 ];
 const layers = Object.fromEntries(layerList.map(([key])=>[key,true]));
 let selected=0, timer=null;
-text("intro", [s.model ? s.model.toUpperCase() : "Unlabelled controller", format(s.observed_seconds,1)+" s of capture", rows.length+" "+s.sample_basis+" records", s.clean_end ? "Clean stop" : "Capture may be truncated"].join(" · "));
+const intro = [s.model ? s.model.toUpperCase() : "Unlabelled controller", format(s.observed_seconds,1)+" s of capture", rows.length+" "+s.sample_basis+" records", s.clean_end ? "Capture closed" : "Capture may be truncated"];
+if (s.shutdown_brake) {
+  const stop = s.shutdown_brake;
+  intro.push(stop.status === "confirmed" ? "Standstill confirmed" : "Standstill unconfirmed ("+stop.status+")");
+  if (stop.distance_to_confirmation_m != null) {
+    intro.push(format(stop.distance_to_confirmation_m)+" m to confirmation");
+  }
+}
+text("intro", intro.join(" · "));
 const cards = [["Distance",format(s.distance_m,1)+" m"],["Peak speed",format(s.peak_actual_speed)+" m/s"],
   ["Speed RMSE",format(s.speed_error_mps.rms)+" m/s"],["P95 |CTE|",format(s.cross_track_m.p95)+" m"],
   ["P95 rollout",format(s.rollout_ms.p95,0)+" ms"],["Usable PP",s.pp.valid_messages+"/"+s.pp.messages],
@@ -274,7 +291,16 @@ text("coverage",Object.entries(s.message_counts).map(([k,v])=>k+" "+v).join(" ·
   (s.clock_resets ? " · clock resets "+s.clock_resets+" (future pose matching disabled)" : ""));
 let resize;
 window.onresize=()=>{clearTimeout(resize);resize=setTimeout(()=>choose(selected),100);};
-choose(0);
+const interactive = $("interactive-report");
+interactive.hidden = false;
+try {
+  choose(0);
+} catch (error) {
+  interactive.hidden = true;
+  throw error;
+}
+$("static-run-summary").hidden = true;
+}
 </script>
 </body>
 </html>

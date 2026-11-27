@@ -283,11 +283,15 @@ class MPPIController:
         self.steering_actuator_enabled = steering_actuator_enabled(model_name)
         self.elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model_name == "exp13")
         self.cone_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+        self.corner_braking = steering_option("MPPI_CORNER_BRAKING", False)
+        self.corner_preview = steering_option("MPPI_CORNER_PREVIEW", False)
+        print(f"[MPPI] Corner speed preview={'on' if self.corner_preview else 'off'}", flush=True)
         if self.cone_clearance and (model_name != "exp13" or self.K_FF
                                     or os.environ.get("MPPI_FORCE_STEER0") == "1"):
             raise ValueError("MPPI_CONE_CLEARANCE requires the standard Exp13 steering output")
         print(f"[MPPI] EUFS steering actuator model={'on' if self.steering_actuator_enabled else 'off'}",
               flush=True)
+        print(f"[MPPI] Corner braking={'on' if self.corner_braking else 'off'}", flush=True)
         if model_name == "exp13":
             cp = ckpt_path or _find_ckpt("exp13_stage1_pretrained.pt")
             state = torch.load(str(cp), map_location="cpu", weights_only=True)
@@ -603,13 +607,24 @@ class MPPIController:
 
         # Feedforward steer from curvature (active only if K_FF > 0).
         # Clip at 0.3: tightest real corner ~R>3 m; unclipped noise spiked full lock.
-        kap = np.clip(kap, -0.3, 0.3)
-        ff_steer = np.arctan(self.L_WB_KIN * kap)
+        clipped_kap = np.clip(kap, -0.3, 0.3)
+        ff_steer = np.arctan(self.L_WB_KIN * clipped_kap)
+        speed_curvature = np.abs(clipped_kap)
+        if self.corner_preview:
+            # Accept curvature above the feedforward clip only when heading
+            # changes consistently over a wheelbase of the same path.
+            span = min(self.L_WB_KIN, s_np[-1])
+            start = np.clip(s_np - span / 2, 0.0, s_np[-1] - span)
+            tangent = np.unwrap(heading)
+            bend = (np.interp(start + span, s_np, tangent)
+                    - np.interp(start, s_np, tangent)) / span
+            supported = np.maximum(0.0, np.sign(kap) * bend)
+            speed_curvature = np.maximum(speed_curvature, np.minimum(np.abs(kap), supported))
 
         # Corner speed profile: lateral-accel limit per point, then a backward
         # braking pass (x2 iterations to converge) so the car slows BEFORE corners.
         vt = np.minimum(self.V_MAX,
-                        np.sqrt(self.A_LAT_MAX / np.maximum(np.abs(kap), 1e-3)))
+                        np.sqrt(self.A_LAT_MAX / np.maximum(speed_curvature, 1e-3)))
         for _ in range(2):
             for i in range(N - 2, -1, -1):
                 ds = max(s_np[i + 1] - s_np[i], 1e-3)
@@ -627,7 +642,7 @@ class MPPIController:
             "ff": torch.tensor(ff_steer, dtype=torch.float32, device=dev),
             "rx_np": rx, "ry_np": ry, "s_np": s_np,
             "xy_np": np.column_stack((rx, ry)),
-            "kap_np": np.asarray(kap, dtype=np.float64),
+            "kap_np": np.asarray(clipped_kap, dtype=np.float64),
             "vt_np":  np.asarray(vt,  dtype=np.float64),
         }
         self.cur = 0
@@ -636,6 +651,40 @@ class MPPIController:
     # =====================================================================
     #  compute — one MPPI planning step
     # =====================================================================
+    def _corner_speed(self, s_cur, speed, distance, profile):
+        current = float(np.interp(s_cur, distance, profile))
+        if not self.corner_preview or speed <= 0:
+            return current
+        # The unsaturated proportional speed loop has time constant
+        # 1 / (KP * ACCEL_MAX). Preview its travel during that response.
+        end = min(s_cur + speed / (self.KP * self.ACCEL_MAX), distance[-1])
+        interior = profile[np.searchsorted(distance, s_cur, side="right"):
+                           np.searchsorted(distance, end)]
+        ceiling = min(current, float(np.interp(end, distance, profile)))
+        return min(ceiling, float(interior.min())) if interior.size else ceiling
+
+    def _speed_target(self, ceiling, speed_cap, dt_ros):
+        if self.corner_braking:
+            # Respect a new lower ceiling now. Limit a rebound using simulation time.
+            self._vr_lp = min(ceiling, self._vr_lp + self.ACCEL_MAX * dt_ros)
+        else:
+            blend = 0.15 if ceiling < self._vr_lp else 0.6
+            self._vr_lp += blend * (ceiling - self._vr_lp)
+        if speed_cap is not None:
+            self._vr_lp = min(self._vr_lp, float(speed_cap))
+        return float(self._vr_lp)
+
+    def _longitudinal_effort(self, err, dt_ros):
+        proportional = self.KP * err
+        raw = proportional + self.KI * self.I_spd
+        if self.corner_braking and err < 0.0:
+            # Cruise throttle accumulated on the straight must not weaken braking.
+            raw = min(raw, proportional)
+        saturated = (raw >= 1.0 and err > 0.0) or (raw <= -1.0 and err < 0.0)
+        if not saturated and abs(err) < self.I_BAND:
+            self.I_spd = float(np.clip(self.I_spd + err * dt_ros, -self.I_CLAMP, self.I_CLAMP))
+        return float(np.clip(raw, -1.0, 1.0))
+
     def compute(self, x, y, yaw, speed, dt_ros, one_sided=True, speed_cap=None,
                 steering_prediction=None, steering_state_s=None, clearance_cones=None):
         """Returns (steer, accel, info). `one_sided` = only one cone colour
@@ -736,7 +785,7 @@ class MPPIController:
         # CTE reduction (slow when off-line) on top of the corner profile.
         scale    = float(np.clip(1.0 - self.K_CT * min(ct_abs / self.CT0, 1.0), 0.0, 1.0))
         vt_np    = pd.get("vt_np")
-        v_corner = float(np.interp(s_cur, pd["s_np"], vt_np))
+        v_corner = self._corner_speed(s_cur, _speed, pd["s_np"], vt_np)
         vr_uncapped = v_corner * scale
         v_brake_cap = math.sqrt(2.0 * self.BRAKE_A * max(path_ahead, 0.0))
         vr_raw = min(vr_uncapped, v_path_cap, v_brake_cap)
@@ -760,15 +809,7 @@ class MPPIController:
             vr_raw = 0.0
         vr_raw = float(np.clip(vr_raw, 0.0, self.V_MAX))
 
-        # Rate-limit: slow to slow down (kills stop-start stutter), quick up.
-        if vr_raw < self._vr_lp:
-            self._vr_lp += 0.15 * (vr_raw - self._vr_lp)
-        else:
-            self._vr_lp += 0.6 * (vr_raw - self._vr_lp)
-        if speed_cap is not None:
-            # Apply the bridge ceiling to the filtered target as well as its input.
-            self._vr_lp = min(self._vr_lp, float(speed_cap))
-        vr_eff = float(self._vr_lp)
+        vr_eff = self._speed_target(vr_raw, speed_cap, dt_ros)
 
         # ---- arc-length reference horizon (marches at the planning speed) ----
         pace_m = max(vr_eff, 0.5) * self.DT_EFF
@@ -929,14 +970,7 @@ class MPPIController:
             self.nom = torch.cat([self.nom[:, 1:], self.nom[:, -1:]], dim=1)
 
         # ---- PI longitudinal with anti-windup ----
-        err  = vr_eff - _speed
-        raw  = self.KP * err + self.KI * self.I_spd
-        lon0 = float(np.clip(raw, -1.0, 1.0))
-        # Integrate only when unsaturated AND near the setpoint; integrating
-        # through transients wound up a bias that resisted braking into corners.
-        saturated = (raw >= 1.0 and err > 0.0) or (raw <= -1.0 and err < 0.0)
-        if (not saturated) and abs(err) < self.I_BAND:
-            self.I_spd = float(np.clip(self.I_spd + err * dt_ros, -self.I_CLAMP, self.I_CLAMP))
+        lon0 = self._longitudinal_effort(vr_eff - _speed, dt_ros)
         accel_out = lon0 * self.ACCEL_MAX
         if blocked:
             self.reset_steering_plan()

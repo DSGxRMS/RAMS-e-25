@@ -11,6 +11,7 @@ import threading
 import time
 
 from controls.random_seed import sampling_seed
+from controls.shutdown_brake import TIMEOUT_S as SHUTDOWN_BRAKE_TIMEOUT_S
 from controls.steering_actuator import steering_actuator_enabled, steering_option
 
 
@@ -21,11 +22,10 @@ def default_runs_root():
     return Path.home() / "rams_runs"
 
 
-def stop(process, interrupt=True):
+def stop(process, interrupt_timeout=20):
     if process is None or process.poll() is not None:
         return
-    signals = [(signal.SIGINT, 20)] if interrupt else []
-    signals += [(signal.SIGTERM, 5), (signal.SIGKILL, 3)]
+    signals = [(signal.SIGINT, interrupt_timeout), (signal.SIGTERM, 5), (signal.SIGKILL, 3)]
     for sig, timeout in signals:
         try:
             os.killpg(process.pid, sig)
@@ -73,6 +73,8 @@ def main():
         align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
         elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
         check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+        corner_braking = steering_option("MPPI_CORNER_BRAKING", False)
+        corner_preview = steering_option("MPPI_CORNER_PREVIEW", False)
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 2
@@ -86,6 +88,7 @@ def main():
     run = Path(tempfile.mkdtemp(prefix=stamp + "-", dir=runs))
     audit = Path(__file__).parent / "run_audit"
     env.update(MPPI_AUDIT="1", MPPI_CSV=str(run / "mppi.csv"),
+               MPPI_SHUTDOWN_JSON=str(run / "shutdown.json"),
                MPPI_TRAJECTORY_PNG=str(run / "trajectory.png"), PYTHONUNBUFFERED="1")
     # Keep ROS's own process logs with the captured topics and stdout.
     env["ROS_LOG_DIR"] = str(run / "ros")
@@ -96,6 +99,8 @@ def main():
         "mppi_steering_sync": align_steering,
         "mppi_elapsed_warm_start": elapsed_warm_start,
         "mppi_cone_clearance": check_clearance,
+        "mppi_corner_braking": corner_braking,
+        "mppi_corner_preview": corner_preview,
         "mppi_worker_python": env.get("MPPI_WORKER_PYTHON"),
         "started": datetime.datetime.now().astimezone().isoformat(),
         "controller_args": sys.argv[1:],
@@ -140,7 +145,7 @@ def main():
                 elif not stopping.is_set():
                     print(f"[run] Recorder failed to start. See {run / 'recorder.log'}", flush=True)
             finally:
-                stop(controller)
+                stop(controller, interrupt_timeout=SHUTDOWN_BRAKE_TIMEOUT_S + 15)
                 if output is not None:
                     output.join(timeout=5)
                 stop(recorder)

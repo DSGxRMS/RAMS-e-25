@@ -17,7 +17,10 @@ Run:  ros2 run controls control_node
 """
 import json
 import os
+import signal
+import sys
 from contextlib import ExitStack
+from pathlib import Path as FilePath
 import rclpy
 from rclpy.time import Time
 import threading, time, math
@@ -32,6 +35,7 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
 from controls.mppi_worker import MPPIWorker
+from controls.shutdown_brake import brake_to_stop
 from controls.steering_actuator import (
     SteeringActuator, steering_actuator_enabled, steering_option, steering_state_time,
     wheel_at_or_before,
@@ -78,7 +82,7 @@ if VIZ:
 
 def main():
     with ExitStack() as resources:
-        _run(resources)
+        return _run(resources)
 
 
 def _run(resources):
@@ -114,14 +118,27 @@ def _run(resources):
     executor_thread.start()
     resources.callback(shutdown)
 
+    stop_requested = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    # Let Ctrl+C finish the current solve while ROS stays up for braking and feedback.
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.signal(signum, request_stop)
+        resources.callback(signal.signal, signum, previous)
+
     # ---- wait for first odometry ----
     print("Waiting for first odometry message...", flush=True)
-    while True:
+    while rclpy.ok() and not stop_requested:
         cx, cy, yaw, speed, have_odom = node.get_state()
         if have_odom:
             print("First position received.", flush=True)
             break
         time.sleep(0.1)
+    if stop_requested or not rclpy.ok():
+        return 0
 
     worker_python = os.environ.get("MPPI_WORKER_PYTHON")
     if worker_python:
@@ -170,8 +187,14 @@ def _run(resources):
         msg.data = json.dumps(row, separators=(",", ":"), allow_nan=False)
         audit_pub.publish(msg)
 
+    last_published_steering = None
+
     def publish_command(steering, speed, acceleration, *, solved=False):
+        nonlocal last_published_steering
+        if stop_requested:
+            raise KeyboardInterrupt
         published = node.send_command(steering=steering, speed=speed, accel=acceleration)
+        last_published_steering = steering
         if model_actuator:
             decision = current_ros_time.nanoseconds
             if published < decision:
@@ -243,8 +266,9 @@ def _run(resources):
     if VIZ:
         plt.ion()
 
+    shutdown_ok = True
     try:
-      while rclpy.ok():
+      while rclpy.ok() and not stop_requested:
         # ---- sim-clock dt ----
         current_ros_time = node.get_clock().now()
         dt_nano = (current_ros_time - last_ros_time).nanoseconds
@@ -485,8 +509,34 @@ def _run(resources):
         # executor thread, so the loop needs no spin here. (~1 ms yield keeps CPU sane.)
         time.sleep(0.001)
     except KeyboardInterrupt:
-        print("\n[control_node] stopped by user.", flush=True)
+        stop_requested = True
     finally:
+        if last_published_steering is not None:
+            print("[control_node] Shutdown braking requested.", flush=True)
+            brake_accel = -mppi.ACCEL_MAX
+
+            def publish_brake():
+                nonlocal current_ros_time, command_publish_sim_ns, cycle_begin
+                nonlocal cx, cy, yaw, speed, pose_stamp, new_path, path_source
+                current_ros_time = node.get_clock().now()
+                cycle_begin = time.perf_counter()
+                command_publish_sim_ns = node.send_command(last_published_steering, 0.0, brake_accel)
+                cx, cy, yaw, speed, _, pose_stamp = node.get_state(stamped=True)
+                new_path, path_source = (), "none"
+                _audit_command("shutdown_brake", last_published_steering, 0.0, brake_accel)
+                return command_publish_sim_ns
+
+            try:
+                result = brake_to_stop(lambda: node.get_clock().now().nanoseconds,
+                                       lambda: node.gt_motion_sample, publish_brake,
+                                       rclpy.ok, SteeringActuator.DELAY_S)
+                shutdown_ok = result["status"] == "confirmed"
+                print(f"[control_node] Shutdown braking {result['status']}.", flush=True)
+                if record := os.environ.get("MPPI_SHUTDOWN_JSON"):
+                    FilePath(record).write_text(json.dumps(result, allow_nan=False) + "\n", encoding="utf-8")
+            except Exception as exc:
+                shutdown_ok = False
+                print(f"[control_node] Shutdown braking could not be verified: {exc}", flush=True)
         print("[control_node] generating trajectory plot...", flush=True)
         try:
             _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts,
@@ -494,6 +544,7 @@ def _run(resources):
                              pseudo_events, rec_ff, rec_mppi, off_pts=pseudo_pts)
         except Exception as e:
             print(f"[plot] failed: {e}", flush=True)
+    return 0 if shutdown_ok else 1
 
 
 def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
@@ -575,4 +626,4 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
