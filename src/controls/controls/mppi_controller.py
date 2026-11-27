@@ -283,8 +283,8 @@ class MPPIController:
         self.steering_actuator_enabled = steering_actuator_enabled(model_name)
         self.elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model_name == "exp13")
         self.cone_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
-        self.corner_braking = steering_option("MPPI_CORNER_BRAKING", False)
-        self.corner_preview = steering_option("MPPI_CORNER_PREVIEW", False)
+        self.corner_braking = steering_option("MPPI_CORNER_BRAKING", model_name == "exp13")
+        self.corner_preview = steering_option("MPPI_CORNER_PREVIEW", model_name == "exp13")
         print(f"[MPPI] Corner speed preview={'on' if self.corner_preview else 'off'}", flush=True)
         if self.cone_clearance and (model_name != "exp13" or self.K_FF
                                     or os.environ.get("MPPI_FORCE_STEER0") == "1"):

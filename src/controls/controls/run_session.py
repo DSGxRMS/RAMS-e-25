@@ -73,8 +73,8 @@ def main():
         align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
         elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
         check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
-        corner_braking = steering_option("MPPI_CORNER_BRAKING", False)
-        corner_preview = steering_option("MPPI_CORNER_PREVIEW", False)
+        corner_braking = steering_option("MPPI_CORNER_BRAKING", model == "exp13")
+        corner_preview = steering_option("MPPI_CORNER_PREVIEW", model == "exp13")
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 2
@@ -82,6 +82,8 @@ def main():
     env["MPPI_STEERING_ACTUATOR"] = "1" if model_actuator else "0"
     env["MPPI_STEERING_SYNC"] = "1" if align_steering else "0"
     env["MPPI_ELAPSED_WARM_START"] = "1" if elapsed_warm_start else "0"
+    env["MPPI_CORNER_BRAKING"] = "1" if corner_braking else "0"
+    env["MPPI_CORNER_PREVIEW"] = "1" if corner_preview else "0"
     stamp = datetime.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     runs = Path(env.get("MPPI_RUNS_DIR", str(default_runs_root()))).expanduser().resolve()
     runs.mkdir(parents=True, exist_ok=True)
