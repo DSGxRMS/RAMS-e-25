@@ -17,6 +17,10 @@ Run:  ros2 run controls control_node
 """
 import json
 import os
+import signal
+import sys
+from contextlib import ExitStack
+from pathlib import Path as FilePath
 import rclpy
 from rclpy.time import Time
 import threading, time, math
@@ -30,7 +34,8 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
 
 from controls.ros_connect import ROSInterface
 from controls.control_utils import compute_signed_curvature
-from controls.mppi_controller import MPPIController
+from controls.mppi_worker import MPPIWorker
+from controls.shutdown_brake import brake_to_stop
 from controls.steering_actuator import (
     SteeringActuator, steering_actuator_enabled, steering_option, steering_state_time,
     wheel_at_or_before,
@@ -60,15 +65,8 @@ VIZ_UPDATE_HZ = 20
 # DON'T hard-brake — hold the last steer command and coast down gently.
 COAST_DECEL_FRAC = 0.4       # fraction of ACCEL_MAX applied as gentle decel while waiting
 
-# ONE-SIDED cone evidence: one colour must outnumber the other by this ratio
-# (and have >=2 cones) to count as "only one wall visible". FS convention:
-# blue = LEFT edge, yellow = RIGHT edge. Feeds both the pseudo-path trigger
-# and MPPI's bad-path guard.
-RECOVER_RATIO = 3.0
-
-# Recovery uses a separately fitted reference and a crawl speed cap.
-BRIDGE_SPEED_MPS = 1.5
-BRIDGE_RELEASE_MPS2 = 0.75    # raise the speed ceiling in simulation time
+# Cone imbalance contributes to the MPPI heading guard.
+CONE_IMBALANCE_RATIO = 3.0
 
 if VIZ:
     import matplotlib.pyplot as plt
@@ -76,10 +74,17 @@ if VIZ:
 
 
 def main():
+    with ExitStack() as resources:
+        return _run(resources)
+
+
+def _run(resources):
     model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
     align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
+    check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
     rclpy.init()
-    node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator)
+    node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator,
+                        clearance_feedback=check_clearance)
 
     # CRITICAL: Sync with Simulator Clock
     node.set_parameters([
@@ -88,6 +93,14 @@ def main():
 
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
+
+    def shutdown():
+        executor.shutdown(timeout_sec=2.0)
+        executor_thread.join(timeout=2.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
     def spin():
         try:
             executor.spin()
@@ -96,29 +109,48 @@ def main():
 
     executor_thread = threading.Thread(target=spin, daemon=True)
     executor_thread.start()
+    resources.callback(shutdown)
+
+    stop_requested = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    # Let Ctrl+C finish the current solve while ROS stays up for braking and feedback.
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.signal(signum, request_stop)
+        resources.callback(signal.signal, signum, previous)
 
     # ---- wait for first odometry ----
     print("Waiting for first odometry message...", flush=True)
-    while True:
+    while rclpy.ok() and not stop_requested:
         cx, cy, yaw, speed, have_odom = node.get_state()
         if have_odom:
             print("First position received.", flush=True)
             break
         time.sleep(0.1)
+    if stop_requested or not rclpy.ok():
+        return 0
 
-    # ---- initialise MPPI ----
-    mppi = MPPIController()
+    worker_python = os.environ.get("MPPI_WORKER_PYTHON")
+    if worker_python:
+        mppi = resources.enter_context(MPPIWorker(worker_python))
+    else:
+        from controls.mppi_controller import MPPIController
+
+        mppi = MPPIController()
+
     steering_actuator = SteeringActuator()
 
-    # ---- live debug publishers (for controls/debug/pseudo_debug.py) ----
-    pseudo_pub = node.create_publisher(PathMsg, "/debug/pseudo_path", 10)
+    # ---- live controller diagnostics ----
     buffer_pub = node.create_publisher(PathMsg, "/debug/buffer_path", 10)
     rollout_pub = node.create_publisher(MarkerArray, "/debug/rollouts", 10)
     audit_pub = (node.create_publisher(String, "/debug/mppi_cycle", 10)
                  if mppi.audit_enabled else None)
 
     def _audit_command(mode, steering, target, acceleration, info=None, **details):
-        """Record the command issued this cycle, including fallback branches."""
+        """Record the command issued this cycle, including stop commands."""
         if audit_pub is None:
             return
         info = info or {}
@@ -147,8 +179,14 @@ def main():
         msg.data = json.dumps(row, separators=(",", ":"), allow_nan=False)
         audit_pub.publish(msg)
 
+    last_published_steering = None
+
     def publish_command(steering, speed, acceleration, *, solved=False):
+        nonlocal last_published_steering
+        if stop_requested:
+            raise KeyboardInterrupt
         published = node.send_command(steering=steering, speed=speed, accel=acceleration)
+        last_published_steering = steering
         if model_actuator:
             decision = current_ros_time.nanoseconds
             if published < decision:
@@ -208,20 +246,15 @@ def main():
     rec_neff, rec_tgt_spd, rec_act_spd = [], [], []   # MPPI diversity + speed tracking
     rec_ff, rec_mppi = [], []                         # steer breakdown: FF part vs MPPI part
     rec_path_pts = []         # snapshots of (route_x, route_y) every N cycles
-    pseudo_pts = []           # (x, y) car positions where a pseudo feed fired (exit plot)
     rec_ctr = 0
-    pseudo_events = 0         # how many times the pseudo centreline extended the buffer
-    rejected_planner = None
-    prefer_recovery = False
-    last_reject_print = 0.0   # throttle for the [PSEUDO] no-fit diagnostic
-    bridge_cap = None
-    bridge_was_fresh = False
+    last_frame_warning = 0.0
 
     if VIZ:
         plt.ion()
 
+    shutdown_ok = True
     try:
-      while rclpy.ok():
+      while rclpy.ok() and not stop_requested:
         # ---- sim-clock dt ----
         current_ros_time = node.get_clock().now()
         dt_nano = (current_ros_time - last_ros_time).nanoseconds
@@ -232,10 +265,6 @@ def main():
             steering_actuator.reset()
             node.reset_steering_samples()
             mppi.reset_steering_plan()
-            bridge_cap = None
-            bridge_was_fresh = False
-            rejected_planner = None
-            prefer_recovery = False
             node.invalidate_buffer()
             mppi.update_path(())
         if dt < 0.001:
@@ -243,8 +272,6 @@ def main():
             continue
 
         cycle_begin = time.perf_counter()
-        pseudo_added = 0
-        pseudo_reject = None
 
         # ---- get path and state ----
         new_path = ()
@@ -253,127 +280,70 @@ def main():
 
         # ---- P16: frame-split guard ----
         # The cone map lives in the SLAM-corrected frame; we plan in the GT
-        # frame. When snap-back splits them (~5 m measured), every cone, the
-        # buffer and any bridge are displaced garbage -> hold a safe stop and
-        # drop the poisoned buffer until the frames re-converge.
+        # frame. If the frames diverge, drop the reference and brake.
         if not node.frame_ok():
             node.invalidate_buffer()
             mppi.update_path(())
-            rejected_planner = None
-            prefer_recovery = False
-            bridge_cap = BRIDGE_SPEED_MPS
-            bridge_was_fresh = True
             command_publish_sim_ns = publish_command(last_steer, 0.0,
                                                       -COAST_DECEL_FRAC * mppi.ACCEL_MAX)
             _audit_command("frame_split", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
                            frame_split_m=node.frame_split_distance())
             now_s = time.perf_counter()
-            if now_s - last_reject_print > 2.0:
-                last_reject_print = now_s
+            if now_s - last_frame_warning > 2.0:
+                last_frame_warning = now_s
                 print(f"[FRAME] SLAM map split from GT pose by "
                       f"{node.frame_split_distance():.1f} m (snap-back?) "
                       f"-> buffer dropped, holding stop", flush=True)
             time.sleep(0.05)
             continue
 
-        # ---- cone evidence for controls recovery ----
+        # ---- cone evidence for the heading guard ----
         nb, ny = node.get_local_cone_counts()
-        one_sided = ((nb >= 2 and (ny == 0 or nb >= RECOVER_RATIO * ny)) or
-                     (ny >= 2 and (nb == 0 or ny >= RECOVER_RATIO * nb)) or
+        one_sided = ((nb >= 2 and (ny == 0 or nb >= CONE_IMBALANCE_RATIO * ny)) or
+                     (ny >= 2 and (nb == 0 or ny >= CONE_IMBALANCE_RATIO * nb)) or
                      (nb == 0 and ny == 0))
 
         now = current_ros_time.nanoseconds * 1e-9
-        pose = (cx, cy, yaw)
-        planner_path = node.reference.planner_path(now, pose)
-        planner_available = bool(planner_path)
-        can_track = bool(planner_path) and (not one_sided or planner_path != rejected_planner)
-        if can_track and not prefer_recovery:
-            new_path, path_source = planner_path, "planner"
-        else:
-            new_path = node.reference.recovery_path(now, pose)
-            if new_path:
-                path_source = "recovery"
-        if not new_path:
-            allow_both_walls = not one_sided
-            pseudo = node.pseudo_wall_path(allow_both_walls=allow_both_walls)
-            if node.reference.accept_recovery(pseudo, now):
-                new_path = node.reference.recovery_path(now, pose)
-                pseudo_added = len(new_path)
-            if new_path:
-                path_source = "recovery"
-                pseudo_events += 1
-                pseudo_pts.append((cx, cy))
-                pseudo_pub.publish(_to_path_msg(new_path))
-                wall = "blue" if nb > ny else "yellow"
-                mode = "UNLOCK" if allow_both_walls else "one-sided"
-                print(f"[PSEUDO] feed #{pseudo_events}: {wall} wall ({mode}), "
-                      f"+{len(pseudo)} pts, nb={nb} ny={ny} (speed cap 1.5)",
-                      flush=True)
-            else:
-                pseudo_reject = node.last_pseudo_reject if not pseudo else "too little recovery path ahead"
-                now_s = time.perf_counter()
-                if now_s - last_reject_print > 2.0:
-                    last_reject_print = now_s
-                    print(f"[PSEUDO] no fit: {pseudo_reject}", flush=True)
-
-        if not new_path and can_track:
-            new_path, path_source = planner_path, "planner"
-        prefer_recovery = False
-        if new_path:
-            buffer_pub.publish(_to_path_msg(new_path))
+        new_path = node.reference.planner_path(now, (cx, cy, yaw))
         mppi.update_path(new_path)
-
-        if new_path:
-            fresh = path_source == "recovery"
-            one_sided_for_compute = one_sided
-            if fresh:
-                bridge_cap = BRIDGE_SPEED_MPS
-            elif bridge_cap is not None and not bridge_was_fresh:
-                bridge_cap += BRIDGE_RELEASE_MPS2 * dt
-                if bridge_cap >= mppi.V_MAX:
-                    bridge_cap = None
-            # Hold the crawl cap on the first cycle after the bridge expires.
-            bridge_was_fresh = fresh
-            steering_prediction = None
-            steering_origin = now
-            wheel_feedback = None
-            if model_actuator:
-                if align_steering:
-                    steering_origin = steering_state_time(now, pose_stamp)
-                    wheel_feedback = wheel_at_or_before(node.steering_samples(), steering_origin)
-                else:
-                    wheel_feedback = node.applied_steering
-                steering_prediction = steering_actuator.prediction(
-                    steering_origin, wheel_feedback, mppi.DT_EFF, mppi.T_MAX,
-                    decision_s=now)
-            steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
-                                                  one_sided=one_sided_for_compute,
-                                                  speed_cap=bridge_cap,
-                                                  steering_prediction=steering_prediction,
-                                                  steering_state_s=steering_origin)
-            last_path_bad  = bool(info.get("path_bad", False))
-            if path_source == "planner":
-                rejected_planner = planner_path if last_path_bad else None
-                prefer_recovery = last_path_bad
-            if last_path_bad:
-                # A zero speed target alone leaves Gazebo coasting in acceleration mode.
-                accel_cmd = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
-                if fresh:
-                    node.reference.recovery = None
-            tt = info.get("top_trajs")
-            if tt:
-                _publish_rollouts(tt)
-        else:
-            # PP dropout with nothing to fit (no lone wall either): hold last
-            # steer and coast down gently (senior's spec). MPPI's own guards
-            # (vr caps, STOP_PATH_M) handle every partial-path case.
-            command_publish_sim_ns = publish_command(last_steer, 0.0,
-                                                      -COAST_DECEL_FRAC * mppi.ACCEL_MAX)
-            _audit_command("no_path", last_steer, 0.0, -COAST_DECEL_FRAC * mppi.ACCEL_MAX,
-                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
-                           pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
+        if not new_path:
+            # Wait for PP with a zero speed target and explicit deceleration.
+            decel = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
+            command_publish_sim_ns = publish_command(last_steer, 0.0, decel)
+            _audit_command("no_path", last_steer, 0.0, decel,
+                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=False)
             time.sleep(0.05)
             continue
+
+        path_source = "planner"
+        buffer_pub.publish(_to_path_msg(new_path))
+        steering_prediction = None
+        steering_origin = now
+        wheel_feedback = None
+        if model_actuator:
+            if align_steering:
+                steering_origin = steering_state_time(now, pose_stamp)
+                wheel_feedback = wheel_at_or_before(node.steering_samples(), steering_origin)
+            else:
+                wheel_feedback = node.applied_steering
+            steering_prediction = steering_actuator.prediction(
+                steering_origin, wheel_feedback, mppi.DT_EFF, mppi.T_MAX,
+                decision_s=now)
+        steer, accel_cmd, info = mppi.compute(cx, cy, yaw, speed, dt,
+                                              one_sided=one_sided,
+                                              steering_prediction=steering_prediction,
+                                              steering_state_s=steering_origin,
+                                              clearance_cones=node.clearance_cones(steering_origin)
+                                              if check_clearance else None)
+        last_path_bad = bool(info.get("path_bad", False))
+        if last_path_bad:
+            # A zero speed target alone leaves Gazebo coasting in acceleration mode.
+            accel_cmd = -COAST_DECEL_FRAC * mppi.ACCEL_MAX
+        if info.get("clearance_blocked"):
+            steer = last_steer
+        tt = info.get("top_trajs")
+        if tt:
+            _publish_rollouts(tt)
 
         path_points = np.array(new_path)
         route_x, route_y = path_points[:, 0], path_points[:, 1]
@@ -434,20 +404,19 @@ def main():
         command_publish_sim_ns = publish_command(steer, target_speed, accel_cmd,
                                                   solved=not last_path_bad)
         if audit_pub is not None:
-            if last_path_bad:
+            if info.get("clearance_blocked"):
+                audit_mode = "clearance_brake"
+            elif last_path_bad:
                 audit_mode = "path_rejected"
             elif info.get("path_exhausted"):
                 audit_mode = "path_exhausted"
-            elif fresh:
-                audit_mode = "pseudo_bridge"
             else:
                 audit_mode = "tracking"
             _audit_command(audit_mode, steer, target_speed, accel_cmd, info,
-                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=planner_available,
-                           bridge_fresh=fresh, one_sided_for_compute=one_sided_for_compute,
+                           blue_in_fov=nb, yellow_in_fov=ny, planner_available=True,
+                           one_sided_for_compute=one_sided,
                            steering_state_sim_s=steering_origin if model_actuator else None,
-                           wheel_feedback_stamp_sim_s=(wheel_feedback[0] if wheel_feedback else None),
-                           pseudo_added=pseudo_added, pseudo_reject=pseudo_reject)
+                           wheel_feedback_stamp_sim_s=(wheel_feedback[0] if wheel_feedback else None))
 
         # No artificial sleep here: the MPPI rollout already takes ~110 ms, so this loop
         # runs as fast as the compute allows. The old 50 ms sleep dropped the control rate
@@ -456,25 +425,47 @@ def main():
         # executor thread, so the loop needs no spin here. (~1 ms yield keeps CPU sane.)
         time.sleep(0.001)
     except KeyboardInterrupt:
-        print("\n[control_node] stopped by user.", flush=True)
+        stop_requested = True
     finally:
+        if last_published_steering is not None:
+            print("[control_node] Shutdown braking requested.", flush=True)
+            brake_accel = -mppi.ACCEL_MAX
+
+            def publish_brake():
+                nonlocal current_ros_time, command_publish_sim_ns, cycle_begin
+                nonlocal cx, cy, yaw, speed, pose_stamp, new_path, path_source
+                current_ros_time = node.get_clock().now()
+                cycle_begin = time.perf_counter()
+                command_publish_sim_ns = node.send_command(last_published_steering, 0.0, brake_accel)
+                cx, cy, yaw, speed, _, pose_stamp = node.get_state(stamped=True)
+                new_path, path_source = (), "none"
+                _audit_command("shutdown_brake", last_published_steering, 0.0, brake_accel)
+                return command_publish_sim_ns
+
+            try:
+                result = brake_to_stop(lambda: node.get_clock().now().nanoseconds,
+                                       lambda: node.gt_motion_sample, publish_brake,
+                                       rclpy.ok, SteeringActuator.DELAY_S)
+                shutdown_ok = result["status"] == "confirmed"
+                print(f"[control_node] Shutdown braking {result['status']}.", flush=True)
+                if record := os.environ.get("MPPI_SHUTDOWN_JSON"):
+                    FilePath(record).write_text(json.dumps(result, allow_nan=False) + "\n", encoding="utf-8")
+            except Exception as exc:
+                shutdown_ok = False
+                print(f"[control_node] Shutdown braking could not be verified: {exc}", flush=True)
         print("[control_node] generating trajectory plot...", flush=True)
         try:
             _plot_trajectory(rec_cx, rec_cy, rec_yaw, rec_steer, rec_cte, rec_path_pts,
                              rec_neff, rec_tgt_spd, rec_act_spd, mppi.K,
-                             pseudo_events, rec_ff, rec_mppi, off_pts=pseudo_pts)
+                             ff=rec_ff, mppi=rec_mppi)
         except Exception as e:
             print(f"[plot] failed: {e}", flush=True)
-        executor.shutdown(timeout_sec=2.0)
-        executor_thread.join(timeout=2.0)
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+    return 0 if shutdown_ok else 1
 
 
 def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
                      neff=None, tgt_spd=None, act_spd=None, K=1024,
-                     pseudo_events=0, ff=None, mppi=None, off_pts=None):
+                     ff=None, mppi=None):
     """Save GT car trajectory vs the PP path snapshots + diagnostics on exit.
     Uses the Agg backend so it ALWAYS saves to a PNG (never blocks/crashes on
     a second Ctrl+C). Saved to the D drive so it's visible from Windows."""
@@ -495,16 +486,11 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
         ax.plot(px, py, '-', color='lightblue', lw=0.6, alpha=0.5)
     if path_snaps:
         ax.plot([], [], '-', color='lightblue', label='PP path snapshots')
-    if off_pts:
-        ax.scatter([p[0] for p in off_pts], [p[1] for p in off_pts],
-                   c='red', s=8, zorder=4, label='pseudo-path feed positions')
     sc = ax.scatter(cx, cy, c=np.arange(len(cx)), cmap='viridis', s=10, zorder=3)
     ax.plot(cx, cy, '-', color='gray', lw=0.5, alpha=0.5)
     ax.scatter([cx[0]], [cy[0]], c='lime', s=140, marker='o', edgecolor='k', zorder=5, label='start')
     ax.scatter([cx[-1]], [cy[-1]], c='red', s=140, marker='X', edgecolor='k', zorder=5, label='end')
-    ax.set_title(f'Car trajectory (GT) vs PP path\n'
-                 f'pseudo-path feeds: {pseudo_events}',
-                 fontsize=11)
+    ax.set_title('Car trajectory (GT) vs PP path', fontsize=11)
     ax.set_xlabel('E (m)'); ax.set_ylabel('N (m)')
     ax.axis('equal'); ax.grid(alpha=0.3); ax.legend(fontsize=8)
     fig.colorbar(sc, ax=ax, label='time step', shrink=0.5)
@@ -551,4 +537,4 @@ def _plot_trajectory(cx, cy, yaw, steer, cte, path_snaps,
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

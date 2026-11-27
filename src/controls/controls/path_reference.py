@@ -5,7 +5,6 @@ import numpy as np
 
 
 PLANNER_MAX_AGE = 0.5
-RECOVERY_MAX_AGE = 1.5
 
 
 def ordered_points(points, minimum):
@@ -45,14 +44,13 @@ def project_reference(x, y, yaw, points, arc, previous_s=None, forward_window=No
 
 
 class OrderedReference:
-    """Keep one planner message and one independently generated recovery path."""
+    """Keep the latest usable planner message in its published order."""
 
     def __init__(self):
         self.clear()
 
     def clear(self):
         self.planner = None
-        self.recovery = None
 
     def accept_planner(self, points, frame, stamp, minimum):
         if frame != "map":
@@ -60,13 +58,6 @@ class OrderedReference:
         path = ordered_points(points, minimum)
         if path and (self.planner is None or stamp >= self.planner[0]):
             self.planner = (stamp, path)
-
-    def accept_recovery(self, points, stamp):
-        path = ordered_points(points, 2)
-        if not path:
-            return False
-        self.recovery = (stamp, path)
-        return True
 
     @staticmethod
     def _select(reference, now, max_age, pose, min_ahead):
@@ -80,6 +71,3 @@ class OrderedReference:
 
     def planner_path(self, now, pose):
         return self._select(self.planner, now, PLANNER_MAX_AGE, pose, min_ahead=3.0)
-
-    def recovery_path(self, now, pose):
-        return self._select(self.recovery, now, RECOVERY_MAX_AGE, pose, min_ahead=3.0)
