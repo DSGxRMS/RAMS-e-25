@@ -13,10 +13,12 @@ Why a separate planner
     The skidpad layout is fixed by the rules (FS Rules 2026, D4 / DV skidpad):
       * two circles, centres 18.25 m apart
       * inner circle diameter 15.25 m (R 7.625 m), track 3 m wide -> outer R 10.625 m
-      * driving line = middle of the track, R = 9.125 m, both circles tangent to the
-        entry/exit line at the crossing point (the timing line)
+      * middle of the track R = 9.125 m, both circles tangent to the entry/exit line at the
+        crossing point (the timing line)
       * procedure: enter, 2 laps of the RIGHT circle (clockwise), 2 laps of the LEFT circle
-        (counter-clockwise), leave along the exit lane
+        (counter-clockwise), leave along the exit lane and come to a full stop in the stop area
+        (max 5 m long, ending at a row of orange cones across the exit lane; FS Driverless
+        Specification 2026, Figure 3 / FS Rules D 4.2.5)
     Cone-by-cone planning (Delaunay/PCD) has to rediscover this every tick and is ambiguous
     at the crossing, where both circles overlap. Here only three numbers are unknown: where
     the layout sits in the map and how it is rotated (x, y, yaw). They are fitted to every
@@ -47,19 +49,29 @@ How it works (every tick)
        [s - 1 m, s + 6 m], so the five passes through the crossing are never confused.
     7. Output: car pose, then the reference from the car's projection for
        `skidpad.horizon_m` (20 m) at 0.5 m spacing, transformed into "map".
-    /pp/mode (JSON): mode SKIDPAD, phase, lap, fit RMS, cones used, locked, s, pose
-    uncertainty, angular coverage, colour convention, and which lock checks are still failing.
-    /pp/debug_markers: the fitted circles (ns "edges") for the bird view / RViz.
-
-Parameters (defaults = FS rules)
-    skidpad.path_radius_m 9.125, skidpad.inner_radius_m 7.625, skidpad.outer_radius_m 10.625,
-    skidpad.centre_distance_m 18.25, skidpad.lane_half_width_m 1.5, skidpad.laps_per_side 2,
-    skidpad.first_side "right", skidpad.start_to_centre_m 15.0, skidpad.entry_length_m 30,
-    skidpad.exit_length_m 25, skidpad.horizon_m 20, skidpad.lock_min_cones 12,
-    skidpad.lock_rms_m 0.25, skidpad.lock_min_per_circle 4, skidpad.lock_min_arc_deg 60,
-    skidpad.lock_sigma_xy_m 0.05, skidpad.lock_sigma_deg 0.3, skidpad.lock_stable_fits 3,
-    skidpad.colour_mode auto (normal / swapped / off), skidpad.colour_penalty_m 0.6,
-    skidpad.gate_half_width_m 1.78
+    8. Driving line (`skidpad.line`): "inner" (default) drives each circle at radius
+       inner_radius + inner_clearance = 8.625 m instead of the middle 9.125 m: when grip limits
+       the speed, a lap takes 2*pi*sqrt(R / a_lat), so the smaller radius is ~2.7% faster per lap.
+       1.0 m = car half width ~0.75 m + cone ~0.11 m + the scatter of real cone positions (the EUFS
+       skidpad's inner cones sit at R 7.49-7.74 m, not exactly 7.625). The lateral offset is
+       blended with a cosine over `skidpad.blend_length_m` (8 m) around the crossing (entry ->
+       right, right -> left, left -> exit). "centre" = the old middle line.
+    8b. Drift compensation (`skidpad.drift_comp`, on): the controller settles outside a
+       constant-radius path (0.46 m in the first skidpad run, enough to touch the outer cones).
+       On each circle the car's radial offset from the line is averaged and the published circle is
+       moved inward by an integrated amount (at most `drift_comp_max_m` 0.5 m, and never closer
+       than `min_plan_clearance_m` 0.5 m to the inner cone centres), so the car itself ends up on
+       the planned radius. Faded out around the crossings. /pp/mode: drift_m, comp_m per circle.
+    9. Stop: the car has to come to rest in the stop area (last 5 m before the row of orange cones
+       across the exit lane; the row is found in the cone map: orange, > 8 m after the crossing,
+       inside the lane; else `skidpad.stop_end_m` 25 m). The target is the middle of the area.
+       The controller only slows for a path that runs out (speed <= sqrt(2 * 2.5 * path_ahead)),
+       drops a planner path with < 3 m ahead and then coasts at 1.2 m/s^2. So on the exit the
+       published path is SHORTENED along a braking profile (`skidpad.stop_decel` 0.8 m/s^2) down to
+       the ~2.8 m/s the controller holds while it has a path, and the path ends `skidpad.overrun_m`
+       (3.2 m) before the target, the distance the car then rolls (calibrated on the 27 Nov Gazebo
+       run: the controller model reproduces its stop at 24.0 m within 0.3 m). /pp/mode reports stop_end_m, stop_target_m, stopped_at_m and
+       stopped_in_area; phase becomes "stopped".
 """
 from __future__ import annotations
 
@@ -99,7 +111,26 @@ class SkidpadConfig:
     first_side: str = "right"           # which circle is driven first
     start_to_centre: float = 15.0       # car's first pose -> crossing point [m]
     entry_length: float = 30.0
-    exit_length: float = 25.0
+    exit_length: float = 40.0           # reference length after the crossing (the path is cut at the stop point)
+    line: str = "inner"                 # "inner": drive close to the inner cones (smaller radius, faster) | "centre"
+    inner_clearance: float = 1.0        # [m] inner cone centre -> car centre on the "inner" line (car half width ~0.75 + cone ~0.11 + cone placement +-0.12)
+    blend_length: float = 8.0           # [m] cosine blend of the lateral offset around each crossing / turn-in
+    stop_end: float = 25.0              # [m] after the crossing: end of the stop area if its end cones are not seen
+    stop_target_back: float = 2.5       # [m] aim to stop this far before the end cones (middle of the 5 m area)
+    stop_decel: float = 0.8             # [m/s^2] braking profile the published path length asks the controller for
+    overrun: float = 4.0                # [m] (3.2 stopped at 19.3 m in Gazebo, target 18.5 m) the car rolls this far past the end of the published path: the
+                                        # controller keeps >= ~2.8 m/s while it has a path (its cap sqrt(5 * path_ahead)
+                                        # with path_ahead > 1.5 m), drops a path with < 3 m ahead, then coasts at 1.2 m/s^2
+    ctrl_min_ahead: float = 3.0         # [m] controller drops a planner path with less than this ahead (path_reference.py)
+    stop_area_length: float = 5.0       # [m] stop area = last 5 m before the end cones (FS DV skidpad, max 5 m)
+    drift_comp: bool = True             # shift the circle line inward by the car's measured outward drift
+    drift_comp_max: float = 0.7         # [m] at most this much (Gazebo run 27 Nov: car 0.8-1.0 m outside the line)
+    min_plan_clearance: float = 0.3     # [m] the shifted line never comes closer than this to inner cone centres
+    drift_gain: float = 0.03            # EMA weight per tick of the radial drift estimate
+    exit_blend_shift: float = 4.0       # [m] the last circle -> exit blend is centred this far AFTER the crossing
+    cone_aware: bool = True             # line radius from the mapped inner cones (real cones scatter +-0.12 m)
+    drift_target_margin: float = 0.15   # [m] compensate towards line radius + this (the integral overshoots inward;
+                                        # Gazebo 27 Nov: car at R 8.46 m touched an inner cone placed at R 7.49 m)
     horizon: float = 20.0
     step: float = 0.5
     merge_radius: float = 0.5
@@ -156,6 +187,14 @@ class SkidpadPlanner:
         self.prior = None
         self.consistent = False
         self.n_disagree = 0
+        self.stop_end = c.stop_end           # [m after the crossing] end of the stop area (end cones)
+        self.stop_end_seen = False
+        self.stopped_at = None               # [m after the crossing] where the car came to rest
+        self.speed = 0.0
+        self._last = None                    # (x, y, t) for the speed estimate
+        self._still = 0.0
+        self.drift = [0.0, 0.0]              # [m] car's mean outward offset from the line, per circle (EMA)
+        self.comp = [0.0, 0.0]               # [m] inward shift applied, per circle
 
     # ---------------------------------------------------------------- reference
     def _build_reference(self):
@@ -177,11 +216,59 @@ class SkidpadPlanner:
         x = np.arange(0.0, c.exit_length + ds, ds)
         parts.append(np.c_[x, np.zeros_like(x)]); names.append("exit")
         ref = np.vstack(parts)
+        starts, i = [], 0
+        for p in parts:
+            starts.append(i); i += len(p)
+        if c.line == "inner":
+            ref = self._inner_line(ref, starts, names)
         s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(ref, axis=0), axis=1))]
-        bounds, i = [], 0
-        for p, n in zip(parts, names):
-            bounds.append((s[i], n)); i += len(p)
+        bounds = [(s[i0], n) for i0, n in zip(starts, names)]
         return ref, s, bounds
+
+    def _inner_line(self, ref, starts, names):
+        """Shift the centre line towards the inner cones: on a circle the car drives at radius
+        inner_radius + inner_clearance instead of the track middle (lap time ~ sqrt(R) when grip
+        limits the speed). The signed lateral offset (+ = left of the driving direction) is
+        -d on the clockwise (right) circle and +d on the counter-clockwise (left) circle,
+        d = path_radius - (inner_radius + inner_clearance); it changes with a cosine blend of
+        blend_length centred on the crossing: entry 0 -> -d, right -> left -d -> +d, left -> exit
+        +d -> 0 (for first_side "left" the signs swap)."""
+        c = self.cfg
+        d = c.path_radius - (c.inner_radius + c.inner_clearance)
+        if d <= 0:
+            return ref
+        seg = np.linalg.norm(np.diff(ref, axis=0), axis=1)
+        s = np.r_[0.0, np.cumsum(seg)]
+        # offset value on each part
+        val = []
+        for n in names:
+            if n in ("entry", "exit"):
+                val.append(0.0)
+            else:
+                val.append(-d if n.startswith("right") else d)
+        e = np.zeros(len(ref))
+        for k, i0 in enumerate(starts):
+            i1 = starts[k + 1] if k + 1 < len(starts) else len(ref)
+            e[i0:i1] = val[k]
+        # blends at every change of value (at the crossing, where both values meet)
+        L = c.blend_length
+        for k in range(1, len(starts)):
+            a, b = val[k - 1], val[k]
+            if a == b:
+                continue
+            s0 = s[starts[k]]
+            if names[k] == "exit":
+                # leaving the last circle the car drifts outward (to its right): keep the line on the
+                # circle's side through the crossing and straighten it only after (Gazebo 27 Nov: the
+                # right gate cone at the crossing was touched twice on the exit)
+                s0 = s0 + c.exit_blend_shift
+            m = np.abs(s - s0) < L / 2
+            w = 0.5 * (1 - np.cos(np.pi * (s[m] - (s0 - L / 2)) / L))
+            e[m] = a + (b - a) * w
+        T = np.gradient(ref, axis=0)
+        T /= np.maximum(np.linalg.norm(T, axis=1)[:, None], 1e-9)
+        N = np.c_[-T[:, 1], T[:, 0]]
+        return ref + e[:, None] * N
 
     def phase(self, s):
         name = self.phase_bounds[0][1]
@@ -418,6 +505,58 @@ class SkidpadPlanner:
                 self.pose = np.r_[(1 - a) * self.pose[:2] + a * res.x[:2], th]
                 self.rms, self.n_used = 0.8 * self.rms + 0.2 * rms, n_in
 
+    # ---------------------------------------------------------------- stop area
+    def update_stop_end(self):
+        """End of the stop area = the row of orange cones across the exit lane (EUFS: 21 m after
+        the crossing; FS figure: up to 25 m + a stop area of max 5 m). Cones counted: orange,
+        more than 8 m after the crossing, inside the lane (|lateral| < lane half width - 0.4 m)."""
+        if self.pose is None or not (self.locked or self.consistent) or not len(self.mem):
+            return
+        orn = self.mem_kind == 1
+        if not orn.any():
+            return
+        q = self.to_layout(self.mem[orn])
+        m = (q[:, 0] > 8.0) & (q[:, 0] < self.cfg.exit_length) & (np.abs(q[:, 1]) < self.cfg.lane_half_width - 0.4)
+        if m.any():
+            self.stop_end = float(np.median(q[m, 0]))
+            self.stop_end_seen = True
+
+    def s_target(self):
+        """arc length where the car should come to rest (middle of the stop area)"""
+        return self.phase_bounds[-1][0] + max(self.stop_end - self.cfg.stop_target_back, 1.0)
+
+    def s_stop(self):
+        """arc length where the published path ends: overrun before the target"""
+        return self.s_target() - self.cfg.overrun
+
+    def brake_length(self):
+        """Published path length on the exit that makes the controller follow a braking profile.
+        The controller caps its speed at sqrt(2 * 2.5 * path_ahead), path_ahead = length minus its
+        look-ahead (min(4 m, half the length)). Wanted speed at distance d to the target:
+        v(d) = sqrt(v_end^2 + 2 * stop_decel * (d - overrun)), v_end = 2.8 m/s (the lowest speed the
+        controller holds on a path), so the car reaches the end of the path at about that speed.
+        Inverting the cap: length = 4 + v^2/5 (v^2/5 >= 4) else 0.4 v^2."""
+        c = self.cfg
+        d = self.s_target() - self.s
+        v2 = 2.8 ** 2 + 2 * c.stop_decel * max(d - c.overrun, 0.0)
+        L = 4.0 + v2 / 5.0 if v2 / 5.0 >= 4.0 else 0.4 * v2
+        return max(L, c.ctrl_min_ahead + 0.05)
+
+    def track_speed(self, car_xy, t):
+        if self._last is not None:
+            dt = t - self._last[2]
+            if dt >= 0.2:
+                self.speed = math.hypot(car_xy[0] - self._last[0], car_xy[1] - self._last[1]) / dt
+                self._last = (car_xy[0], car_xy[1], t)
+                if self.phase(self.s) == "exit" and self.speed < 0.15:
+                    self._still += dt
+                    if self._still >= 1.0 and self.stopped_at is None:
+                        self.stopped_at = float(self.to_layout(np.asarray(car_xy, float)[None])[0][0])
+                else:
+                    self._still = 0.0
+        else:
+            self._last = (car_xy[0], car_xy[1], t)
+
     # ---------------------------------------------------------------- path
     def to_map(self, Q):
         tx, ty, th = self.pose
@@ -447,17 +586,97 @@ class SkidpadPlanner:
         hi = max(hi, lo + 2)
         i = lo + int(np.argmin(np.linalg.norm(self.ref[lo:hi] - q, axis=1)))
         self.s = max(self.s, float(self.ref_s[i]))
-        u = np.arange(self.s + self.cfg.step, min(self.s + self.cfg.horizon, self.ref_s[-1]) + 1e-9, self.cfg.step)
+        self.update_stop_end()
+        s_end = min(self.s_stop(), self.ref_s[-1])
+        if self.s >= self.phase_bounds[-1][0] - 2.0:             # exit: path length = braking profile
+            s_end = min(s_end, self.s + self.brake_length())
+        u = np.arange(self.s + self.cfg.step, min(self.s + self.cfg.horizon, s_end) + 1e-9, self.cfg.step)
+        if len(u) and s_end - u[-1] > 1e-6 and s_end <= self.s + self.cfg.horizon:
+            u = np.r_[u, s_end]                            # end exactly at the stop point
         if len(u) == 0:
             return np.zeros((0, 2))
         Q = np.c_[np.interp(u, self.ref_s, self.ref[:, 0]), np.interp(u, self.ref_s, self.ref[:, 1])]
+        if self.cfg.drift_comp or self.cfg.cone_aware:
+            Q = self._compensate(q, u, Q)
         return self.to_map(Q)
 
+    def _circle_of(self, name):
+        """index of the circle a phase name drives (0 = first, 1 = second), or None"""
+        if name in ("entry", "exit"):
+            return None
+        first = self.cfg.first_side
+        return 0 if name.startswith(first) else 1
+
+    def _inner_cones(self, k):
+        """(angle, radius) about circle k's centre of the mapped cones on its inner boundary"""
+        if self.pose is None or not len(self.mem):
+            return np.zeros(0), np.zeros(0)
+        P = self.to_layout(self.mem[self.mem_kind != 1])
+        v = P - self.centres[k]
+        r = np.linalg.norm(v, axis=1)
+        m = np.abs(r - self.cfg.inner_radius) < 0.45
+        return np.arctan2(v[m, 1], v[m, 0]), r[m]
+
+    def _line_radius(self, k, theta, R_line, ang, rad):
+        """wanted radius at angle theta: the nominal line, raised where a mapped inner cone within
+        +-15 deg sits further out than inner_radius (keeps inner_clearance to the REAL cones)"""
+        if not len(rad):
+            return R_line
+        dth = np.abs((ang - theta + np.pi) % (2 * np.pi) - np.pi)
+        near = dth < np.radians(15)
+        if not near.any():
+            return R_line
+        return max(R_line, float(rad[near].max()) + self.cfg.inner_clearance)
+
+    def _compensate(self, q, u, Q):
+        """1. Cone-aware radius: on each circle the line keeps inner_clearance to the mapped inner cones
+        (the EUFS skidpad's inner cones sit at R 7.49-7.74 m, not exactly 7.625 m).
+        2. Drift compensation: the controller settles outside a constant-radius path (0.8-1.0 m in the
+        27 Nov Gazebo runs). Measure the car's radial offset from that line on each circle (EMA) and
+        publish the circle shifted inward by an integrated amount, so the CAR ends up on the line.
+        Bounded by drift_comp_max and by min_plan_clearance to the inner cone centres. Both are faded
+        out near the crossings so entry, change-over and exit stay as planned."""
+        c = self.cfg
+        R_line = c.inner_radius + c.inner_clearance if c.line == "inner" else c.path_radius
+        k = self._circle_of(self.phase(self.s))
+        crossings = np.array([b[0] for b in self.phase_bounds[1:]])
+        cones = {kk: self._inner_cones(kk) if c.cone_aware else (np.zeros(0), np.zeros(0)) for kk in (0, 1)}
+        if c.drift_comp and k is not None:
+            if self.comp[k] == 0.0 and self.comp[1 - k] > 0.0:
+                self.comp[k] = self.comp[1 - k]       # same controller, same drift: start from the other circle's shift
+            if np.min(np.abs(crossings - self.s)) > 1.5 * c.blend_length:
+                v = q - self.centres[k]
+                R_here = self._line_radius(k, math.atan2(v[1], v[0]), R_line, *cones[k])
+                err = float(np.linalg.norm(v) - R_here - c.drift_target_margin)   # + = car outside
+                if abs(err) < 2.0:
+                    self.drift[k] += c.drift_gain * (err - self.drift[k])
+                    cap = min(c.drift_comp_max, max(R_line - c.inner_radius - c.min_plan_clearance, 0.0))
+                    # integral action: the shift grows while the car is still outside the line
+                    self.comp[k] = float(np.clip(self.comp[k] + 0.02 * self.drift[k], 0.0, cap))
+        out = Q.copy()
+        for j, sj in enumerate(u):
+            kj = self._circle_of(self.phase(sj))
+            if kj is None:
+                continue
+            # fade: none within 0.75 blend of a crossing, full beyond 1.5 blend (the car needs time to move out)
+            w = float(np.clip((np.min(np.abs(crossings - sj)) - 0.75 * c.blend_length) / (0.75 * c.blend_length), 0.0, 1.0))
+            if w <= 0:
+                continue
+            v = Q[j] - self.centres[kj]
+            r = max(np.linalg.norm(v), 1e-9)
+            R_here = self._line_radius(kj, math.atan2(v[1], v[0]), R_line, *cones[kj])
+            comp = self.comp[kj] if c.drift_comp else 0.0
+            out[j] = self.centres[kj] + v / r * (r + w * ((R_here - R_line) - comp))
+        return out
+
     def info(self):
-        lap = {"entry": 0, "exit": 2 * self.cfg.laps_per_side + 1}
         ph = self.phase(self.s) if self.s is not None else "entry"
         names = [n for _, n in self.phase_bounds]
-        return dict(mode="SKIDPAD", phase=ph, lap=names.index(ph) if ph in names else 0,
+        if ph == "exit" and self.stopped_at is not None:
+            ph_out = "stopped"
+        else:
+            ph_out = ph
+        return dict(mode="SKIDPAD", phase=ph_out, lap=names.index(ph) if ph in names else 0,
                     locked=bool(self.locked), layout=("locked" if self.locked else
                                                       "provisional" if self.consistent else "none (straight ahead)"), fit_rms_m=round(float(self.rms), 3) if np.isfinite(self.rms) else None,
                     cones_used=int(self.n_used), cones_in_memory=int(len(self.mem)),
@@ -467,6 +686,15 @@ class SkidpadPlanner:
                     sigma_yaw_deg=round(self.sigma[1], 3) if np.isfinite(self.sigma[1]) else None,
                     arc_deg=[round(a) for a in self.arcs],
                     colour={1: "normal", -1: "swapped", 0: "unused"}[self.colour_conv],
+                    line=self.cfg.line, line_radius_m=round(self.cfg.inner_radius + self.cfg.inner_clearance
+                                                            if self.cfg.line == "inner" else self.cfg.path_radius, 3),
+                    stop_end_m=round(self.stop_end, 2), stop_end_seen=bool(self.stop_end_seen),
+                    stop_target_m=round(self.stop_end - self.cfg.stop_target_back, 2),
+                    speed_mps=round(float(self.speed), 2),
+                    drift_m=[round(float(d), 3) for d in self.drift], comp_m=[round(float(v), 3) for v in self.comp],
+                    stopped_at_m=None if self.stopped_at is None else round(self.stopped_at, 2),
+                    stopped_in_area=None if self.stopped_at is None else bool(
+                        self.stop_end - self.cfg.stop_area_length <= self.stopped_at <= self.stop_end),
                     reason="" if self.locked else ("fitting the layout"
                                                    + ("" if self.consistent else " (fit does not match the car's pose yet)")
                                                    + ("; waiting for: " + ", ".join(k for k, v in self.lock_checks.items() if not v)
@@ -507,7 +735,14 @@ class SkidpadNode(Node):
                      ("lock_min_per_circle", d.lock_min_per_circle), ("lock_min_arc_deg", d.lock_min_arc_deg),
                      ("lock_sigma_xy_m", d.lock_sigma_xy), ("lock_sigma_deg", d.lock_sigma_deg),
                      ("lock_stable_fits", d.lock_stable_fits), ("colour_mode", d.colour_mode),
-                     ("colour_penalty_m", d.colour_penalty)):
+                     ("colour_penalty_m", d.colour_penalty), ("line", d.line),
+                     ("inner_clearance_m", d.inner_clearance), ("blend_length_m", d.blend_length),
+                     ("stop_end_m", d.stop_end), ("stop_target_back_m", d.stop_target_back),
+                     ("stop_decel", d.stop_decel), ("ctrl_min_ahead_m", d.ctrl_min_ahead),
+                     ("overrun_m", d.overrun),
+                     ("stop_area_length_m", d.stop_area_length), ("drift_comp", d.drift_comp),
+                     ("drift_comp_max_m", d.drift_comp_max), ("min_plan_clearance_m", d.min_plan_clearance),
+                     ("cone_aware", d.cone_aware), ("exit_blend_shift_m", d.exit_blend_shift)):
             dp("skidpad." + k, v)
         dp("skidpad.use_unknown", True)
         dp("debug.publish", True)
@@ -526,7 +761,15 @@ class SkidpadNode(Node):
             lock_sigma_xy=float(g("skidpad.lock_sigma_xy_m")), lock_sigma_deg=float(g("skidpad.lock_sigma_deg")),
             lock_stable_fits=int(g("skidpad.lock_stable_fits")),
             colour_mode=str(g("skidpad.colour_mode")).strip().lower(),
-            colour_penalty=float(g("skidpad.colour_penalty_m")))
+            colour_penalty=float(g("skidpad.colour_penalty_m")),
+            line=str(g("skidpad.line")).strip().lower(), inner_clearance=float(g("skidpad.inner_clearance_m")),
+            blend_length=float(g("skidpad.blend_length_m")), stop_end=float(g("skidpad.stop_end_m")),
+            stop_target_back=float(g("skidpad.stop_target_back_m")), stop_decel=float(g("skidpad.stop_decel")),
+            ctrl_min_ahead=float(g("skidpad.ctrl_min_ahead_m")), overrun=float(g("skidpad.overrun_m")),
+            stop_area_length=float(g("skidpad.stop_area_length_m")),
+            drift_comp=bool(g("skidpad.drift_comp")), drift_comp_max=float(g("skidpad.drift_comp_max_m")),
+            min_plan_clearance=float(g("skidpad.min_plan_clearance_m")),
+            cone_aware=bool(g("skidpad.cone_aware")), exit_blend_shift=float(g("skidpad.exit_blend_shift_m")))
         self.use_unknown = bool(g("skidpad.use_unknown"))
         self.planner = SkidpadPlanner(self.cfg)
         qos = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=int(g("qos.depth")),
@@ -551,7 +794,10 @@ class SkidpadNode(Node):
         self.get_logger().info(
             f"skidpad planner: R path {self.cfg.path_radius} m, circles {self.cfg.centre_distance} m apart, "
             f"{self.cfg.laps_per_side} laps per side, {self.cfg.first_side} first, "
-            f"crossing assumed {self.cfg.start_to_centre} m ahead of the start pose")
+            f"crossing assumed {self.cfg.start_to_centre} m ahead of the start pose; line {self.cfg.line}"
+            + (f" (R {self.cfg.inner_radius + self.cfg.inner_clearance:.3f} m)" if self.cfg.line == "inner" else "")
+            + f"; stop target {self.cfg.stop_target_back} m before the stop-area end cones, braking {self.cfg.stop_decel} m/s^2")
+        self._said = set()
 
     def cb_odom(self, m):
         p = m.pose.pose
@@ -576,6 +822,18 @@ class SkidpadNode(Node):
             return
         self.planner.add_cones(**new)
         path = self.planner.plan(car[:2], car[2])
+        self.planner.track_speed(car[:2], self.get_clock().now().nanoseconds * 1e-9)
+        pl = self.planner
+        if pl.stop_end_seen and "end" not in self._said:
+            self._said.add("end")
+            self.get_logger().info(f"skidpad: stop-area end cones at {pl.stop_end:.2f} m after the crossing; "
+                                   f"stop target {pl.stop_end - self.cfg.stop_target_back:.2f} m")
+        if pl.stopped_at is not None and "stop" not in self._said:
+            self._said.add("stop")
+            lo = pl.stop_end - self.cfg.stop_area_length
+            ok = lo <= pl.stopped_at <= pl.stop_end
+            self.get_logger().info(f"skidpad: stopped at {pl.stopped_at:.2f} m after the crossing "
+                                   f"(stop area {lo:.1f}-{pl.stop_end:.1f} m): {'INSIDE' if ok else 'OUTSIDE'} the stop area")
         self._publish(car, path)
         self.n_tick += 1
         if self.dbg and self.n_tick % 2 == 0:

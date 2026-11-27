@@ -1,8 +1,8 @@
 # Path planning changes and next objectives
 
-Branch `tel_soum_integration` · Ground-truth EUFS Small Track, comp_2021, garden_light and skidpad · Updated 26 November 2026
+Branch `tel_soum_integration` · Ground-truth EUFS Small Track, comp_2021, garden_light and skidpad · Updated 28 November 2026
 
-The branch has three planners, all publishing the same `/path_points` message, so the controller needs no change. **`pp_tls`** (v1) is the team planner `pp_node_skidpad` with **Predictive Corridor Delaunay (PCD)** tried first on every tick. **`pp_tels_new`** (v2, `stack_tels_new.launch.py`) adds route memory, hairpin-tip following, a curvature-limited line and the orange-gate fix; on Small Track (run `20261125-233516`) every message was a full PCD path, with no path jump over 1 m and no contact, lap 20.6 s at the 6 m/s cap (v1: 20.3 s at 6.5 m/s). **`pp_skidpad_tels`** (`stack_skidpad.launch.py`) fits the rule skidpad layout to the cones and publishes the exact figure of eight; its first Gazebo run locked the layout rotated, which is fixed and now locks only when the fit is well determined (re-test pending). `pp_node_skidpad` itself is unchanged and still launched by `stack.launch.py`. The bird view shows a steering-direction indicator. The hairpin failures on comp_2021 and garden_light are mainly controller limits (20° steering cap, corner speed, a 0.45–0.5 m steady offset on constant-radius turns), handed to controls with the racing-line study.
+The branch has three planners, all publishing the same `/path_points` message, so the controller needs no change. **`pp_tls`** (v1) is the team planner `pp_node_skidpad` with **Predictive Corridor Delaunay (PCD)** tried first on every tick. **`pp_tels_new`** (v2, `stack_tels_new.launch.py`) adds route memory, hairpin-tip following, a curvature-limited line and the orange-gate fix; on Small Track (run `20261125-233516`) every message was a full PCD path, with no path jump over 1 m and no contact, lap 20.6 s at the 6 m/s cap (v1: 20.3 s at 6.5 m/s). **`pp_skidpad_tels`** (`stack_skidpad.launch.py`) fits the rule skidpad layout to the cones and drives the figure of eight on an inner line (1.0 m from the mapped inner cones, compensated for the controller's outward drift), then brakes on the exit and stops in the stop area; last Gazebo runs (27 Nov): no or 2 cone contacts, stop 18.7–19.3 m after the crossing (stop area 16–21 m), timed laps 12.1–12.5 s / 12.9–13.1 s. `pp_node_skidpad` itself is unchanged and still launched by `stack.launch.py`. The bird view shows a steering-direction indicator. The hairpin failures on comp_2021 and garden_light are mainly controller limits (20° steering cap, corner speed, a 0.45–0.5 m steady offset on constant-radius turns), handed to controls with the racing-line study.
 
 ## How the planner works
 
@@ -22,6 +22,7 @@ The team Delaunay planner connects blue and yellow cones it can currently see. I
 | [pp_node_skidpad.py](src/pathplanning/pathplanning/pp_node_skidpad.py) | Team planner. Not edited. Its NORMAL/FALLBACK/big-orange logic is copied into `pp_tls` and used as the fallback. |
 | [setup.py](src/pathplanning/setup.py) | Entry point `pp_tls = pathplanning.pp_tls:main`. |
 | [stack_tls.launch.py](bringup/launch/stack_tls.launch.py) | `stack.launch.py` with `pp_tls` (node name `pp_tls`) in place of `pp_node_skidpad`. Same parameters, including `topics.odom_in: /slam/odom_raw`. |
+| [birdview_skidpad.py](tools/birdview_skidpad.py) | The bird view plus a skidpad scoreboard: time of each circle in both tries, current lap, cones hit (Gazebo contacts) and the estimated result. |
 | [birdview.py](tools/birdview.py) | Read-only bird's-eye viewer. Draws cones, car trail, `/path_points`, the controller's tracked path and rollouts, and the PCD internals from `/pp/debug_markers` and `/pp/mode`. A steering gauge shows commanded and applied front-wheel angle against the 20° controller cap and 29.8° EUFS lock; the car is drawn with its front wheels turned and the arc it would drive at the commanded steering. |
 
 Dependencies: `rclpy`, `nav_msgs`, `geometry_msgs`, `eufs_msgs`, `std_msgs`, `visualization_msgs` (optional, debug topics are skipped without it), NumPy, SciPy (`Delaunay`, `cKDTree`, `splprep`), Matplotlib (optional live plot).
@@ -94,6 +95,7 @@ All `pp_node_skidpad` parameters are kept. New parameters:
 rams_abh && MPLBACKEND=Agg ros2 launch bringup stack_tls.launch.py   # PCD planner v1
 rams_abh && MPLBACKEND=Agg ros2 launch bringup stack_tels_new.launch.py   # PCD planner v2 (pp_tels_new)
 rams_abh && ros2 launch bringup stack_skidpad.launch.py              # skidpad map only (pp_skidpad_tels)
+rams_abh && python3 tools/birdview_skidpad.py                        # skidpad viewer with circle times and cones hit
 rams_abh && MPLBACKEND=Agg ros2 launch bringup stack.launch.py       # team planner
 rams_abh && python3 tools/birdview.py                                # viewer
 ```
@@ -110,13 +112,81 @@ rams_abh && python3 tools/birdview.py                                # viewer
 | 4 | **Short and invalid messages** · PP-04 | Fixed in v2 and confirmed in Gazebo on Small Track (`20261125-233516`: 730/730 full PCD paths, no jump > 1 m). Still to do: log `/pp/mode` in the run recorder. | Jumps > 1 m of the 4 m look-ahead point, short messages with mode and reason. |
 | 4a | **Verify v2 in Gazebo** | Small Track done (no regression, see the v2 entry). Still to run: comp_2021 and boa_constrictor with `stack_tels_new.launch.py`, same controller build as v1. Watch `route` and `tight_for_20deg` in `/pp/mode`. | Lap time, cross-track to the true centreline, contacts, `/pp/mode` states, hold/switch counts. |
 | 4b | **Planning when the car is off the corridor** | comp_2021 replay and garden_light run (`20261125-234324`): once the car left the corridor, PCD found no path and the team logic aimed at other lanes; route memory switched to it after 3 ticks. Hold a PCD route against team paths until the hold expires, measure the hold in time instead of ticks, plan from the car's projection onto the last route, allow a larger first turn inside a U-turn. | Frames with no or cut paths after an excursion. |
-| 5 | **Skidpad mode** | `pp_skidpad_tels`: first Gazebo run failed (rotated lock, fixed). Re-run on a fresh skidpad world; decide how the car should stop after the exit (planner or controller); radius as a parameter (8.625 m once the controller's offset is < 0.25 m). | Fit RMS and lock time from `/pp/mode`, cross-track on the circles, phase sequence, contacts. |
+| 5 | **Skidpad mode** | `pp_skidpad_tels` runs clean in Gazebo (inner line, drift compensation, stop in the stop area). Next: the car still drives R 8.8–9.0 m on a published 7.9–8.1 m; the remaining lap-time gain needs the controller's steady offset < 0.25 m (controller requirement R1). | Fit RMS and lock time from `/pp/mode`, cross-track on the circles, phase sequence, contacts. |
 | 6 | **Racing line** | Global minimum-curvature line (TUM QP) for mapped laps and the skidpad, same `/path_points` format plus curvature and planned speed (`/pp/path_info`, to agree with controls). Modelled gain at today's limits: 9.4% Small Track, 15.8% boa_constrictor, 2.7% skidpad. Needs map closure first for trackdrive, and controller requirements R1–R4 (handoff package `racing_line_controls_handoff`). | Lap time vs the centreline on the same controller build, closest cone, contacts. |
 | Later | **Robustness** | Test with simulated perception (noise, missed cones, colour errors) instead of ground truth. Repeat the matched comparison. | Off-track frames, dropouts, closest cone under each noise level. |
 
 ## Implemented changes
 
-All entries down to `2efe7c6` arrive in one commit, the first after `6c9b47a` (26 November 2026). They are kept as separate entries because each solved a different problem; the commit's hash is the one on GitHub after `6c9b47a`.
+The skidpad entries dated 27 November 2026 arrive in one commit, the first after `c253aba`. All entries below them, down to `2efe7c6`, arrive in `c253aba`, the first commit after `6c9b47a` (26 November 2026). They are kept as separate entries because each solved a different problem.
+
+### 27 Nov 2026 · Tool: skidpad bird view with circle times and cones hit
+
+**Why.** User request: a bird view for the skidpad that shows the time of each circle in both tries and the number of cones hit.
+
+**What changed.** New `tools/birdview_skidpad.py`: the normal bird view plus a scoreboard on the map. Circle times = time between passes through the timing line at the crossing (simulation time; the line comes from the planner's fitted layout in `/pp/mode`), each lap named by the planner's phase (right 1/2, left 1/2), the current lap running live. Cones hit = Gazebo contacts between the car and any cone (`gz topic -e …/physics/contacts`, the run recorder's source), counted once per cone and booked to the phase. Result = mean of the two timed laps + 0.2 s per cone (FS skidpad penalty; an estimate, the sim counts touches, not cones down/out). Key `k` resets the scoreboard. Named `birdview_skidpad.py` so it does not overwrite a local `tools/birdview_skid.py`.
+
+**Files.** [birdview_skidpad.py](tools/birdview_skidpad.py).
+
+**Verification.** Fed the recorded odometry of the 22:51 Gazebo run: circle times 13.33 / 12.14 / 13.34 / 12.91 s, identical to the analysis of the report; two injected contacts booked to "right 2" and "exit"; scoreboard rendered. The live Gazebo contact stream was not available here.
+
+### 27 Nov 2026 · Skidpad: line keeps clearance to the real inner cones; exit straightened after the crossing
+
+**Why.** Gazebo run 27 Nov 22:51 (previous version, controller now up to 6 m/s): stop 18.7 m after the crossing (target 18.5 m), timed laps 12.14 / 12.91 s, but 2 contacts: yellow cone 45 at the bottom of the right circle by the right rear wheel (car at R 8.73 m: that inner cone sits further out than the nominal 7.625 m; the EUFS skidpad's inner cones scatter between R 7.49 and 7.74 m) and yellow cone 38, the right gate cone at the crossing, on the exit (also touched in the 21:10 run): coming off the left circle the car drifts to its right while the line was already straightening.
+
+**What changed.**
+- `skidpad.cone_aware` (on): on each circle the line radius at each angle is max(nominal, radius of the mapped inner cones within ±15° + `inner_clearance_m`), and the drift compensation measures against that local radius. The line moves out by up to 0.1 m where a cone sits further out.
+- `skidpad.exit_blend_shift_m` 4.0: the last circle → exit blend is centred 4 m after the crossing, so the line stays 0.5 m to the circle's side through the crossing (1.14 m from the opposite gate cone).
+
+**Files.** [pp_skidpad_tels.py](src/pathplanning/pathplanning/pp_skidpad_tels.py).
+
+**Verification.** Offline closed loop: closest cone 0.90–0.95 m (was 0.89), timed laps 11.05 / 11.0 s, stop 17.2 m in the model (model stops ~0.6–0.8 m earlier than Gazebo). Gazebo to confirm.
+
+### 27 Nov 2026 · Skidpad: stop point and drift target tuned from the Gazebo run
+
+**Why.** Gazebo run with the previous version (report 27 Nov, 21:10): the car came to rest 19.3 m after the crossing, inside the stop area (16–21 m), no end-row contact (before: 24.0 m, through the row). Contacts 10 → 2: yellow cone 33 on the second right lap (car at R 8.46 m while the published circle was R 7.8 m: the integral overshot inward; that cone sits at R 7.49 m) and yellow cone 38 at the left-to-exit crossing. Timed laps 12.46 / 13.07 s; car radius median 8.82 / 9.07 m.
+
+**What changed.** `skidpad.overrun_m` 3.2 → 4.0 (stop 0.8 m earlier, the middle of the area). Drift compensation aims at line radius + `drift_target_margin` 0.15 m, so the car settles near R 8.78 m instead of overshooting below 8.625 m.
+
+**Files.** [pp_skidpad_tels.py](src/pathplanning/pathplanning/pp_skidpad_tels.py), [stack_skidpad.launch.py](bringup/launch/stack_skidpad.launch.py).
+
+**Verification.** Gazebo run 27 Nov 21:16 (EUFS skidpad, Exp13 MPPI): **no cone contacts**, stopped 19.0 m after the crossing (stop area 16–21 m), timed laps 12.36 s (right) / 12.94 s (left), car radius median 8.81 / 9.03 m on a published 8.06 / 7.92 m, closest cone centre 1.01 m.
+
+### 27 Nov 2026 · Skidpad: braking profile on the exit so the car stops in the stop area; stronger drift compensation
+
+**Why.** Gazebo run with the previous version (report 27 Nov, 20:37): timed laps 12.47 s (right) / 13.1 s (left), 10 contact episodes on 5 cones. (1) The car stopped 24.0 m after the crossing, 3 m through the stop-area end row at 21 m (orange cones 78/79). Timeline: the path ended at 19.5 m, but the controller held ~5 m/s until 4 m of path were left, braked only to ~4.4 m/s (rate-limited target), dropped the path when less than 3 m was ahead (`path_reference.py`, `min_ahead=3.0`) and then coasted at 1.2 m/s² (0.4 × ACCEL_MAX) for 8 m. (2) The drift compensation hit its 0.5 m cap: published circle R 8.2 / 8.1 m, car at R 8.94 / 9.18 m (0.8–1.0 m outside). (3) Yellow cone 48 touched on the first left lap at R 9.7 m (the left circle's compensation started from zero) and yellow cones 36/37 at the right-to-left crossing by the right rear wheel (car still inside when the shift faded).
+
+**What changed.**
+- Stop: on the exit the published path is shortened along a braking profile: wanted speed v(d) = √(2.8² + 2 · `stop_decel` (0.8 m/s²) · (d − overrun)) at distance d to the target, turned into a path length through the controller's own cap √(5 · path_ahead) (length = 4 + v²/5, or 0.4 v² when short). The path ends `skidpad.overrun_m` (3.2 m) before the target (middle of the stop area, `stop_target_back_m` 2.5 m before the end row), the distance the car rolls after the controller drops the path. Replaces `stop_gap_m`.
+- Drift compensation: cap 0.7 m (`drift_comp_max_m`), line never closer than 0.3 m to inner cone centres (`min_plan_clearance_m`); a circle starts from the other circle's shift; measured only > 1.5 × blend (12 m) from a crossing; faded out between 12 m and 6 m before each crossing (was 8–4 m).
+
+**Files.** [pp_skidpad_tels.py](src/pathplanning/pathplanning/pp_skidpad_tels.py), [stack_skidpad.launch.py](bringup/launch/stack_skidpad.launch.py).
+
+**Verification.** Offline closed loop with the controller's rules modelled (speed cap from path length, rate limit 0.15 / 0.6 per cycle, path dropped below 3 m ahead, coast 1.2 m/s²). Calibration: the model with the previous version stops at 23.73 m (Gazebo 24.0 m). New: stop 18.4 m (target 18.5 m, stop area 16–21 m); 17.5–19.7 m for controller cycles of 0.05–0.3 s (previous version: 22.0–26.1 m), 18.1–18.8 m with a_lat 4, drifting car, centre line. Timed laps 11.15 / 11.1 s, closest cone 0.89 m. Gazebo still to confirm; if the car stops too close to the end row, raise `skidpad.overrun_m`.
+
+### 27 Nov 2026 · Skidpad: drift compensation keeps the car on the inner line
+
+**Why.** First Gazebo run with the inner line (bird view, 27 Nov): the line was right (R 8.625 m) and the car stopped, but it drove 0.5–1 m outside the published circle, as in the first skidpad run (0.46 m), and touched a few cones. User: the line should be closer to the inner curve.
+
+**What changed.** `skidpad.drift_comp` (on): on each circle the car's radial offset from the line is averaged (EMA 0.03 per tick, only > 8 m away from a crossing) and the published circle is moved inward by an integrated shift (+0.02 × offset per tick), capped at `skidpad.drift_comp_max_m` 0.5 m and at `skidpad.min_plan_clearance_m` 0.5 m from the inner cone centres; the shift fades out over 4 m before each crossing. Net effect: the car, not the published path, ends up on R 8.625 m. `/pp/mode`: `drift_m`, `comp_m` per circle. `inner_clearance_m` stays 1.0 m: the EUFS skidpad's inner cones sit at R 7.49–7.74 m, so a 0.9 m clearance (R 8.525 m) came 0.79 m from one cone offline. The launch file now sets all of these.
+
+**Files.** [pp_skidpad_tels.py](src/pathplanning/pathplanning/pp_skidpad_tels.py), [stack_skidpad.launch.py](bringup/launch/stack_skidpad.launch.py).
+
+**Verification.** Offline closed loop as before, with the steering scaled by 0.85 to make the test car drift outward: mean radius on the timed laps 8.85 m → 8.69 m (target 8.625 m, shift 0.25 m), closest cone 0.84 m; without drift 8.71 → 8.66 m, laps 11.2 / 11.1 s → 11.25 / 11.1 s, stop at 18.5 m unchanged. The real controller's drift and how it reacts to the shift still need a Gazebo run.
+
+### 27 Nov 2026 · Skidpad: stop inside the stop area; inner driving line
+
+**Why.** The DV skidpad ends with a full stop in the stop area: max 5 m long, ending at a row of orange cones across the exit lane (FS Driverless Specification 2026 v1.1, Figure 3 / FS Rules D 4.2.5). The planner's path ran 25 m past the crossing, but on the EUFS skidpad the end row is at 21 m: the controller stopped about 1 m before the path end, past the cones (offline: stopped 23.85 m after the crossing, 0.55 m from an end cone). The user also asked for the faster line close to the inner cones instead of the track middle.
+
+**What changed.**
+- Stop: the path ends `skidpad.stop_gap_m` (1.5 m) before the stop-area end row, found in the cone map (orange, > 8 m after the crossing, inside the lane; fallback `skidpad.stop_end_m` 25 m). The controller's existing path-end rules (speed ≤ √(2 · 2.5 · path left), zero below ~3 m of path) then stop the car in the middle of the 5 m area. `/pp/mode`: `stop_end_m`, `stop_end_seen`, `path_end_m`, `speed_mps`, `stopped_at_m`, `stopped_in_area`; phase `stopped`; one log line when the end row is found and one with the stop position.
+- Line: `skidpad.line` "inner" (default) drives the circles at R = inner radius + `skidpad.inner_clearance_m` = 7.625 + 1.0 = 8.625 m instead of 9.125 m (lap time ∝ √R when grip-limited: −2.7%); the lateral offset (∓0.5 m) is blended with a cosine over `skidpad.blend_length_m` 8 m around each crossing. "centre" keeps the old line.
+- Reference continues 40 m after the crossing (`skidpad.exit_length_m`), cut at the stop point.
+- `stack_skidpad.launch.py` sets `skidpad.line`, `skidpad.inner_clearance_m` and `skidpad.stop_gap_m` explicitly, so they can be changed there (follow-up commit).
+
+**Files.** [pp_skidpad_tels.py](src/pathplanning/pathplanning/pp_skidpad_tels.py).
+
+**Verification.** Offline closed loop on the EUFS skidpad (layout fit from simulated cones within 20 m / ±60°, pure pursuit 4 m with 20° cap, speed with the controller's path-end rules and rate limit, a_lat 2.5): timed laps (2nd lap per side) 11.45 / 11.45 s centre line → 11.2 / 11.1 s inner line; closest cone on the circles 1.29 → 0.94 m; stop 18.5 m after the crossing (stop area 16–21 m) for inner and centre line, a_lat 2.5 or 4 and look-ahead 3 or 4 m; before: 23.85 m (past the end row). Not yet run in Gazebo; the real controller's lag may move the stop point by ~1 m (`stop_gap_m` to tune).
 
 ### 26 Nov 2026 · Skidpad planner: lock only when the layout is determined; soft colour term
 

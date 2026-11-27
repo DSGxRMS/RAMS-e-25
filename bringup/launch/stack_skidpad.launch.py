@@ -50,7 +50,17 @@ def generate_launch_description():
             executable="pp_skidpad_tels",
             name="pp_skidpad_tels",
             output="screen",
-            parameters=common + [{"topics.odom_in": "/slam/odom_raw"}],
+            parameters=common + [{
+                "topics.odom_in": "/slam/odom_raw",
+                "skidpad.line": "inner",            # "inner": circles at inner cones + clearance; "centre": track middle (R 9.125)
+                "skidpad.inner_clearance_m": 1.0,   # inner cone centre -> car centre [m]; R = 7.625 + this
+                "skidpad.drift_comp": True,         # move the circle inward by the car's measured outward drift
+                "skidpad.drift_comp_max_m": 0.7,    # at most this much [m]
+                "skidpad.min_plan_clearance_m": 0.3,  # shifted line never closer to inner cone centres [m]
+                "skidpad.stop_target_back_m": 2.5,  # stop this far before the stop-area end cones [m] (middle of 5 m)
+                "skidpad.stop_decel": 0.8,          # braking profile on the exit [m/s^2]
+                "skidpad.overrun_m": 4.0,           # car rolls this far past the path end [m]; raise if it stops late
+            }],
         ),
 
         # # 4) Controls
