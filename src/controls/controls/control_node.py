@@ -48,7 +48,6 @@ from visualization_msgs.msg import Marker, MarkerArray
 # ================================
 # Control Constants
 # ================================
-MAX_VELOCITY        = 5.0    # m/s  — target cruise velocity matched to MPPIController.V_MAX
 WHEELBASE_M         = 1.5
 MAX_STEER_RAD       = 0.349  # model training limit; EUFS hardware cap is 0.7
 
@@ -350,7 +349,7 @@ def _run(resources):
 
         # ---- init telemetry visualizer on first good path ----
         if VIZ and viz is None:
-            vt_viz = np.full_like(route_x, MAX_VELOCITY)
+            vt_viz = np.full_like(route_x, mppi.V_MAX)
             viz = TelemetryVisualizer(route_x, route_y, vt_viz)
             plt.show()
 
@@ -378,7 +377,7 @@ def _run(resources):
 
         # ---- telemetry ----
         if VIZ and viz is not None:
-            vt_viz = np.full_like(route_x, MAX_VELOCITY)
+            vt_viz = np.full_like(route_x, mppi.V_MAX)
             viz.update_path_data(route_x, route_y, vt_viz)
 
             arc_pts = generate_turning_arc(cx, cy, yaw, steer, WHEELBASE_M)

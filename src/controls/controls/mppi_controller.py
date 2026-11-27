@@ -225,7 +225,7 @@ class MPPIController:
     ACCEL_MAX   = 3.0    # m/s^2 (EUFS sim clip -3..3)
 
     # ---- speed profile / path-length caps ----
-    V_MAX       = 3.0    # m/s
+    V_MAX       = 4.0    # m/s
     A_LAT_MAX   = 2.5    # m/s^2 lateral budget: v = min(V_MAX, sqrt(A_LAT/|kappa|)
                          # + backward braking pass (brake BEFORE the corner)
     BRAKE_A     = 2.5    # m/s^2 braking used by the backward pass and path-end ramp

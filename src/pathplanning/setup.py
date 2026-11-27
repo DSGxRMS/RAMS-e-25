@@ -22,6 +22,10 @@ setup(
         'console_scripts': [
             'pp_node_skidpad = pathplanning.pp_node_skidpad:main',
             'pp_tls = pathplanning.pp_tls:main',
+            'pp_cone_memory = pathplanning.pp_cone_memory:main',
+            'pp_hybrid_turn = pathplanning.pp_hybrid_turn:main',
+            'pp_shadow_only = pathplanning.pp_shadow_only:main',
+            'cone_memory_plot = pathplanning.cone_memory_plot:main',
             'pp_debug = pathplanning.pp_debug.skidpad_debug:main',
         ],
     },
