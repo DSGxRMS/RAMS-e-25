@@ -19,6 +19,24 @@ The active controller is the mirror-symmetric Exp13 Stage 1 Neural ODE with MPPI
 
 ## Implemented changes
 
+### CTRL-04 · Cap Exp13 speed from rollout feasibility
+
+With `MPPI_CONE_CLEARANCE=1`, the most recent batch can cap the next solve's target. The cap rises quadratically from 1.5 m/s at 0% feasible to the configured maximum at 65% feasible. It tightens immediately for the next solve. Raising it uses a 10 percentage-point hysteresis band and a 1.5 m/s² release rate in simulator time. The existing brake rule still applies to the current solve when there are no feasible candidates or the cone map is unavailable.
+
+The audit logs the feasible percentage, the target before the clearance cap, and the applied and next caps. Set `MPPI_CLEARANCE_SPEED=0` alongside `MPPI_CONE_CLEARANCE=1` for a comparison that keeps the clearance steering filter enabled.
+
+### CTRL-04 · Retry steering at the reduced target before requesting a stop
+
+The clearance cap now applies after the original profiler's smoothing, with its own state. If every candidate fails clearance while the starting footprint is clear, controls attempt one lower target, at most 1.5 m/s and at most half the first target. They rebuild the timed reference and rollout speed targets, then select steering from the rechecked batch. The retry uses the measured starting speed and preserves the steering queue. If it fails or the cone map is unavailable, the normal PI controller receives a zero speed target with its integral cleared.
+
+The audit includes the first and final feasible percentages, the retry target and solve time, and the desired speed used to stage the last batch.
+
+### CTRL-04 · Measure clearance and weight feasible Exp13 rollouts
+
+The run report estimates the signed gap from the measured car footprint to visible ground-truth cones. The ground-truth and timeline CSVs retain both that gap and the gap after subtracting the 0.10 m margin. Unmatched observations remain blank. The summary includes the minimum, p05, and pose coverage.
+
+With `MPPI_CONE_CLEARANCE=1`, each cycle logs the percentage of the batch rejected by clearance, separate from invalid rollouts. Infeasible candidates receive zero weight. Feasible candidates below 0.25 m of padded clearance get a quadratic log-weight penalty of up to 6. The weighted sequence is checked again and its margin is logged separately from the margin of the selected sequence. The percentage is telemetry for future speed control.
+
 ### CTRL-04 · Check swept cone clearance in the Exp13 rollouts
 
 **Why.** Both recorded orange-gate returns had projected chassis overlap near the blue-side cones even with a small reported cross-track error. Clearance depends on the complete footprint and heading along the predicted trajectory.

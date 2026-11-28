@@ -1,0 +1,110 @@
+{
+  "model": "exp13",
+  "observed_seconds": 135.66063779499999,
+  "clock_resets": 0,
+  "invalid_json_rows": 0,
+  "clean_end": true,
+  "sample_basis": "cycle",
+  "message_counts": {
+    "buffer": 742,
+    "clock_epoch": 1,
+    "cmd": 933,
+    "contact_native": 791,
+    "contact_ros": 0,
+    "coverage": 3,
+    "cycle": 933,
+    "end": 1,
+    "gt": 12295,
+    "gt_cones": 6146,
+    "gt_steering": 12293,
+    "map_cones": 6147,
+    "meta": 1,
+    "odom_raw": 12295,
+    "odom_slam": 6147,
+    "pp": 1224,
+    "pseudo": 2,
+    "rollouts": 740
+  },
+  "distance_m": 161.3548941319426,
+  "speed_error_mps": {
+    "n": 933,
+    "median": 0.003323577794814181,
+    "p95": 1.2585007386541813,
+    "max": 3.9578205657848113,
+    "rms": 0.6409057976439125
+  },
+  "cross_track_m": {
+    "n": 742,
+    "median": 0.09874398255994445,
+    "p95": 1.5628425907263868,
+    "max": 3.5548973716187673,
+    "rms": 0.6678878176343266
+  },
+  "peak_actual_speed": 4.169537095833295,
+  "rollout_ms": {
+    "n": 740,
+    "median": 113.25623250002081,
+    "p95": 230.5921413000192,
+    "max": 327.73658300015995,
+    "rms": 141.8559453953679
+  },
+  "cycle_ms": {
+    "n": 933,
+    "median": 130.03566300017155,
+    "p95": 252.22521219993723,
+    "max": 345.31061699999555,
+    "rms": 142.82664411548188
+  },
+  "command_interval_ms": {
+    "n": 932,
+    "median": 133.96799399999537,
+    "p95": 258.4435848000016,
+    "max": 350.30782500000157,
+    "rms": 153.76341345216284
+  },
+  "overshoot": {
+    "threshold_mps": 0.25,
+    "episodes": 11,
+    "samples_braking": 126
+  },
+  "deviation": {
+    "threshold_m": 1.0,
+    "episodes": 3
+  },
+  "steering_near_limit_fraction": 0.5509110396570204,
+  "modes": {
+    "tracking": 694,
+    "no_path": 191,
+    "pseudo_bridge": 46,
+    "path_rejected": 2
+  },
+  "pp": {
+    "messages": 1224,
+    "valid_messages": 974,
+    "unique_valid_geometry": 793,
+    "minimum_points": 5,
+    "freshness_s": 0.5,
+    "unavailable_seconds": 27.88593838699998,
+    "dropouts": 4
+  },
+  "contact": {
+    "episodes": 16,
+    "unique_cones": 12,
+    "episode_gap_s": 0.4,
+    "native_payload": true,
+    "ros_payload": false,
+    "partial_or_unknown": true,
+    "coverage": [
+      {
+        "contact_topic": "/gazebo/boa_constrictor/physics/contacts"
+      },
+      {
+        "native_contact_payload": true
+      },
+      {
+        "contact_stream_end": "/gazebo/boa_constrictor/physics/contacts"
+      }
+    ]
+  },
+  "closest_mapped_cone_center_m": 0.4994790137176949
+}

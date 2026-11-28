@@ -1,0 +1,67 @@
+Waiting for first odometry message...
+First position received.
+[MPPI] GPU NVIDIA GeForce RTX 4050 Laptop GPU (6.4 GB) + CUDA graph
+[MPPI] sampling seed=42
+[MPPI] EUFS steering actuator model=on
+[MPPI] dynamics=exp13 checkpoint=/home/telsu_2005/RAMS-abh/build/controls/controls/fs_model/exp13_stage1_pretrained.pt
+[MPPI] Loaded exp13_stage1_pretrained.pt  K=1024  T=200/400 (@<3.0 m/s)  dt_eff=0.005s  RK4=True
+[MPPI] CSV trace -> /home/telsu_2005/RAMS-abh/runs/20261126-182349-laaeso8h/mppi.csv
+[MPPI] CUDA graph captured (horizon=200 = 1.0s)
+[MPPI] CUDA graph captured (horizon=400 = 2.0s)
+[MPPI] startup warm-up complete: graphs live for T=200/400
+[MPPI] t= 143ms odom= 0.00 use= 0.00 vplan= 0.0 vr= 1.9 vcap=16.3 vcrnr= 4.0 look=4.0 | steer=+0.062 ff0=-0.027 accel=+2.85 lon0=+0.95 | cur=0/40 ahead= 8.6m CTE=+0.01 hd_err=-0.07 | cost[0.03,0.07] nEff=531/1024 lam=0.006 a0std=0.094 I=0.00
+[MPPI] path matured (9.2 m ahead) -> launch governor released
+[MPPI] t= 111ms odom= 2.19 use= 2.19 vplan= 2.2 vr= 3.4 vcap=18.4 vcrnr= 4.0 look=4.0 | steer=-0.045 ff0=-0.023 accel=+1.87 lon0=+0.62 | cur=0/40 ahead=10.6m CTE=+0.02 hd_err=+0.01 | cost[0.01,0.05] nEff=817/1024 lam=0.006 a0std=0.098 I=0.18
+[MPPI] t= 226ms odom= 4.02 use= 4.02 vplan= 4.0 vr= 3.9 vcap=19.9 vcrnr= 4.0 look=4.0 | steer=-0.035 ff0=+0.072 accel=+0.01 lon0=+0.00 | cur=0/40 ahead=19.8m CTE=-0.41 hd_err=+0.20 | cost[0.16,1.50] nEff=901/1024 lam=0.201 a0std=0.097 I=0.43
+[MPPI] t= 231ms odom= 3.93 use= 3.93 vplan= 3.9 vr= 3.9 vcap=14.6 vcrnr= 4.0 look=4.0 | steer=+0.162 ff0=+0.320 accel=+0.11 lon0=+0.04 | cur=0/40 ahead=13.5m CTE=-0.27 hd_err=-0.07 | cost[4.33,4.89] nEff=861/1024 lam=0.083 a0std=0.092 I=0.32
+[MPPI] t= 113ms odom= 3.99 use= 3.99 vplan= 4.0 vr= 4.0 vcap=19.9 vcrnr= 4.0 look=4.0 | steer=+0.283 ff0=+0.325 accel=+0.11 lon0=+0.04 | cur=0/40 ahead= 9.3m CTE=-0.06 hd_err=-0.33 | cost[1.89,1.98] nEff=810/1024 lam=0.014 a0std=0.074 I=0.36
+[MPPI] t= 116ms odom= 3.96 use= 3.96 vplan= 4.0 vr= 4.0 vcap=16.2 vcrnr= 4.0 look=4.0 | steer=+0.326 ff0=-0.022 accel=+0.15 lon0=+0.05 | cur=0/40 ahead= 8.8m CTE=-0.03 hd_err=-0.90 | cost[1.83,2.52] nEff=587/1024 lam=0.104 a0std=0.062 I=0.37
+[MPPI] t= 227ms odom= 3.93 use= 3.93 vplan= 3.9 vr= 3.6 vcap=13.9 vcrnr= 3.3 look=4.0 | steer=-0.027 ff0=-0.182 accel=-0.37 lon0=-0.12 | cur=0/40 ahead=13.1m CTE=-0.08 hd_err=-0.67 | cost[1.11,3.04] nEff=808/1024 lam=0.290 a0std=0.098 I=0.23
+[MPPI] t= 226ms odom= 3.56 use= 3.56 vplan= 3.6 vr= 3.9 vcap=12.2 vcrnr= 4.0 look=4.0 | steer=+0.002 ff0=+0.340 accel=+0.66 lon0=+0.22 | cur=1/40 ahead=11.8m CTE=-0.37 hd_err=+0.07 | cost[1.98,2.72] nEff=326/1024 lam=0.111 a0std=0.093 I=0.37
+[MPPI] t= 114ms odom= 3.92 use= 3.92 vplan= 3.9 vr= 3.9 vcap=17.8 vcrnr= 3.9 look=4.0 | steer=+0.326 ff0=+0.258 accel=+0.09 lon0=+0.03 | cur=0/40 ahead= 8.4m CTE=-0.48 hd_err=-0.19 | cost[0.93,1.11] nEff=642/1024 lam=0.027 a0std=0.064 I=0.42
+[MPPI] t= 113ms odom= 3.83 use= 3.83 vplan= 3.8 vr= 4.0 vcap=13.5 vcrnr= 4.0 look=4.0 | steer=+0.328 ff0=-0.101 accel=+0.35 lon0=+0.12 | cur=0/40 ahead= 5.9m CTE=-0.14 hd_err=-0.64 | cost[2.35,3.09] nEff=594/1024 lam=0.112 a0std=0.067 I=0.41
+[MPPI] t= 113ms odom= 3.87 use= 3.87 vplan= 3.9 vr= 4.0 vcap=17.6 vcrnr= 4.0 look=4.0 | steer=-0.062 ff0=-0.416 accel=+0.29 lon0=+0.10 | cur=0/40 ahead= 8.8m CTE=+0.14 hd_err=-0.27 | cost[2.99,3.17] nEff=541/1024 lam=0.028 a0std=0.094 I=0.41
+[MPPI] t= 114ms odom= 3.90 use= 3.90 vplan= 3.9 vr= 4.0 vcap=20.0 vcrnr= 4.0 look=4.0 | steer=-0.327 ff0=+0.165 accel=+0.26 lon0=+0.09 | cur=0/40 ahead=10.3m CTE=+0.03 hd_err=+0.87 | cost[2.52,3.01] nEff=590/1024 lam=0.073 a0std=0.066 I=0.39
+[MPPI] t= 111ms odom= 4.02 use= 4.02 vplan= 4.0 vr= 3.9 vcap=21.1 vcrnr= 4.0 look=4.0 | steer=+0.336 ff0=+0.125 accel=-0.05 lon0=-0.02 | cur=0/40 ahead= 9.6m CTE=-0.62 hd_err=-0.93 | cost[1.38,1.72] nEff=473/1024 lam=0.052 a0std=0.063 I=0.25
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] feed #1: yellow wall (one-sided), +3 pts, nb=0 ny=5 (speed cap 1.5)
+[MPPI] t= 110ms odom= 3.60 use= 3.60 vplan= 3.6 vr= 1.5 vcap= 7.1 vcrnr= 4.0 look=2.5 | steer=+0.328 ff0=+0.000 accel=-3.00 lon0=-1.00 | cur=0/40 ahead= 2.5m CTE=-1.14 hd_err=-0.84 | cost[3.60,3.87] nEff=612/1024 lam=0.041 a0std=0.063 I=0.15
+[MPPI] t= 112ms odom= 1.80 use= 1.80 vplan= 1.8 vr= 1.8 vcap=22.4 vcrnr= 4.0 look=4.0 | steer=+0.329 ff0=+0.029 accel=+0.04 lon0=+0.01 | cur=0/40 ahead=11.5m CTE=-0.53 hd_err=-0.69 | cost[0.91,1.08] nEff=566/1024 lam=0.025 a0std=0.063 I=-0.07
+[PSEUDO] no fit: unlock: wall fit bends 0.67 m > 0.35 limit
+[MPPI] t= 113ms odom= 1.89 use= 1.89 vplan= 1.9 vr= 2.6 vcap=17.5 vcrnr= 4.0 look=4.0 | steer=+0.327 ff0=-0.003 accel=+1.12 lon0=+0.37 | cur=0/40 ahead= 9.9m CTE=-0.16 hd_err=-0.51 | cost[0.20,0.29] nEff=577/1024 lam=0.014 a0std=0.065 I=0.32
+[MPPI] t= 113ms odom= 3.01 use= 3.01 vplan= 3.0 vr= 3.3 vcap=17.6 vcrnr= 4.0 look=4.0 | steer=+0.028 ff0=+0.033 accel=+0.72 lon0=+0.24 | cur=0/40 ahead= 8.4m CTE=-0.04 hd_err=-0.03 | cost[0.01,0.05] nEff=814/1024 lam=0.005 a0std=0.094 I=0.78
+[MPPI] t= 111ms odom= 3.92 use= 3.92 vplan= 3.9 vr= 4.0 vcap=23.6 vcrnr= 4.0 look=4.0 | steer=+0.067 ff0=-0.003 accel=+0.45 lon0=+0.15 | cur=0/40 ahead=11.5m CTE=+0.03 hd_err=-0.16 | cost[0.01,0.08] nEff=694/1024 lam=0.011 a0std=0.098 I=1.16
+[MPPI] t= 226ms odom= 4.06 use= 4.06 vplan= 4.1 vr= 3.9 vcap=13.6 vcrnr= 4.0 look=4.0 | steer=-0.020 ff0=+0.214 accel=+0.12 lon0=+0.04 | cur=1/40 ahead=13.1m CTE=-0.29 hd_err=+0.22 | cost[1.69,2.49] nEff=747/1024 lam=0.119 a0std=0.095 I=0.95
+[MPPI] t= 114ms odom= 4.08 use= 4.08 vplan= 4.1 vr= 4.0 vcap=16.8 vcrnr= 4.0 look=4.0 | steer=+0.270 ff0=+0.346 accel=+0.07 lon0=+0.02 | cur=0/40 ahead= 7.9m CTE=-0.13 hd_err=-0.31 | cost[2.33,2.38] nEff=775/1024 lam=0.008 a0std=0.082 I=0.80
+[MPPI] t= 115ms odom= 4.02 use= 4.02 vplan= 4.0 vr= 4.0 vcap=11.7 vcrnr= 4.0 look=4.0 | steer=+0.331 ff0=+0.014 accel=+0.16 lon0=+0.05 | cur=0/40 ahead= 6.4m CTE=-0.18 hd_err=-0.74 | cost[1.60,2.31] nEff=609/1024 lam=0.107 a0std=0.061 I=0.73
+[MPPI] t= 114ms odom= 4.04 use= 4.04 vplan= 4.0 vr= 4.0 vcap=16.6 vcrnr= 4.0 look=4.0 | steer=+0.326 ff0=-0.128 accel=+0.09 lon0=+0.03 | cur=0/40 ahead= 7.9m CTE=-0.01 hd_err=-0.71 | cost[0.93,1.06] nEff=649/1024 lam=0.020 a0std=0.068 I=0.68
+[MPPI] t= 114ms odom= 4.05 use= 4.05 vplan= 4.0 vr= 4.0 vcap=17.4 vcrnr= 4.0 look=4.0 | steer=-0.226 ff0=+0.008 accel=+0.11 lon0=+0.04 | cur=0/40 ahead= 8.1m CTE=+0.00 hd_err=+0.37 | cost[0.06,0.12] nEff=720/1024 lam=0.009 a0std=0.086 I=0.61
+[MPPI] t= 118ms odom= 4.09 use= 4.09 vplan= 4.1 vr= 4.0 vcap=17.0 vcrnr= 4.0 look=4.0 | steer=+0.013 ff0=-0.008 accel=+0.03 lon0=+0.01 | cur=0/40 ahead= 8.1m CTE=+0.01 hd_err=-0.03 | cost[0.00,0.07] nEff=820/1024 lam=0.011 a0std=0.090 I=0.53
+[MPPI] t= 240ms odom= 4.05 use= 4.05 vplan= 4.0 vr= 4.0 vcap=19.0 vcrnr= 4.0 look=4.0 | steer=-0.092 ff0=+0.050 accel=+0.01 lon0=+0.00 | cur=0/40 ahead=21.9m CTE=-0.27 hd_err=+0.26 | cost[0.13,1.50] nEff=837/1024 lam=0.206 a0std=0.095 I=0.45
+[MPPI] t= 232ms odom= 3.94 use= 3.94 vplan= 3.9 vr= 3.5 vcap=10.7 vcrnr= 2.9 look=4.0 | steer=+0.108 ff0=+0.052 accel=-0.56 lon0=-0.19 | cur=0/40 ahead= 6.4m CTE=-0.05 hd_err=-0.74 | cost[2.80,3.31] nEff=838/1024 lam=0.077 a0std=0.092 I=0.25
+[MPPI] t= 114ms odom= 3.48 use= 3.48 vplan= 3.5 vr= 3.6 vcap= 5.0 vcrnr= 4.0 look=2.2 | steer=+0.324 ff0=-0.071 accel=+0.15 lon0=+0.05 | cur=0/40 ahead= 2.2m CTE=-0.04 hd_err=-0.54 | cost[0.22,0.38] nEff=715/1024 lam=0.024 a0std=0.062 I=0.09
+[MPPI] t= 112ms odom= 3.74 use= 3.74 vplan= 3.7 vr= 4.0 vcap=16.4 vcrnr= 3.9 look=4.0 | steer=+0.218 ff0=+0.347 accel=+0.44 lon0=+0.15 | cur=0/40 ahead= 7.9m CTE=-0.01 hd_err=-0.08 | cost[2.52,2.59] nEff=702/1024 lam=0.011 a0std=0.086 I=0.32
+[MPPI] t= 112ms odom= 3.92 use= 3.92 vplan= 3.9 vr= 4.0 vcap=10.7 vcrnr= 4.0 look=4.0 | steer=+0.322 ff0=+0.025 accel=+0.20 lon0=+0.07 | cur=0/40 ahead= 5.4m CTE=-0.22 hd_err=-0.79 | cost[1.39,2.07] nEff=620/1024 lam=0.103 a0std=0.068 I=0.40
+[MPPI] t= 222ms odom= 4.01 use= 4.01 vplan= 4.0 vr= 3.9 vcap=13.0 vcrnr= 3.8 look=4.0 | steer=+0.038 ff0=-0.241 accel=+0.04 lon0=+0.01 | cur=0/40 ahead=12.7m CTE=+0.03 hd_err=-0.85 | cost[1.70,4.05] nEff=611/1024 lam=0.352 a0std=0.094 I=0.43
+[MPPI] t= 109ms odom= 3.96 use= 3.96 vplan= 4.0 vr= 4.0 vcap=13.5 vcrnr= 4.0 look=4.0 | steer=-0.167 ff0=+0.025 accel=+0.15 lon0=+0.05 | cur=0/40 ahead= 6.2m CTE=-0.01 hd_err=+0.32 | cost[0.06,0.15] nEff=817/1024 lam=0.013 a0std=0.092 I=0.35
+[MPPI] t= 112ms odom= 4.01 use= 4.01 vplan= 4.0 vr= 4.0 vcap=15.0 vcrnr= 4.0 look=4.0 | steer=-0.020 ff0=+0.432 accel=+0.07 lon0=+0.02 | cur=0/40 ahead=10.2m CTE=-0.16 hd_err=+0.30 | cost[4.89,5.07] nEff=629/1024 lam=0.028 a0std=0.093 I=0.34
+[MPPI] t= 112ms odom= 3.93 use= 3.93 vplan= 3.9 vr= 3.6 vcap=15.7 vcrnr= 3.5 look=4.0 | steer=+0.329 ff0=+0.025 accel=-0.41 lon0=-0.14 | cur=0/40 ahead= 9.0m CTE=-0.08 hd_err=-0.42 | cost[0.77,1.23] nEff=594/1024 lam=0.070 a0std=0.065 I=0.24
+[MPPI] t= 112ms odom= 3.87 use= 3.87 vplan= 3.9 vr= 4.0 vcap=12.8 vcrnr= 4.0 look=4.0 | steer=+0.286 ff0=-0.397 accel=+0.25 lon0=+0.08 | cur=1/40 ahead= 6.2m CTE=+0.10 hd_err=-0.67 | cost[4.00,4.05] nEff=283/1024 lam=0.007 a0std=0.081 I=0.32
+[MPPI] t= 114ms odom= 3.76 use= 3.76 vplan= 3.8 vr= 3.9 vcap= 6.4 vcrnr= 4.0 look=2.9 | steer=-0.324 ff0=+0.036 accel=+0.29 lon0=+0.10 | cur=0/40 ahead= 2.9m CTE=+0.08 hd_err=+0.90 | cost[0.90,1.35] nEff=579/1024 lam=0.067 a0std=0.069 I=0.24
+[MPPI] t= 225ms odom= 4.05 use= 4.05 vplan= 4.1 vr= 3.9 vcap=12.8 vcrnr= 3.8 look=4.0 | steer=+0.086 ff0=+0.236 accel=-0.11 lon0=-0.04 | cur=0/40 ahead= 9.8m CTE=-0.16 hd_err=-0.49 | cost[1.41,3.69] nEff=523/1024 lam=0.343 a0std=0.095 I=0.27
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] feed #2: yellow wall (one-sided), +3 pts, nb=0 ny=3 (speed cap 1.5)
+[MPPI] t= 112ms odom= 2.72 use= 2.72 vplan= 2.7 vr= 1.5 vcap= 5.5 vcrnr= 4.0 look=2.5 | steer=+0.328 ff0=+0.000 accel=-1.78 lon0=-0.59 | cur=0/40 ahead= 2.5m CTE=-2.56 hd_err=-0.90 | cost[10.87,11.23] nEff=547/1024 lam=0.054 a0std=0.068 I=0.20
+[PSEUDO] no fit: no dominant wall (nb=0 ny=2, need >=3 and majority)
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+[PSEUDO] no fit: too little recovery path ahead
+
+[control_node] stopped by user.
+[control_node] generating trajectory plot...
+[plot] saved /home/telsu_2005/RAMS-abh/runs/20261126-182349-laaeso8h/trajectory.png

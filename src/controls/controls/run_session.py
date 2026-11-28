@@ -10,6 +10,10 @@ import tempfile
 import threading
 import time
 
+from controls.cone_clearance import (
+    CLEARANCE_SPEED_FLOOR_MPS, CLEARANCE_SPEED_FULL_PCT, CLEARANCE_SPEED_HYSTERESIS_PCT,
+    CLEARANCE_SPEED_RELEASE_MPS2, MAX_CLEARANCE_LOG_PENALTY, PREFERRED_MARGIN_M,
+)
 from controls.random_seed import sampling_seed
 from controls.steering_actuator import steering_actuator_enabled, steering_option
 
@@ -73,6 +77,7 @@ def main():
         align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
         elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
         check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+        limit_clearance_speed = check_clearance and steering_option("MPPI_CLEARANCE_SPEED", True)
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
         return 2
@@ -102,6 +107,15 @@ def main():
         "ros_domain_id": env.get("ROS_DOMAIN_ID", "0"),
         "recorder_ready": False,
     }
+    if check_clearance:
+        status.update(mppi_clearance_preferred_margin_m=PREFERRED_MARGIN_M,
+                      mppi_clearance_max_log_penalty=MAX_CLEARANCE_LOG_PENALTY,
+                      mppi_clearance_speed=limit_clearance_speed)
+    if limit_clearance_speed:
+        status.update(mppi_clearance_speed_floor_mps=CLEARANCE_SPEED_FLOOR_MPS,
+                      mppi_clearance_speed_full_pct=CLEARANCE_SPEED_FULL_PCT,
+                      mppi_clearance_speed_hysteresis_pct=CLEARANCE_SPEED_HYSTERESIS_PCT,
+                      mppi_clearance_speed_release_mps2=CLEARANCE_SPEED_RELEASE_MPS2)
     meta_file = run / "run.json"
     write_status(meta_file, status)
     print(f"[run] {run}", flush=True)

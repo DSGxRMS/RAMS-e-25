@@ -15,6 +15,55 @@ SMALL_CONE_RADIUS_M = .15
 LARGE_CONE_RADIUS_M = .16
 MARGIN_M = .10
 SWEEP_STRIDE = 5
+PREFERRED_MARGIN_M = .25
+MAX_CLEARANCE_LOG_PENALTY = 6.0
+CLEARANCE_SPEED_FULL_PCT = 65.0
+CLEARANCE_SPEED_HYSTERESIS_PCT = 10.0
+CLEARANCE_SPEED_FLOOR_MPS = 1.5
+CLEARANCE_SPEED_RELEASE_MPS2 = 1.5
+
+
+class ClearanceSpeedGovernor:
+    """Tighten on low feasibility and release slowly with hysteresis."""
+
+    def __init__(self, max_speed_mps):
+        self.max_speed_mps = max_speed_mps
+        self.cap_mps = max_speed_mps
+
+    def _requested_cap(self, feasible_pct):
+        fraction = min(max(feasible_pct / CLEARANCE_SPEED_FULL_PCT, 0.0), 1.0)
+        floor = min(CLEARANCE_SPEED_FLOOR_MPS, self.max_speed_mps)
+        return floor + (self.max_speed_mps - floor) * fraction**2
+
+    def observe(self, feasible_pct, dt_sim_s):
+        if feasible_pct is None:
+            return
+        requested = self._requested_cap(feasible_pct)
+        if requested < self.cap_mps:
+            self.cap_mps = requested
+        else:
+            # Require more clearance to raise the cap than to hold it.
+            release = self._requested_cap(feasible_pct - CLEARANCE_SPEED_HYSTERESIS_PCT)
+            step = CLEARANCE_SPEED_RELEASE_MPS2 * min(max(dt_sim_s, 0.0), 0.1)
+            self.cap_mps = max(self.cap_mps, min(release, self.cap_mps + step))
+
+
+def measured_footprint_gap(cones):
+    """Signed gap in metres from the footprint to observed cones in base_footprint."""
+    data = np.asarray(cones, dtype=float).reshape(-1, 3)
+    if not len(data):
+        return None
+    boxes = np.asarray(FOOTPRINT)
+    offsets = np.abs(data[:, None, :2] - boxes[None, :, :2]) - boxes[None, :, 2:]
+    outside = np.linalg.norm(offsets.clip(min=0), axis=-1)
+    inside = offsets.max(axis=-1).clip(max=0)
+    return float((outside + inside - data[:, None, 2]).min())
+
+
+def clearance_log_penalty(margins):
+    """Discount feasible samples that barely clear the padded footprint."""
+    shortfall = (1.0 - margins / PREFERRED_MARGIN_M).clamp(0, 1)
+    return MAX_CLEARANCE_LOG_PENALTY * shortfall.square()
 
 
 def nearby_cones(cones, x, y, reach_m):

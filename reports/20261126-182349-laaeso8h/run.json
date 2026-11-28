@@ -1,0 +1,17 @@
+{
+  "model": "exp13",
+  "mppi_seed": 42,
+  "mppi_steering_actuator": true,
+  "mppi_steering_sync": true,
+  "mppi_elapsed_warm_start": true,
+  "mppi_cone_clearance": false,
+  "mppi_worker_python": null,
+  "started": "2026-11-26T18:23:49.958732+05:30",
+  "controller_args": [],
+  "ros_domain_id": "0",
+  "recorder_ready": true,
+  "controller_exit": 0,
+  "recorder_exit": 0,
+  "report_exit": 0,
+  "finished": "2026-11-26T18:26:37.006921+05:30"
+}

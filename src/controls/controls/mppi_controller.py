@@ -36,7 +36,10 @@ import torch.nn as nn
 from scipy.interpolate import splprep, splev
 
 from controls.path_reference import project_reference
-from controls.cone_clearance import nearby_cones, swept_clearance
+from controls.cone_clearance import (
+    CLEARANCE_SPEED_FLOOR_MPS, ClearanceSpeedGovernor, clearance_log_penalty, nearby_cones,
+    swept_clearance,
+)
 from controls.random_seed import sampling_seed
 from controls.steering_actuator import SteeringActuator, steering_actuator_enabled, steering_option
 
@@ -225,7 +228,7 @@ class MPPIController:
     ACCEL_MAX   = 3.0    # m/s^2 (EUFS sim clip -3..3)
 
     # ---- speed profile / path-length caps ----
-    V_MAX       = 6.0    # m/s
+    V_MAX       = 4.0    # m/s
     A_LAT_MAX   = 2.5    # m/s^2 lateral budget: v = min(V_MAX, sqrt(A_LAT/|kappa|)
                          # + backward braking pass (brake BEFORE the corner)
     BRAKE_A     = 2.5    # m/s^2 braking used by the backward pass and path-end ramp
@@ -283,11 +286,16 @@ class MPPIController:
         self.steering_actuator_enabled = steering_actuator_enabled(model_name)
         self.elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model_name == "exp13")
         self.cone_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+        self.clearance_speed = (ClearanceSpeedGovernor(self.V_MAX)
+                                if self.cone_clearance and steering_option("MPPI_CLEARANCE_SPEED", True)
+                                else None)
         if self.cone_clearance and (model_name != "exp13" or self.K_FF
                                     or os.environ.get("MPPI_FORCE_STEER0") == "1"):
             raise ValueError("MPPI_CONE_CLEARANCE requires the standard Exp13 steering output")
         print(f"[MPPI] EUFS steering actuator model={'on' if self.steering_actuator_enabled else 'off'}",
               flush=True)
+        print(f"[MPPI] cone clearance={'on' if self.cone_clearance else 'off'}, "
+              f"clearance speed={'on' if self.clearance_speed is not None else 'off'}", flush=True)
         if model_name == "exp13":
             cp = ckpt_path or _find_ckpt("exp13_stage1_pretrained.pt")
             state = torch.load(str(cp), map_location="cpu", weights_only=True)
@@ -366,7 +374,11 @@ class MPPIController:
             self._csv.write(
                 "time,x,y,yaw,odom_spd,use_spd,v_plan,vr_eff,steer,accel,lon0,"
                 "cte,heading_err,cost_min,cost_max,n_eff,a0_std,pace_m,roll_ms,"
-                "I_spd,yaw_rate,cur,N,ff_part,mppi_part\n")
+                "I_spd,yaw_rate,cur,N,ff_part,mppi_part,"
+                "clearance_infeasible_pct,clearance_weighted_margin_m,clearance_selected_margin_m,"
+                "clearance_feasible_pct,clearance_speed_cap_mps,clearance_speed_next_cap_mps,"
+                "clearance_speed_base_target_mps,clearance_initial_feasible_pct,"
+                "clearance_retry_target_mps,clearance_retry_roll_ms,clearance_rollout_target_mps\n")
             print(f"[MPPI] CSV trace -> {csv_path}", flush=True)
 
         # ---- P18-g: eager dual-horizon warm-up (closes tracker item P4) ----
@@ -553,6 +565,27 @@ class MPPIController:
         else:
             poses = self._rollout(horizon, model_actuator, actions)
         return float(swept_clearance(torch.cat((initial_pose, poses)), cones)[0])
+
+    def _run_rollout_batch(self, horizon, model_actuator):
+        start = time.perf_counter()
+        if self.use_graph:
+            key = horizon, model_actuator
+            if key not in self._graphs:
+                self._capture_graph(*key)
+            self._graphs[key].replay()
+            torch.cuda.synchronize()
+        else:
+            self._rollout(horizon, model_actuator)
+        return (time.perf_counter() - start) * 1000.0
+
+    def _screen_rollouts(self, horizon, initial_pose, cones):
+        poses = torch.stack((self._trajE[:horizon], self._trajN[:horizon],
+                             self._trajYaw[:horizon]), dim=-1)
+        margins = swept_clearance(torch.cat((initial_pose.expand(1, self.K, 3), poses)), cones)
+        finite = torch.isfinite(margins)
+        clear = finite & (margins > 0)
+        candidates = torch.nonzero(clear & torch.isfinite(self._cost)).flatten()
+        return margins, candidates, int((finite & ~clear).sum())
 
     # =====================================================================
     #  update_path — spline the buffer, build reference + speed profile
@@ -759,6 +792,7 @@ class MPPIController:
         if path_is_bad:
             vr_raw = 0.0
         vr_raw = float(np.clip(vr_raw, 0.0, self.V_MAX))
+        clearance_audit = {}
 
         # Rate-limit: slow to slow down (kills stop-start stutter), quick up.
         if vr_raw < self._vr_lp:
@@ -769,19 +803,28 @@ class MPPIController:
             # Apply the bridge ceiling to the filtered target as well as its input.
             self._vr_lp = min(self._vr_lp, float(speed_cap))
         vr_eff = float(self._vr_lp)
+        if self.clearance_speed is not None:
+            clearance_cap = self.clearance_speed.cap_mps
+            clearance_audit.update(clearance_speed_base_target_mps=vr_raw,
+                                   clearance_speed_cap_mps=clearance_cap)
+            # Keep the original profiler's filter state independent of the add-on.
+            vr_raw = min(vr_raw, clearance_cap)
+            vr_eff = min(vr_eff, clearance_cap)
 
         # ---- arc-length reference horizon (marches at the planning speed) ----
-        pace_m = max(vr_eff, 0.5) * self.DT_EFF
-        s_tgt  = torch.clamp(
-            s_cur + lookahead_eff
-            + torch.arange(horizon, dtype=torch.float32, device=dev) * pace_m,
-            0.0, s_max)
-        refE  = _interp_1d(pd["s"], pd["rx"], s_tgt)
-        refN  = _interp_1d(pd["s"], pd["ry"], s_tgt)
-        nE_t  = _interp_1d(pd["s"], pd["nE"], s_tgt)
-        nN_t  = _interp_1d(pd["s"], pd["nN"], s_tgt)
-        ff_t  = _interp_1d(pd["s"], pd["ff"], s_tgt)
-        vtgt_t = _interp_1d(pd["s"], pd["vt"], s_tgt)
+        steps = torch.arange(horizon, dtype=torch.float32, device=dev)
+
+        def stage_reference(target_speed):
+            pace = max(target_speed, 0.5) * self.DT_EFF
+            s_tgt = torch.clamp(s_cur + lookahead_eff + steps * pace, 0.0, s_max)
+            knots = pd["s"]
+            self._refE[:horizon].copy_(_interp_1d(knots, pd["rx"], s_tgt))
+            self._refN[:horizon].copy_(_interp_1d(knots, pd["ry"], s_tgt))
+            self._nE[:horizon].copy_(_interp_1d(knots, pd["nE"], s_tgt))
+            self._nN[:horizon].copy_(_interp_1d(knots, pd["nN"], s_tgt))
+            self._ff[:horizon].copy_(_interp_1d(knots, pd["ff"], s_tgt))
+            self._vtgt[:horizon].copy_(_interp_1d(knots, pd["vt"], s_tgt).clamp(max=target_speed))
+            return pace
 
         # ---- steer samples: sustained per-sample bias + fine jitter ----
         model_actuator = self.steering_actuator_enabled and steering_prediction is not None
@@ -815,14 +858,7 @@ class MPPIController:
         # T_MAX wide, the interp outputs are `horizon` wide, and the rollout
         # only ever reads [0, horizon)) ----
         self._A.copy_(A)
-        self._refE[:horizon].copy_(refE)
-        self._refN[:horizon].copy_(refN)
-        self._nE[:horizon].copy_(nE_t)
-        self._nN[:horizon].copy_(nN_t)
-        self._ff[:horizon].copy_(ff_t)
-        # Rollout speed target capped at this cycle's command so the rollout's
-        # P-longitudinal predicts a speed consistent with reality.
-        self._vtgt[:horizon].copy_(torch.clamp(vtgt_t, max=vr_eff))
+        pace_m = stage_reference(vr_eff)
         # Heading slots use the TRAINING convention: yaw_sin=-cos(yaw), yaw_cos=sin(yaw)
         self._x0.copy_(torch.tensor(
             [v_plan, 0.0, self.yaw_rate, -math.cos(yaw), math.sin(yaw), 0.0],
@@ -830,28 +866,18 @@ class MPPIController:
         self._p0.copy_(torch.tensor([x, y], dtype=torch.float32, device=dev))
 
         # ---- rollout (CUDA graph replay, or plain call on CPU) ----
-        _t_roll = time.perf_counter()
-        if self.use_graph:
-            g = self._graphs.get((horizon, model_actuator))
-            if g is None:
-                self._capture_graph(horizon, model_actuator)
-                g = self._graphs[horizon, model_actuator]
-            g.replay()
-            if self.dev.type == "cuda":
-                torch.cuda.synchronize()
-        else:
-            self._rollout(horizon, model_actuator)
-        roll_ms = (time.perf_counter() - _t_roll) * 1000.0
+        roll_ms = self._run_rollout_batch(horizon, model_actuator)
         cost = self._cost
 
         # ---- softmax -> updated nominal (adaptive temperature) ----
         # Fixed lambda degenerates when the cost spread is tiny (all samples
         # equal-weighted -> MPPI = noise). Scale it to the actual spread.
-        clearance_audit = {}
         blocked = False
         candidates = None
         if self.cone_clearance:
             clearance_start = time.perf_counter()
+            retry_roll_ms = 0.0
+            initial_feasible_pct = None
             # Use the deployed state bounds over the full horizon, including the footprint.
             reach = math.hypot(13.902, 1.173) * horizon * self.DT_EFF + 3.0
             cone_data = nearby_cones(() if clearance_cones is None else clearance_cones, x, y, reach)
@@ -860,57 +886,97 @@ class MPPIController:
             if len(cone_data):
                 cones = torch.as_tensor(cone_data, device=dev)
                 initial_pose = torch.as_tensor([x, y, yaw], dtype=self._trajE.dtype, device=dev).view(1, 1, 3)
-                poses = torch.stack((self._trajE[:horizon], self._trajN[:horizon],
-                                     self._trajYaw[:horizon]), dim=-1)
-                margins = swept_clearance(torch.cat((initial_pose.expand(1, self.K, 3), poses)), cones)
-                candidates = torch.nonzero((margins > 0) & torch.isfinite(cost)).flatten()
+                margins, candidates, infeasible = self._screen_rollouts(horizon, initial_pose, cones)
+                initial_feasible_pct = 100.0 * len(candidates) / self.K
+                retry_target = min(CLEARANCE_SPEED_FLOOR_MPS, 0.5 * vr_eff)
+                if (self.clearance_speed is not None and infeasible == self.K
+                        and vr_eff - retry_target >= 0.05
+                        and float(swept_clearance(initial_pose, cones)[0]) > 0.0):
+                    # Keep the measured state and steering queue, and solve the same
+                    # sample bank against the slower reference and longitudinal target.
+                    vr_eff = retry_target
+                    vr_raw = min(vr_raw, vr_eff)
+                    pace_m = stage_reference(vr_eff)
+                    retry_roll_ms = self._run_rollout_batch(horizon, model_actuator)
+                    roll_ms += retry_roll_ms
+                    margins, candidates, infeasible = self._screen_rollouts(horizon, initial_pose, cones)
+                    clearance_audit.update(clearance_retry_target_mps=vr_eff,
+                                           clearance_retry_roll_ms=retry_roll_ms)
+                clearance_audit["clearance_infeasible_pct"] = 100.0 * infeasible / self.K
                 clearance_audit["clearance_feasible_count"] = len(candidates)
-                clearance_audit["clearance_best_margin_m"] = float(margins.max())
+                clearance_audit["clearance_invalid_count"] = self.K - len(candidates) - infeasible
+                clearance_audit["clearance_best_margin_m"] = float(
+                    margins.masked_fill(~torch.isfinite(margins), -math.inf).max())
                 blocked = not len(candidates)
             else:
-                clearance_audit["clearance_feasible_count"] = None if blocked else self.K
+                clearance_audit["clearance_infeasible_pct"] = None if blocked else 0.0
+                if not blocked:
+                    candidates = torch.nonzero(torch.isfinite(cost)).flatten()
+                    clearance_audit["clearance_feasible_count"] = len(candidates)
+                    clearance_audit["clearance_invalid_count"] = self.K - len(candidates)
+                    blocked = not len(candidates)
+            feasible_pct = None if candidates is None else 100.0 * len(candidates) / self.K
+            if initial_feasible_pct is None:
+                initial_feasible_pct = feasible_pct
+            clearance_audit["clearance_feasible_pct"] = feasible_pct
+            clearance_audit["clearance_initial_feasible_pct"] = initial_feasible_pct
+            clearance_audit["clearance_rollout_target_mps"] = vr_eff
+            if self.clearance_speed is not None:
+                # A successful slower retry does not cancel the original warning.
+                self.clearance_speed.observe(initial_feasible_pct, dt_ros)
+                if retry_roll_ms and not blocked:
+                    self.clearance_speed.cap_mps = min(self.clearance_speed.cap_mps, vr_eff)
+                clearance_audit["clearance_speed_next_cap_mps"] = self.clearance_speed.cap_mps
 
-        scored_cost = cost[candidates] if candidates is not None and len(candidates) else cost
-        c_lo = scored_cost.min()
-        c_spread = float(scored_cost.max() - c_lo)
-        lam = max(self.LAMBDA_FRAC * c_spread, self.LAMBDA_MIN)
-        wts = torch.exp(-(scored_cost - c_lo) / lam)
-        wts = wts / wts.sum()
-        scored_actions = A[candidates] if candidates is not None and len(candidates) else A
-        nom_new = (wts.unsqueeze(1) * scored_actions).sum(dim=0)
-        if self.cone_clearance and candidates is not None and len(candidates):
-            margin = self._check_selected(horizon, model_actuator, nom_new.unsqueeze(0), initial_pose, cones)
-            clearance_audit["clearance_weighted_margin_m"] = margin
-            if not margin > 0:
-                best = candidates[scored_cost.argmin()]
-                nom_new = A[best]
-                margin = float(margins[best])
-                clearance_audit["clearance_decision"] = "best_feasible"
-            clearance_audit["clearance_selected_margin_m"] = margin
+        weighted = None
+        n_eff, lam = 0.0, None
+        top_trajs = []
+        if blocked:
+            # An infeasible batch has no steering distribution to average.
+            nom_new = torch.zeros_like(self.nom[0])
+        else:
+            scored_cost = cost if candidates is None else cost[candidates]
+            c_lo = scored_cost.min()
+            c_spread = float(scored_cost.max() - c_lo)
+            lam = max(self.LAMBDA_FRAC * c_spread, self.LAMBDA_MIN)
+            logits = -(scored_cost - c_lo) / lam
+            if self.cone_clearance and len(cone_data):
+                logits = logits - clearance_log_penalty(margins[candidates])
+            wts = torch.exp(logits)
+            wts = wts / wts.sum()
+            scored_actions = A if candidates is None else A[candidates]
+            weighted = (wts.unsqueeze(1) * scored_actions).sum(dim=0)
+            nom_new = weighted
+            if self.cone_clearance and len(cone_data):
+                margin = self._check_selected(horizon, model_actuator, weighted.unsqueeze(0), initial_pose, cones)
+                clearance_audit["clearance_weighted_margin_m"] = margin
+                if not margin > 0:
+                    best = candidates[logits.argmax()]
+                    nom_new = A[best]
+                    margin = float(margins[best])
+                    clearance_audit["clearance_decision"] = "best_feasible"
+                clearance_audit["clearance_selected_margin_m"] = margin
+            n_eff = float(1.0 / (wts * wts).sum())
+            top = torch.topk(logits, k=min(10, len(logits))).indices
+            if candidates is not None:
+                top = candidates[top]
+            for idx in top.tolist():
+                top_trajs.append(list(zip(self._trajE[:horizon:5, idx].tolist(),
+                                          self._trajN[:horizon:5, idx].tolist())))
         if self.cone_clearance:
             clearance_audit.setdefault("clearance_decision",
                                        "missing_cone_map" if clearance_cones is None else
                                        "brake" if blocked else "weighted" if len(cone_data) else "no_nearby_cones")
-            clearance_audit["clearance_ms"] = (time.perf_counter() - clearance_start) * 1000.0
+            clearance_audit["clearance_ms"] = (time.perf_counter() - clearance_start) * 1000.0 - retry_roll_ms
         self.nom = nom_new.unsqueeze(0)
 
         # ---- diagnostics ----
         cost_min = float(cost.min())
         cost_max = float(cost.max())
-        n_eff    = float(1.0 / (wts * wts).sum())   # ~K degenerate, ~1 peaked
         a0_std   = float(A[:, 0].std())             # sample diversity at t=0
 
-        # ---- top-10 rollouts for the live visualiser (best first) ----
-        top_trajs = []
-        top = torch.topk(scored_cost, k=min(10, len(scored_cost)), largest=False).indices
-        if candidates is not None and len(candidates):
-            top = candidates[top]
-        for idx in top.tolist():
-            top_trajs.append(list(zip(self._trajE[:horizon:5, idx].tolist(),
-                                      self._trajN[:horizon:5, idx].tolist())))
-
         # ---- first action: feedforward + MPPI correction ----
-        ff0       = float(ff_t[0])
+        ff0       = float(self._ff[0])
         ff_part   = self.K_FF * ff0
         mppi_part = float(nom_new[0])
         steer_out = float(np.clip(ff_part + mppi_part, -smax0, smax0))
@@ -929,21 +995,19 @@ class MPPIController:
             self.nom = torch.cat([self.nom[:, 1:], self.nom[:, -1:]], dim=1)
 
         # ---- PI longitudinal with anti-windup ----
+        if blocked:
+            self.reset_steering_plan()
+            self.I_spd = 0.0
+            vr_eff = 0.0
         err  = vr_eff - _speed
         raw  = self.KP * err + self.KI * self.I_spd
         lon0 = float(np.clip(raw, -1.0, 1.0))
         # Integrate only when unsaturated AND near the setpoint; integrating
         # through transients wound up a bias that resisted braking into corners.
         saturated = (raw >= 1.0 and err > 0.0) or (raw <= -1.0 and err < 0.0)
-        if (not saturated) and abs(err) < self.I_BAND:
+        if not blocked and not saturated and abs(err) < self.I_BAND:
             self.I_spd = float(np.clip(self.I_spd + err * dt_ros, -self.I_CLAMP, self.I_CLAMP))
         accel_out = lon0 * self.ACCEL_MAX
-        if blocked:
-            self.reset_steering_plan()
-            self.I_spd = 0.0
-            self._vr_lp = 0.0
-            vr_eff = 0.0
-            accel_out = -self.ACCEL_MAX
 
         # ---- telemetry ----
         mean_traj   = self._viz_kinematic(x, y, yaw, steer_out, _speed)
@@ -956,27 +1020,35 @@ class MPPIController:
                   f"cur={self.cur}/{pd['N']} ahead={path_ahead:4.1f}m CTE={cte_val:+.2f} "
                   f"hd_err={float(heading_err):+.2f} | "
                   f"cost[{cost_min:.2f},{cost_max:.2f}] nEff={n_eff:.0f}/{self.K} "
-                  f"lam={lam:.3f} a0std={a0_std:.3f} I={self.I_spd:.2f}",
+                  f"lam={lam or 0.0:.3f} a0std={a0_std:.3f} I={self.I_spd:.2f}",
                   flush=True)
 
         # ---- optional CSV trace ----
         if self._csv is not None:
+            clearance_csv = []
+            for name in ("clearance_infeasible_pct", "clearance_weighted_margin_m", "clearance_selected_margin_m",
+                         "clearance_feasible_pct", "clearance_speed_cap_mps", "clearance_speed_next_cap_mps",
+                         "clearance_speed_base_target_mps", "clearance_initial_feasible_pct",
+                         "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps"):
+                value = clearance_audit.get(name)
+                clearance_csv.append(f"{value:.6f}" if value is not None and math.isfinite(value) else "")
             self._csv.write(
                 f"{time.time():.3f},{x:.3f},{y:.3f},{yaw:.4f},{speed:.3f},{_speed:.3f},"
                 f"{v_plan:.3f},{vr_eff:.3f},{steer_out:.4f},{accel_out:.3f},{lon0:.3f},"
                 f"{cte_val:.3f},{float(heading_err):.4f},{cost_min:.3f},{cost_max:.3f},"
                 f"{n_eff:.1f},{a0_std:.4f},{pace_m:.4f},{roll_ms:.1f},{self.I_spd:.3f},"
-                f"{self.yaw_rate:.4f},{self.cur},{pd['N']},{ff_part:.4f},{mppi_part:.4f}\n")
+                f"{self.yaw_rate:.4f},{self.cur},{pd['N']},{ff_part:.4f},{mppi_part:.4f},"
+                + ",".join(clearance_csv) + "\n")
             self._csv.flush()
 
         audit = {}
         if self.audit_enabled:
             audit = {
                 **clearance_audit,
-                "reference": torch.stack((refE[::5], refN[::5]), dim=-1).tolist(),
+                "reference": torch.stack((self._refE[:horizon:5], self._refN[:horizon:5]), dim=-1).tolist(),
                 "spline": np.column_stack((pd["rx_np"], pd["ry_np"])).tolist(),
                 "rollouts": top_trajs,
-                "weighted_steer_sequence": nom_new[:horizon].tolist(),
+                "weighted_steer_sequence": weighted[:horizon].tolist() if weighted is not None else [],
                 "rollout_speed_targets": self._vtgt[:horizon].tolist(),
                 "rollout_dt": 5 * self.DT_EFF,
                 "rollout_first_dt": self.DT_EFF,
@@ -1000,6 +1072,8 @@ class MPPIController:
                 "cur": self.cur,
                 "N": pd["N"],
             }
+            if weighted is not None and nom_new is not weighted:
+                audit["selected_steer_sequence"] = nom_new[:horizon].tolist()
             if model_actuator:
                 audit.update(wheel_angle_seed_rad=wheel_angle,
                              wheel_seed_from_feedback=measured_wheel,

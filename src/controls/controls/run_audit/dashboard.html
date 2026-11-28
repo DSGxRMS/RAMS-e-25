@@ -73,6 +73,19 @@ const series = [
   ["Latency (ms)", [["cycle_ms","Control cycle","#ffd166"],["roll_ms","Rollout compute","#6ea8fe"]]],
   ["Sampling and heading", [["n_eff","Effective sample count","#7ce5b5"],["heading_err","Heading error (rad), right axis","#f3a7c6","right"]]]
 ];
+if (rows.some(r=>Number.isFinite(r.actual_clearance_margin_m) || Number.isFinite(r.clearance_weighted_margin_m))) {
+  series.push(["Clearance margin (m)", [["actual_clearance_margin_m","Measured with margin","#83baff"],
+    ["clearance_weighted_margin_m","Weighted prediction","#ffc857"],
+    ["clearance_selected_margin_m","Selected prediction","#72e2b3"]]]);
+}
+if (rows.some(r=>Number.isFinite(r.clearance_infeasible_pct))) {
+  series.push(["Rollouts rejected by clearance (%)", [["clearance_infeasible_pct","Infeasible","#f47488"]]]);
+}
+if (rows.some(r=>Number.isFinite(r.clearance_speed_cap_mps))) {
+  series.push(["Clearance speed governor (m/s)", [["clearance_speed_base_target_mps","Target before clearance","#ecc489"],
+    ["clearance_speed_cap_mps","Applied clearance cap","#83baff"],["clearance_retry_target_mps","Retry target","#e38df8"],
+    ["target_speed","Command target","#72e2b3"]]]);
+}
 const layerList = [
   ["trail","Driven path","#698daa"],["reference","Fixed course","#c5a3fd"],["pp","Fresh raw PP","#9faec2"],
   ["buffer","Buffered path","#61dfef"],["spline","MPPI spline","#479cfa"],["desired","Scored reference","#ffd166"],
@@ -86,6 +99,9 @@ const cards = [["Distance",format(s.distance_m,1)+" m"],["Peak speed",format(s.p
   ["Speed RMSE",format(s.speed_error_mps.rms)+" m/s"],["P95 |CTE|",format(s.cross_track_m.p95)+" m"],
   ["P95 rollout",format(s.rollout_ms.p95,0)+" ms"],["Usable PP",s.pp.valid_messages+"/"+s.pp.messages],
   ["Observed cone hits",s.contact.unique_cones ?? "Unknown"]];
+if (s.actual_clearance?.observed_poses) {
+  cards.push(["Minimum measured body gap",format(s.actual_clearance.min_m)+" m"]);
+}
 for (const [label,value] of cards) {
   const box = document.createElement("div"); box.className="card";
   const name = document.createElement("small"); name.textContent=label;
@@ -217,12 +233,23 @@ function choose(i) {
     ["Buffered path",r.buffer_points+" points"],["Ahead / CTE",format(r.ahead_eff)+" / "+format(r.cte)+" m"],
     ["Horizon / roll time",(r.horizon??"—")+" / "+format(r.roll_ms,0)+" ms"],
     ["Blue / yellow in FOV",(r.blue_in_fov??"—")+" / "+(r.yellow_in_fov??"—")],
-    ["Nearest cone center",format(r.cone_center_distance_m)+" m"]];
+    ["Nearest cone center",format(r.cone_center_distance_m)+" m"],
+    ["Measured body gap",format(r.actual_clearance_m)+" m"]];
   if(r.clearance_decision) {
     stats.push(["Clearance decision",r.clearance_decision],
       ["Feasible rollouts",(r.clearance_feasible_count??"—")],
+      ["Clearance-infeasible rollouts",format(r.clearance_infeasible_pct,1)+"%"],
+      ["Weighted clearance",format(r.clearance_weighted_margin_m)+" m"],
       ["Selected clearance",format(r.clearance_selected_margin_m)+" m"],
       ["Clearance work",format(r.clearance_ms,1)+" ms"]);
+    if(Number.isFinite(r.clearance_speed_cap_mps)) {
+      stats.push(["Feasible fraction",format(r.clearance_feasible_pct,1)+"%"],
+        ["Clearance speed cap / next",format(r.clearance_speed_cap_mps)+" / "+format(r.clearance_speed_next_cap_mps)+" m/s"]);
+    }
+    if(Number.isFinite(r.clearance_retry_target_mps)) {
+      stats.push(["Retry target / duration",format(r.clearance_retry_target_mps)+" m/s / "+format(r.clearance_retry_roll_ms,1)+" ms"],
+        ["Feasible before / after",format(r.clearance_initial_feasible_pct,1)+"% / "+format(r.clearance_feasible_pct,1)+"%"]);
+    }
   }
   $("detail").replaceChildren();
   for(const [label,value] of stats) {

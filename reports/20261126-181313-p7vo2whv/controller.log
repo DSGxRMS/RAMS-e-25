@@ -1,0 +1,50 @@
+Waiting for first odometry message...
+First position received.
+[MPPI] GPU NVIDIA GeForce RTX 4050 Laptop GPU (6.4 GB) + CUDA graph
+[MPPI] sampling seed=42
+[MPPI] EUFS steering actuator model=on
+[MPPI] dynamics=exp13 checkpoint=/home/telsu_2005/RAMS-abh/build/controls/controls/fs_model/exp13_stage1_pretrained.pt
+[MPPI] Loaded exp13_stage1_pretrained.pt  K=1024  T=200/400 (@<3.0 m/s)  dt_eff=0.005s  RK4=True
+[MPPI] CSV trace -> /home/telsu_2005/RAMS-abh/runs/20261126-181313-p7vo2whv/mppi.csv
+[MPPI] CUDA graph captured (horizon=200 = 1.0s)
+[MPPI] CUDA graph captured (horizon=400 = 2.0s)
+[MPPI] startup warm-up complete: graphs live for T=200/400
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+[PSEUDO] no fit: wall skew 88 deg > 75 limit
+
+[control_node] stopped by user.
+[control_node] generating trajectory plot...
+[plot] not enough data

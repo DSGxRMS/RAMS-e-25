@@ -1,0 +1,107 @@
+{
+  "model": "exp13",
+  "observed_seconds": 69.248770387,
+  "clock_resets": 0,
+  "invalid_json_rows": 0,
+  "clean_end": true,
+  "sample_basis": "cycle",
+  "message_counts": {
+    "buffer": 0,
+    "clock_epoch": 1,
+    "cmd": 683,
+    "contact_native": 0,
+    "contact_ros": 0,
+    "coverage": 3,
+    "cycle": 683,
+    "end": 1,
+    "gt": 9211,
+    "gt_cones": 4605,
+    "gt_steering": 9209,
+    "map_cones": 4274,
+    "meta": 1,
+    "odom_raw": 8550,
+    "odom_slam": 4275,
+    "pp": 825,
+    "pseudo": 0,
+    "rollouts": 0
+  },
+  "distance_m": 0.0,
+  "speed_error_mps": {
+    "n": 683,
+    "median": 0.0,
+    "p95": 0.0,
+    "max": 0.0,
+    "rms": 0.0
+  },
+  "cross_track_m": {
+    "n": 0,
+    "median": null,
+    "p95": null,
+    "max": null,
+    "rms": null
+  },
+  "peak_actual_speed": 0.0,
+  "rollout_ms": {
+    "n": 0,
+    "median": null,
+    "p95": null,
+    "max": null,
+    "rms": null
+  },
+  "cycle_ms": {
+    "n": 683,
+    "median": 0.5679210000835155,
+    "p95": 0.9334717000228918,
+    "max": 7.491987000094014,
+    "rms": 0.7125161212994381
+  },
+  "command_interval_ms": {
+    "n": 682,
+    "median": 101.14257349999889,
+    "p95": 105.97125155000063,
+    "max": 274.5720569999932,
+    "rms": 101.90346254082782
+  },
+  "overshoot": {
+    "threshold_mps": 0.25,
+    "episodes": 0,
+    "samples_braking": 0
+  },
+  "deviation": {
+    "threshold_m": 1.0,
+    "episodes": 0
+  },
+  "steering_near_limit_fraction": 0.0,
+  "modes": {
+    "no_path": 683
+  },
+  "pp": {
+    "messages": 825,
+    "valid_messages": 0,
+    "unique_valid_geometry": 0,
+    "minimum_points": 5,
+    "freshness_s": 0.5,
+    "unavailable_seconds": 69.248770387,
+    "dropouts": 1
+  },
+  "contact": {
+    "episodes": 0,
+    "unique_cones": 0,
+    "episode_gap_s": 0.4,
+    "native_payload": true,
+    "ros_payload": false,
+    "partial_or_unknown": true,
+    "coverage": [
+      {
+        "contact_topic": "/gazebo/skidpad/physics/contacts"
+      },
+      {
+        "native_contact_payload": true
+      },
+      {
+        "contact_stream_end": "/gazebo/skidpad/physics/contacts"
+      }
+    ]
+  },
+  "closest_mapped_cone_center_m": 3.773843687705799
+}

@@ -9,6 +9,10 @@ import math
 import re
 from pathlib import Path
 
+from controls.cone_clearance import (
+    LARGE_CONE_RADIUS_M, MARGIN_M, SMALL_CONE_RADIUS_M, measured_footprint_gap,
+)
+
 
 def percentile(values, q):
     ordered = sorted(v for v in values if v is not None and math.isfinite(v))
@@ -181,8 +185,9 @@ def read_mppi(path):
         rows = []
         for row in csv.DictReader(handle):
             try:
-                data = {key: float(value) for key, value in row.items()}
-                if not all(math.isfinite(value) for value in data.values()):
+                data = {key: float(value) for key, value in row.items()
+                        if value not in ("", None)}
+                if "time" not in data or not all(math.isfinite(value) for value in data.values()):
                     continue
             except (ValueError, TypeError):
                 continue
@@ -200,6 +205,22 @@ def save_csv(path, rows, columns=None):
             writer.writerows(rows)
 
 
+def observed_clearance(rows):
+    """Measure each Gazebo cone observation at its own car-relative pose."""
+    measurements = []
+    for row in rows:
+        if row.get("frame") != "base_footprint" or not row.get("stamp_ns"):
+            continue
+        cones = []
+        for kind, group in row["data"].items():
+            radius = LARGE_CONE_RADIUS_M if kind in ("big_orange", "unknown_color") else SMALL_CONE_RADIUS_M
+            cones.extend((p[0], p[1], radius) for p in points(group)
+                         if math.isfinite(p[0]) and math.isfinite(p[1]))
+        measurements.append(dict(t=row["t"], stamp_ns=row["stamp_ns"],
+                                 gap_m=measured_footprint_gap(cones), cone_count=len(cones)))
+    return Lookup(measurements)
+
+
 def analyze(args):
     streams, invalid_rows = load_archive(args.run / "events.jsonl")
     meta = next((r["data"] for r in streams["meta"]), {})
@@ -207,6 +228,7 @@ def analyze(args):
               ("gt", "pp", "buffer", "pseudo", "rollouts", "cmd", "map_cones",
                "odom_raw", "odom_slam", "gt_steering")}
     legacy_csv = read_mppi(args.run / "mppi.csv")
+    clearance_observations = observed_clearance(streams["gt_cones"])
     reference = read_reference(args.reference)
     contacts = contact_episodes(streams, meta, args.contact_gap)
     commands = streams["cmd"]
@@ -233,13 +255,23 @@ def analyze(args):
             if last and (stamp is None or last_stamp is None or stamp >= last_stamp):
                 distance += math.hypot(position[0][0] - last[0], position[0][1] - last[1])
             last, last_stamp = position[0], stamp
+        clearance = clearance_observations.nearest(record["t"], .25)
+        if not (clearance and record.get("stamp_ns")
+                and abs(clearance["stamp_ns"] - record["stamp_ns"]) <= 50_000_000):
+            clearance = {}
+        gap = clearance.get("gap_m")
         gt_frames.append(dict(t=record["t"], sim_ns=record.get("sim_ns"), stamp_ns=record.get("stamp_ns"),
                               x=data["xy"][0], y=data["xy"][1], yaw=data["yaw"],
                               vx=data["vx"], vy=data["vy"], yaw_rate=data["yaw_rate"],
                               distance=distance, target_speed=command.get("speed"),
                               acceleration_command=command.get("acceleration"),
                               steering_command=command.get("steering_angle"),
-                              command_age_s=record["t"] - held["t"] if held else None))
+                              command_age_s=record["t"] - held["t"] if held else None,
+                              actual_clearance_m=gap,
+                              actual_clearance_margin_m=gap - MARGIN_M if gap is not None else None,
+                              actual_clearance_stamp_ns=clearance.get("stamp_ns"),
+                              actual_clearance_cone_count=clearance.get("cone_count")))
+    gt_by_time = {row["t"]: row for row in gt_frames}
     for row in basis:
         t, cycle = row["t"], row["data"] if row["kind"] == "cycle" else {}
         legacy = (legacy_csv.get(row["wall_ns"] / 1e9 + .005, .25).get("data", {})
@@ -288,6 +320,7 @@ def analyze(args):
         best_tracking_rms = metrics([math.hypot(p[0] - q[0], p[1] - q[1])
                                      for p, q in zip(best, ref)])["rms"]
         sim_ns = cycle.get("sim_ns", row.get("sim_ns"))
+        measured = gt_by_time.get(actual.get("t"), {})
         sample = dict(t=t, sim_s=(sim_ns - anchor) / 1e9 if sim_ns is not None and anchor is not None else None,
                       mode=cycle.get("mode"), model=cycle.get("model"),
                       x=actual_xy[0] if actual_xy else None, y=actual_xy[1] if actual_xy else None,
@@ -306,7 +339,11 @@ def analyze(args):
                       actual_to_course_m=distance_to_path(actual_xy, reference, True),
                       cte=cycle.get("cte", legacy.get("cte")), best_to_ref_rms_m=best_tracking_rms,
                       predicted_paths=len(rollouts), scored_reference_points=len(ref),
-                      cone_center_distance_m=closest, odom_frame_delta_m=split)
+                      cone_center_distance_m=closest, odom_frame_delta_m=split,
+                      actual_clearance_m=measured.get("actual_clearance_m"),
+                      actual_clearance_margin_m=measured.get("actual_clearance_margin_m"),
+                      actual_clearance_stamp_ns=measured.get("actual_clearance_stamp_ns"),
+                      actual_clearance_cone_count=measured.get("actual_clearance_cone_count"))
         for key in ("speed_used", "raw_target_speed", "corner_speed", "speed_cap", "path_ahead",
                     "ahead_eff", "heading_err", "roll_ms", "cycle_ms", "horizon", "n_eff",
                     "cost_min", "cost_max", "temperature", "a0_std", "I_spd", "ff_part", "mppi_part",
@@ -317,9 +354,13 @@ def analyze(args):
                     "wheel_seed_from_feedback", "steering_publish_delay_estimate_s",
                     "steering_prefix_steps", "pose_stamp_sim_s", "steering_state_sim_s",
                     "wheel_feedback_stamp_sim_s", "steering_warm_start_elapsed_steps",
-                    "clearance_cone_count", "clearance_feasible_count", "clearance_best_margin_m",
+                    "clearance_cone_count", "clearance_feasible_count", "clearance_infeasible_pct",
+                    "clearance_invalid_count", "clearance_best_margin_m",
                     "clearance_weighted_margin_m", "clearance_selected_margin_m",
-                    "clearance_decision", "clearance_ms"):
+                    "clearance_decision", "clearance_ms", "clearance_feasible_pct",
+                    "clearance_speed_cap_mps", "clearance_speed_next_cap_mps",
+                    "clearance_speed_base_target_mps", "clearance_initial_feasible_pct",
+                    "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.
@@ -403,7 +444,30 @@ def analyze(args):
         summary["clearance"] = dict(
             decisions=dict(collections.Counter(r["clearance_decision"] for r in clearance_rows)),
             check_ms=metrics([r["clearance_ms"] for r in clearance_rows]),
-            feasible_rollouts=metrics([r["clearance_feasible_count"] for r in clearance_rows]))
+            feasible_rollouts=metrics([r["clearance_feasible_count"] for r in clearance_rows]),
+            feasible_pct=metrics([r["clearance_feasible_pct"] for r in clearance_rows]),
+            infeasible_pct=metrics([r["clearance_infeasible_pct"] for r in clearance_rows]),
+            invalid_rollouts=metrics([r["clearance_invalid_count"] for r in clearance_rows]),
+            weighted_margin_m=metrics([r["clearance_weighted_margin_m"] for r in clearance_rows]),
+            selected_margin_m=metrics([r["clearance_selected_margin_m"] for r in clearance_rows]))
+    speed_rows = [r for r in timeline if r["clearance_speed_cap_mps"] is not None
+                  and r["clearance_speed_base_target_mps"] is not None]
+    if speed_rows:
+        retries = [r for r in speed_rows if r["clearance_retry_target_mps"] is not None]
+        summary["clearance_speed"] = dict(
+            cycles=len(speed_rows),
+            limited_cycles=sum(r["clearance_speed_cap_mps"] < r["clearance_speed_base_target_mps"]
+                               for r in speed_rows),
+            minimum_cap_mps=min(r["clearance_speed_cap_mps"] for r in speed_rows),
+            retries=len(retries),
+            successful_retries=sum((r["clearance_feasible_pct"] or 0) > 0 for r in retries),
+            retry_roll_ms=metrics([r["clearance_retry_roll_ms"] for r in retries]))
+    actual_gaps = [r["actual_clearance_m"] for r in gt_frames if r["actual_clearance_m"] is not None]
+    summary["actual_clearance"] = dict(
+        observed_poses=len(actual_gaps), total_poses=len(gt_frames), configured_margin_m=MARGIN_M,
+        min_m=min(actual_gaps, default=None), p05_m=percentile(actual_gaps, .05),
+        below_margin_poses=sum(gap < MARGIN_M for gap in actual_gaps),
+        overlap_poses=sum(gap < 0 for gap in actual_gaps))
 
     for event in contacts:
         at = lookup["gt"].nearest(event["t"], .25).get("data", {})
