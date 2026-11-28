@@ -242,6 +242,9 @@ function choose(i) {
       ["Weighted clearance",format(r.clearance_weighted_margin_m)+" m"],
       ["Selected clearance",format(r.clearance_selected_margin_m)+" m"],
       ["Clearance work",format(r.clearance_ms,1)+" ms"]);
+    if(Number.isFinite(r.clearance_escape_count)) {
+      stats.push(["Crawl-only escape rollouts",r.clearance_escape_count]);
+    }
     if(Number.isFinite(r.clearance_speed_cap_mps)) {
       stats.push(["Feasible fraction",format(r.clearance_feasible_pct,1)+"%"],
         ["Clearance speed cap / next",format(r.clearance_speed_cap_mps)+" / "+format(r.clearance_speed_next_cap_mps)+" m/s"]);

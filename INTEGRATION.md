@@ -164,7 +164,7 @@ For a timing A/B test, leave `MPPI_STEERING_ACTUATOR=1` and `MPPI_STEERING_SYNC=
 
 Exp13 enables cone clearance and clearance-based speed limiting by default. For a baseline run, set `MPPI_CONE_CLEARANCE=0`. To keep the clearance steering checks and disable only the speed limit add-on, set `MPPI_CLEARANCE_SPEED=0`. Restart from a fresh world for each comparison. In the report, check feasible rollouts, the applied speed cap, the rollout target, and the selected margin. Use the default simulator car and its normal ground-truth cone stream.
 
-With clearance speed limiting enabled, Exp13 can retry at 0.5 m/s when the current batch has no cone-clear path. If the valid paths still overlap a cone, it follows the best-scoring crawl candidate and records `clearance_crawl`. The normal speed cap recovers as feasible paths return.
+Clearance uses a conservative eight-sided outline of the default EUFS chassis, the four tyre boxes, and a 0.10 m cone buffer. With clearance speed limiting enabled, Exp13 can retry at 0.5 m/s when the current batch has no fully clear path. It prefers crawl paths that improve the gap to each cone already inside the buffer and keep the full buffer around the other cones. These paths are recorded as the `escape` decision within `clearance_crawl`. If there are no such paths, the existing crawl fallback can still accept a cone contact. The normal speed cap recovers as fully clear paths return.
 
 ## Troubleshooting
 

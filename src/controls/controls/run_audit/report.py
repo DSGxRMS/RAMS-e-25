@@ -360,7 +360,8 @@ def analyze(args):
                     "clearance_decision", "clearance_ms", "clearance_feasible_pct",
                     "clearance_speed_cap_mps", "clearance_speed_next_cap_mps",
                     "clearance_speed_base_target_mps", "clearance_initial_feasible_pct",
-                    "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps"):
+                    "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps",
+                    "clearance_escape_count"):
             sample[key] = cycle.get(key, legacy.get(key))
         timeline.append(sample)
         # Keep per-command geometry in the HTML. All original ROS frames are in the archive.
@@ -445,6 +446,7 @@ def analyze(args):
             decisions=dict(collections.Counter(r["clearance_decision"] for r in clearance_rows)),
             check_ms=metrics([r["clearance_ms"] for r in clearance_rows]),
             feasible_rollouts=metrics([r["clearance_feasible_count"] for r in clearance_rows]),
+            escape_rollouts=metrics([r["clearance_escape_count"] for r in clearance_rows]),
             feasible_pct=metrics([r["clearance_feasible_pct"] for r in clearance_rows]),
             infeasible_pct=metrics([r["clearance_infeasible_pct"] for r in clearance_rows]),
             invalid_rollouts=metrics([r["clearance_invalid_count"] for r in clearance_rows]),

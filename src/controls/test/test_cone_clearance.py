@@ -6,7 +6,7 @@ import torch
 
 from controls.cone_clearance import (
     ClearanceSpeedGovernor, clearance_log_penalty, cone_clearance_enabled,
-    measured_footprint_gap, swept_clearance,
+    measured_footprint_gap, swept_clearance, swept_clearance_with_escape,
 )
 
 
@@ -15,6 +15,12 @@ def test_projected_footprint_covers_wheels_and_respects_heading():
     result = swept_clearance(poses, torch.tensor([[.79, .90, .15]]))
     assert result[0] < 0
     assert result[1] > 0
+
+
+def test_tapered_nose_clears_the_previous_false_overlap():
+    stopped_pose_cone = (1.36023, -.68876, .15)
+    assert measured_footprint_gap([stopped_pose_cone]) > .10
+    assert measured_footprint_gap([(1.82, 0., .15)]) < 0
 
 
 def test_clearance_covers_motion_between_sampled_poses():
@@ -35,6 +41,38 @@ def test_measured_gap_uses_the_same_footprint_without_rollout_padding():
         predicted = swept_clearance(poses, torch.tensor(cones))[0].item()
         assert math.isclose(measured - .10, predicted, abs_tol=1e-6)
     assert measured_footprint_gap([]) is None
+
+
+def test_escape_checks_progress_and_reentry_for_the_same_cone():
+    # Both starts are in the buffer. The lower y case also begins in contact
+    # with the planar footprint.
+    paths = [
+        [0., -.01, -.02, -.04, -.07, -.15],    # moves away and clears
+        [0., -.005, -.01, -.02, -.025, -.03],  # measurable progress inside the buffer
+        [0., .01, .02, -.04, -.07, -.15],      # deepens overlap before moving away
+        [0., 0., 0., 0., 0., 0.],             # no progress
+        [0., -.09, -.15, -.04, -.01, -.15],    # leaves the buffer and re-enters
+    ]
+    poses = torch.zeros(6, len(paths), 3)
+    poses[..., 1] = torch.tensor(paths).T
+    for cone_y in (.90, .82):
+        margins, escaping = swept_clearance_with_escape(poses, torch.tensor([[0., cone_y, .15]]))
+        assert (margins <= 0).all()
+        assert escaping.tolist() == [True, True, False, False, False]
+
+
+def test_escape_requires_clearance_from_each_other_cone():
+    poses = torch.zeros(6, 1, 3)
+    poses[:, 0, 1] = torch.linspace(0, -.25, 6)
+    first = torch.tensor([[0., .90, .15]])
+    second = torch.tensor([[0., -1.03, .15]])
+    _, allowed = swept_clearance_with_escape(poses, first)
+    assert allowed.item()
+    _, allowed = swept_clearance_with_escape(poses, torch.cat((first, second)))
+    assert not allowed.item()
+    # A second cone already inside the buffer also has to improve on its own.
+    _, allowed = swept_clearance_with_escape(poses, torch.tensor([[0., .90, .15], [0., -.90, .15]]))
+    assert not allowed.item()
 
 
 def test_clearance_penalty_strongly_discounts_small_positive_margins():
@@ -131,17 +169,23 @@ def test_clearance_crawl_retimes_rollouts_and_preserves_path_stops(monkeypatch):
                 assert "clearance_retry_target_mps" not in audit
                 assert acceleration > 0.0
 
-            _, _, next_step = solve(1.15, .5, [])
+            _, _, away = solve(1.15, .5, [(-1.20, 0., .15)])
+            assert away["audit"]["clearance_decision"] == "escape"
+            assert away["audit"]["clearance_escape_count"] > 0
+            assert away["audit"]["clearance_feasible_pct"] == 0.0
+            assert away["target_speed"] == away["audit"]["clearance_speed_next_cap_mps"] == .5
+
+            _, _, next_step = solve(1.20, .5, [])
             assert not next_step["clearance_crawl"]
             assert next_step["target_speed"] == .5
             assert math.isclose(next_step["audit"]["clearance_speed_next_cap_mps"], .575)
 
-            _, acceleration, stopped = solve(1.20, .8, None)
+            _, acceleration, stopped = solve(1.25, .8, None)
             assert stopped["clearance_blocked"] and stopped["target_speed"] == 0.0
             assert math.isclose(acceleration, -1.2)
 
             controller.update_path([(0., 0.), (.7, 0.)])
-            _, _, end_of_path = solve(1.25, 0.0, obstacle)
+            _, _, end_of_path = solve(1.30, 0.0, obstacle)
             assert end_of_path["clearance_blocked"] and not end_of_path["clearance_crawl"]
             assert end_of_path["target_speed"] == 0.0
     finally:

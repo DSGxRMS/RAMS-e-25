@@ -38,7 +38,7 @@ from scipy.interpolate import splprep, splev
 from controls.path_reference import project_reference
 from controls.cone_clearance import (
     CLEARANCE_CRAWL_MPS, ClearanceSpeedGovernor, clearance_log_penalty,
-    cone_clearance_enabled, nearby_cones, swept_clearance,
+    cone_clearance_enabled, nearby_cones, swept_clearance, swept_clearance_with_escape,
 )
 from controls.random_seed import sampling_seed
 from controls.steering_actuator import SteeringActuator, steering_actuator_enabled, steering_option
@@ -379,7 +379,8 @@ class MPPIController:
                 "clearance_infeasible_pct,clearance_weighted_margin_m,clearance_selected_margin_m,"
                 "clearance_feasible_pct,clearance_speed_cap_mps,clearance_speed_next_cap_mps,"
                 "clearance_speed_base_target_mps,clearance_initial_feasible_pct,"
-                "clearance_retry_target_mps,clearance_retry_roll_ms,clearance_rollout_target_mps\n")
+                "clearance_retry_target_mps,clearance_retry_roll_ms,clearance_rollout_target_mps,"
+                "clearance_escape_count\n")
             print(f"[MPPI] CSV trace -> {csv_path}", flush=True)
 
         # ---- P18-g: eager dual-horizon warm-up (closes tracker item P4) ----
@@ -396,11 +397,12 @@ class MPPIController:
                 self._capture_graph(h)
                 if self.cone_clearance:
                     self._capture_selected_graph(h, self.steering_actuator_enabled)
-                    # Exercise the variable-size geometry path before the first command.
+                    # Exercise strict and crawl geometry before the first command.
                     initial = torch.zeros((1, 1, 3), device=dev)
-                    cones = torch.tensor([[float(i), 3., .16] for i in range(16)], device=dev)
+                    cones = torch.tensor([[-1.20, 0., .15]] +
+                                         [[float(i), 3., .16] for i in range(15)], device=dev)
                     poses = torch.stack((self._trajE[:h], self._trajN[:h], self._trajYaw[:h]), dim=-1)
-                    swept_clearance(torch.cat((initial.expand(1, self.K, 3), poses)), cones)
+                    swept_clearance_with_escape(torch.cat((initial.expand(1, self.K, 3), poses)), cones)
                     self._check_selected(h, self.steering_actuator_enabled,
                                          self._selected_actions, initial, cones)
             print(f"[MPPI] startup warm-up complete: graphs live for "
@@ -579,14 +581,19 @@ class MPPIController:
             self._rollout(horizon, model_actuator)
         return (time.perf_counter() - start) * 1000.0
 
-    def _screen_rollouts(self, horizon, initial_pose, cones):
+    def _screen_rollouts(self, horizon, initial_pose, cones, *, check_escape=False):
         poses = torch.stack((self._trajE[:horizon], self._trajN[:horizon],
                              self._trajYaw[:horizon]), dim=-1)
-        margins = swept_clearance(torch.cat((initial_pose.expand(1, self.K, 3), poses)), cones)
+        poses = torch.cat((initial_pose.expand(1, self.K, 3), poses))
+        if check_escape:
+            margins, escaping = swept_clearance_with_escape(poses, cones)
+        else:
+            margins = swept_clearance(poses, cones)
         valid = torch.isfinite(margins) & torch.isfinite(self._cost)
         clear = margins > 0
         candidates = torch.nonzero(valid & clear).flatten()
-        return margins, candidates, int((valid & ~clear).sum())
+        escapes = torch.nonzero(valid & escaping).flatten() if check_escape else None
+        return margins, candidates, int((valid & ~clear).sum()), escapes
 
     # =====================================================================
     #  update_path — spline the buffer, build reference + speed profile
@@ -875,6 +882,7 @@ class MPPIController:
         # equal-weighted -> MPPI = noise). Scale it to the actual spread.
         blocked = False
         crawl = False
+        escapes = None
         candidates = None
         if self.cone_clearance:
             clearance_start = time.perf_counter()
@@ -888,23 +896,27 @@ class MPPIController:
             if len(cone_data):
                 cones = torch.as_tensor(cone_data, device=dev)
                 initial_pose = torch.as_tensor([x, y, yaw], dtype=self._trajE.dtype, device=dev).view(1, 1, 3)
-                margins, candidates, infeasible = self._screen_rollouts(horizon, initial_pose, cones)
-                initial_feasible_pct = 100.0 * len(candidates) / self.K
                 crawl_target = min(CLEARANCE_CRAWL_MPS, vr_raw, vr_eff)
-                if (self.clearance_speed is not None and not len(candidates) and infeasible
-                        and crawl_target > 0.0 and not exhausted):
+                can_crawl = self.clearance_speed is not None and crawl_target > 0.0 and not exhausted
+                margins, candidates, infeasible, escapes = self._screen_rollouts(
+                    horizon, initial_pose, cones, check_escape=can_crawl and vr_eff <= crawl_target)
+                initial_feasible_pct = 100.0 * len(candidates) / self.K
+                if can_crawl and not len(candidates) and infeasible:
                     if vr_eff > crawl_target:
                         # Reuse the measured state, queued steering and candidate bank.
                         vr_eff = vr_raw = crawl_target
                         pace_m = stage_reference(vr_eff)
                         retry_roll_ms = self._run_rollout_batch(horizon, model_actuator)
                         roll_ms += retry_roll_ms
-                        margins, candidates, infeasible = self._screen_rollouts(horizon, initial_pose, cones)
+                        margins, candidates, infeasible, escapes = self._screen_rollouts(
+                            horizon, initial_pose, cones, check_escape=True)
                         clearance_audit.update(clearance_retry_target_mps=vr_eff,
                                                clearance_retry_roll_ms=retry_roll_ms)
                     crawl = not len(candidates) and infeasible > 0
                 clearance_audit["clearance_infeasible_pct"] = 100.0 * infeasible / self.K
                 clearance_audit["clearance_feasible_count"] = len(candidates)
+                if escapes is not None:
+                    clearance_audit["clearance_escape_count"] = len(escapes)
                 clearance_audit["clearance_invalid_count"] = self.K - len(candidates) - infeasible
                 clearance_audit["clearance_best_margin_m"] = float(
                     margins.masked_fill(~torch.isfinite(margins), -math.inf).max())
@@ -929,7 +941,11 @@ class MPPIController:
                     self.clearance_speed.cap_mps = min(self.clearance_speed.cap_mps, CLEARANCE_CRAWL_MPS)
                 clearance_audit["clearance_speed_next_cap_mps"] = self.clearance_speed.cap_mps
             if crawl:
-                candidates = torch.nonzero(torch.isfinite(margins) & torch.isfinite(cost)).flatten()
+                if escapes is not None and len(escapes):
+                    candidates = escapes
+                    clearance_audit["clearance_decision"] = "escape"
+                else:
+                    candidates = torch.nonzero(torch.isfinite(margins) & torch.isfinite(cost)).flatten()
                 blocked = False
 
         weighted = None
@@ -951,8 +967,8 @@ class MPPIController:
                 best = candidates[logits.argmax()]
                 nom_new = A[best]
                 n_eff = 1.0
-                clearance_audit.update(clearance_decision="crawl",
-                                       clearance_selected_margin_m=float(margins[best]))
+                clearance_audit.setdefault("clearance_decision", "crawl")
+                clearance_audit["clearance_selected_margin_m"] = float(margins[best])
             else:
                 wts = torch.exp(logits)
                 wts = wts / wts.sum()
@@ -1041,7 +1057,8 @@ class MPPIController:
             for name in ("clearance_infeasible_pct", "clearance_weighted_margin_m", "clearance_selected_margin_m",
                          "clearance_feasible_pct", "clearance_speed_cap_mps", "clearance_speed_next_cap_mps",
                          "clearance_speed_base_target_mps", "clearance_initial_feasible_pct",
-                         "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps"):
+                         "clearance_retry_target_mps", "clearance_retry_roll_ms", "clearance_rollout_target_mps",
+                         "clearance_escape_count"):
                 value = clearance_audit.get(name)
                 clearance_csv.append(f"{value:.6f}" if value is not None and math.isfinite(value) else "")
             self._csv.write(
