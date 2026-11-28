@@ -1,6 +1,6 @@
 # Run the RAMS-e-25 stack in Gazebo
 
-Use branch `abh_soum_integration` for the ground-truth EUFS Small Track stack, with Abhi's path planner and Soumil's mirror-symmetric Exp13 Neural ODE MPPI. This guide uses the Gazebo GUI. All commands below are for Bash in Ubuntu 20.04, including Ubuntu 20.04 under WSL 2. For controller changes, verification and upcoming objectives, see the [controls changelog](changes-controls.md).
+The `srijan` branch runs the ground-truth EUFS stack with the TEL planner and Exp13 MPPI. This guide uses the Gazebo GUI. Run the commands in Bash in Ubuntu 20.04, including Ubuntu 20.04 under WSL 2. For controller changes, see the [controls changelog](changes-controls.md).
 
 ## 1. Set up ROS and EUFS once
 
@@ -37,36 +37,33 @@ The last command should print the installed EUFS launcher path. The simulator so
 
 ## 2. Get and build the team stack
 
-For a new checkout:
+In WSL, enter the Windows checkout you edit. Adjust the path if your checkout is elsewhere.
 
 ```bash
-git clone --branch abh_soum_integration https://github.com/DSGxRMS/RAMS-e-25.git "$HOME/RAMS-e-25-integration"
-cd "$HOME/RAMS-e-25-integration"
-```
-
-For an existing checkout, change into its actual directory. For example, it may be `~/RAMS-e-25-shared` or `/mnt/d/RAMSe/RAMS-e-25-integration`. On the shared branch:
-
-```bash
+cd /mnt/c/Code/RMS/RAMS-e-25
 git branch --show-current
-# Expect abh_soum_integration. Keep any local changes before switching branches.
-git pull --ff-only origin abh_soum_integration
+bash scripts/run_integration.sh build
 ```
 
-Build from the repository root:
+The launcher builds directly from this checkout into `~/rams-wsl/build` and `~/rams-wsl/install`. Build logs go to `~/rams-wsl/log`. If you have not created the Galactic venv yet, follow step 3 or set `RAMS_ROS_PYTHON=/usr/bin/python3` if the system interpreter has your ROS and numerical dependencies.
+
+After editing only controls, rebuild and then restart the controls terminal. Use `build` without a package name after switching branches or changing multiple packages.
+
+```bash
+bash /mnt/c/Code/RMS/RAMS-e-25/scripts/run_integration.sh build controls
+```
+
+To run ROS diagnostics directly from the checkout, source the EUFS underlay and the WSL install.
 
 ```bash
 source scripts/setup_integration.sh
-colcon build --base-paths bringup src --packages-select bringup perception slam pathplanning controls
-source install/setup.bash
+source "${RAMS_WSL_WORKSPACE:-$HOME/rams-wsl}/install/local_setup.bash"
 ros2 pkg prefix eufs_launcher
 ros2 pkg prefix bringup
 ros2 pkg executables controls
-/usr/bin/python3 -c 'import rclpy, eufs_msgs, numpy, scipy, matplotlib, tkinter; print("Galactic Python imports OK")'
 ```
 
-If you reused an EUFS installation and the Python check reports a missing numerical or plotting package, install it with `sudo apt install python3-numpy python3-scipy python3-matplotlib python3-tk` and repeat the check.
-
-If your ROS or EUFS installation is elsewhere, set `ROS_SETUP` to Galactic's `setup.bash` and `EUFS_WS` to the root of the built EUFS workspace before sourcing. Set `EUFS_MASTER` only if the simulator source is outside `$EUFS_WS/src/eufs_sim`. Use the same values in every terminal. When a later update touches only controls, rebuild from the repository root with `colcon build --base-paths src --packages-select controls` after sourcing `scripts/setup_integration.sh`.
+If your ROS or EUFS installation is elsewhere, set `ROS_SETUP` to Galactic's `setup.bash` and `EUFS_WS` to the root of the built EUFS workspace. Set `EUFS_MASTER` if the simulator source is outside `$EUFS_WS/src/eufs_sim`. If you set `RAMS_WSL_WORKSPACE` to a different Ubuntu directory, use that same path for the build and all launch terminals.
 
 ## 3. Choose the controller's GPU setup
 
@@ -111,36 +108,27 @@ The ROS interpreter needs `rclpy`, the EUFS messages, NumPy, SciPy and Matplotli
 
 The full 1,024-rollout CPU fallback is useful for offline diagnostics. In a recorded CPU Gazebo run the 3.0 m/s target was overshot to 7.20 m/s and most steering solves had no remaining time to affect their rollouts. Use a working CUDA configuration for driving comparisons.
 
-## 4. Launch Small Track in three terminals
+## 4. Launch in three WSL terminals
 
-At the start of **each** terminal, change into the repository. Substitute your actual checkout path if it differs. Source in this order:
-
-```bash
-cd "$HOME/RAMS-e-25-integration"
-source scripts/setup_integration.sh
-source install/setup.bash
-export ROS_DOMAIN_ID=0
-```
-
-Use the same ROS domain and middleware for Gazebo, bringup, controls and any debug terminal. If your setup requires a particular `RMW_IMPLEMENTATION`, use that setting in all terminals.
+Each command sources ROS, EUFS, and the WSL build automatically. Use the same ROS domain and middleware for Gazebo, bringup, controls, and any debug terminal. The launcher defaults to ROS domain 0.
 
 ### Terminal 1 · EUFS launcher
 
 ```bash
-ros2 launch eufs_launcher eufs_launcher.launch.py
+bash /mnt/c/Code/RMS/RAMS-e-25/scripts/run_integration.sh sim
 ```
 
-In the launcher, choose **Small Track** (`small_track.launch`), robot **eufs**, **DynamicBicycle**, **DryTrack**, and command mode **acceleration**. Enable **Gazebo GUI**, **Publish Ground Truth** and **Use Simulated Perception**. Use the default spawn and keep cone noise settings fixed across comparisons. Click **Launch** and wait for the car and cones to appear. If Gazebo is paused, resume physics. The controller issues acceleration commands in m/s². The speed field records its target.
+In the launcher, choose your track, robot **eufs**, **DynamicBicycle**, **DryTrack**, and command mode **acceleration**. Enable **Gazebo GUI**, **Publish Ground Truth** and **Use Simulated Perception**. Use the default spawn and keep cone noise settings fixed across comparisons. Click **Launch** and wait for the car and cones to appear. If Gazebo is paused, resume physics. The controller issues acceleration commands in m/s². The speed field records its target.
 
 ### Terminal 2 · Team bringup and the PP window
 
 ```bash
-MPLBACKEND=TkAgg ros2 launch bringup stack.launch.py
+bash /mnt/c/Code/RMS/RAMS-e-25/scripts/run_integration.sh planner
 ```
 
-Wait for the planner's window and for an ordered path to appear. Bringup starts fusion, the ground-truth odometry relay, SLAM in GT passthrough and the planner. Controls are started separately. If the plot fails to open, check that Tk is available and the terminal can display windows. `MPLBACKEND=Agg` starts this same bringup with its plot window disabled.
+Bringup starts fusion, the ground-truth odometry relay, SLAM in GT passthrough, and the TEL planner. The planner runs headless by default. To view the path and steering, open the optional debug tab.
 
-Before starting controls, check the simulator and planner streams from Terminal 3 after sourcing the environment. Run each line individually and press Ctrl+C after seeing messages. At spawn, `/path_points` should contain the car pose followed by several forward waypoints.
+To check the simulator and planner streams, source the environment as in step 2 and run these commands separately. At spawn, `/path_points` should contain the car pose followed by several forward waypoints.
 
 ```bash
 ros2 topic echo /ground_truth/odom --field pose.pose.position
@@ -150,24 +138,11 @@ ros2 topic echo /path_points --field poses
 
 ### Terminal 3 · Exp13 and automatic recording
 
-Pick **one** of the commands below. Set `ros_python` in this terminal to the Galactic interpreter chosen in step 3. Both options use the team controller entry point and record automatically.
-
-Direct CUDA:
-
 ```bash
-# Example interpreter. Use /usr/bin/python3 if that passed the CUDA check.
-ros_python="$HOME/.venvs/rams-galactic/bin/python3"
-MPPI_MODEL=exp13 MPPI_SEED=42 ros2 run --prefix "$ros_python" controls control_node
+bash /mnt/c/Code/RMS/RAMS-e-25/scripts/run_integration.sh controls
 ```
 
-Separate GPU worker:
-
-```bash
-# Use "$VIRTUAL_ENV/bin/python3" here if using an activated Galactic venv.
-ros_python=/usr/bin/python3
-MPPI_WORKER_PYTHON="$HOME/.venvs/rams-mppi-gpu/bin/python" MPPI_MODEL=exp13 MPPI_SEED=42 \
-  ros2 run --prefix "$ros_python" controls control_node
-```
+The launcher uses the separate CUDA worker by default. If your Galactic interpreter runs CUDA directly, set `MPPI_WORKER_PYTHON=` on the launch command to use that interpreter for MPPI as well.
 
 Wait for **`[MPPI] GPU ... + CUDA graph`**, the **200- and 400-step CUDA graph captures**, and startup warm-up completion. In EUFS Mission Control click **Manual Drive** once. Leave the steering controls alone. Use the same arm point for comparable runs. If a second terminal may be controlling the car, check `ros2 topic info /cmd -v` and confirm that the running controller is the only command publisher.
 
@@ -176,25 +151,27 @@ Wait for **`[MPPI] GPU ... + CUDA graph`**, the **200- and 400-step CUDA graph c
 Use the same checkout and sources as the other terminals. This opens the separate Matplotlib window with raw PP, the controller reference, the recovery path and the cheapest MPPI rollouts.
 
 ```bash
-/usr/bin/python3 src/controls/controls/debug/pseudo_debug.py
+bash /mnt/c/Code/RMS/RAMS-e-25/scripts/run_integration.sh debug
 ```
 
 ## 5. Finish, share and repeat a run
 
-1. Press **Ctrl+C in the controller terminal** and wait for **`[run] Report:`** before closing the terminal. The controller writes a fresh `runs/<id>/` folder. `MPPI_RUNS_DIR` overrides that location.
+1. Press **Ctrl+C in the controller terminal** and wait for **`[run] Report:`** before closing the terminal. The launcher writes each recording to `~/rams-wsl/runs/<id>/` by default. `MPPI_RUNS_DIR` overrides that location.
 2. Open `report.html` and `trajectory.png` in that folder. Share the whole folder if another teammate needs to diagnose the run. It includes the model, seed and worker setting in `run.json`, `controller.log`, the raw `events.jsonl`, `timeline.csv`, `ground_truth.csv` and `applied_steering.csv` when wheel feedback is available. A contact count marked unknown means the recorder received no contact payload.
 3. For a new comparable run, stop bringup and the EUFS launcher after the report is written and relaunch from step 4. This restores the starting cone poses, car pose and wheel state. Keep the track, launch settings, planner build and seed fixed. Seed 42 repeats the optimizer's random sequence under the same device and sequence of solves. Simulator and ROS timing can still vary.
 
 For a timing A/B test, leave `MPPI_STEERING_ACTUATOR=1` and `MPPI_STEERING_SYNC=1` in both trials and toggle `MPPI_ELAPSED_WARM_START=0` versus `1` on the controller command. Exp13 defaults to all three on. The settings are saved in `run.json`.
 
-For the Small Track cone clearance experiment, prefix the Exp13 command with `MPPI_CONE_CLEARANCE=1`. Restart from a fresh world for the enabled and baseline runs. In the report, check clearance decisions, feasible rollouts, selected margin and added time. Use the default simulator car and its normal ground-truth cone stream. This uses conservative planar geometry and requires GUI verification of false stops and stopping distances.
+Exp13 enables cone clearance and clearance-based speed limiting by default. For a baseline run, set `MPPI_CONE_CLEARANCE=0`. To keep the clearance steering checks and disable only the speed limit add-on, set `MPPI_CLEARANCE_SPEED=0`. Restart from a fresh world for each comparison. In the report, check feasible rollouts, the applied speed cap, the rollout target, and the selected margin. Use the default simulator car and its normal ground-truth cone stream.
+
+With clearance speed limiting enabled, Exp13 can retry at 0.5 m/s when the current batch has no cone-clear path. If the valid paths still overlap a cone, it follows the best-scoring crawl candidate and records `clearance_crawl`. The normal speed cap recovers as feasible paths return.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
 | `Package 'eufs_launcher' not found` | Check `EUFS_WS` and confirm the simulator built. Source `scripts/setup_integration.sh` in that terminal. |
-| `Package 'bringup' not found` | Build from both `bringup` and `src`, then source this checkout's `install/setup.bash`. |
+| `Package 'bringup' not found` | Run the launcher's `build` command. For manual ROS commands, source the WSL install as in step 2. |
 | Nothing on `/ground_truth/odom` | Check Publish Ground Truth, car spawn, pause state, ROS domain and middleware. |
 | Ground truth arrives but `/path_points` has no useful waypoints | Check Terminal 2 for errors and verify `/ground_truth/cones`, `/slam/odom_raw` and `/slam/map_cones` have data. |
 | No PP window | Use `MPLBACKEND=TkAgg`, check `python3-tk` and GUI access, and read the planner's live-plot warning if present. |

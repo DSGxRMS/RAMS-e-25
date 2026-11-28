@@ -11,8 +11,9 @@ import threading
 import time
 
 from controls.cone_clearance import (
-    CLEARANCE_SPEED_FLOOR_MPS, CLEARANCE_SPEED_FULL_PCT, CLEARANCE_SPEED_HYSTERESIS_PCT,
+    CLEARANCE_CRAWL_MPS, CLEARANCE_SPEED_FLOOR_MPS, CLEARANCE_SPEED_FULL_PCT, CLEARANCE_SPEED_HYSTERESIS_PCT,
     CLEARANCE_SPEED_RELEASE_MPS2, MAX_CLEARANCE_LOG_PENALTY, PREFERRED_MARGIN_M,
+    cone_clearance_enabled,
 )
 from controls.random_seed import sampling_seed
 from controls.steering_actuator import steering_actuator_enabled, steering_option
@@ -76,7 +77,7 @@ def main():
         model_actuator = steering_actuator_enabled(model)
         align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
         elapsed_warm_start = steering_option("MPPI_ELAPSED_WARM_START", model == "exp13")
-        check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+        check_clearance = cone_clearance_enabled(model)
         limit_clearance_speed = check_clearance and steering_option("MPPI_CLEARANCE_SPEED", True)
     except ValueError as exc:
         print(f"[run] {exc}", file=sys.stderr)
@@ -113,6 +114,7 @@ def main():
                       mppi_clearance_speed=limit_clearance_speed)
     if limit_clearance_speed:
         status.update(mppi_clearance_speed_floor_mps=CLEARANCE_SPEED_FLOOR_MPS,
+                      mppi_clearance_crawl_mps=CLEARANCE_CRAWL_MPS,
                       mppi_clearance_speed_full_pct=CLEARANCE_SPEED_FULL_PCT,
                       mppi_clearance_speed_hysteresis_pct=CLEARANCE_SPEED_HYSTERESIS_PCT,
                       mppi_clearance_speed_release_mps2=CLEARANCE_SPEED_RELEASE_MPS2)

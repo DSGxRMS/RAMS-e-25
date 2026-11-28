@@ -30,6 +30,7 @@ if os.environ.get("MPPI_VIZ", "0") != "1":
     matplotlib.use("Agg")
 
 from controls.ros_connect import ROSInterface
+from controls.cone_clearance import cone_clearance_enabled
 from controls.control_utils import compute_signed_curvature
 from controls.mppi_worker import MPPIWorker
 from controls.steering_actuator import (
@@ -82,9 +83,10 @@ def main():
 
 
 def _run(resources):
-    model_actuator = steering_actuator_enabled(os.environ.get("MPPI_MODEL", "exp13"))
+    model = os.environ.get("MPPI_MODEL", "exp13")
+    model_actuator = steering_actuator_enabled(model)
     align_steering = steering_option("MPPI_STEERING_SYNC", model_actuator)
-    check_clearance = steering_option("MPPI_CONE_CLEARANCE", False)
+    check_clearance = cone_clearance_enabled(model)
     rclpy.init()
     node = ROSInterface(ordered_reference=True, wheel_feedback=model_actuator,
                         clearance_feedback=check_clearance)
@@ -463,6 +465,8 @@ def _run(resources):
         if audit_pub is not None:
             if info.get("clearance_blocked"):
                 audit_mode = "clearance_brake"
+            elif info.get("clearance_crawl"):
+                audit_mode = "clearance_crawl"
             elif last_path_bad:
                 audit_mode = "path_rejected"
             elif info.get("path_exhausted"):

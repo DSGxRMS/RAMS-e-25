@@ -5,7 +5,8 @@ import numpy as np
 import torch
 
 from controls.cone_clearance import (
-    ClearanceSpeedGovernor, clearance_log_penalty, measured_footprint_gap, swept_clearance,
+    ClearanceSpeedGovernor, clearance_log_penalty, cone_clearance_enabled,
+    measured_footprint_gap, swept_clearance,
 )
 
 
@@ -40,16 +41,18 @@ def test_clearance_penalty_strongly_discounts_small_positive_margins():
     penalty = clearance_log_penalty(torch.tensor([.01, .10, .25, .50]))
     weights = torch.exp(-penalty)
     assert 0 < weights[0] < .01 < weights[1] < weights[2] == weights[3] == 1
+    overlaps = clearance_log_penalty(torch.tensor([-.15, -.05, 0.0]))
+    assert overlaps[0] > overlaps[1] > overlaps[2]
 
 
 def test_clearance_speed_tightens_quadratically_without_compounding():
-    governor = ClearanceSpeedGovernor(6.0)
+    governor = ClearanceSpeedGovernor(4.0)
     governor.observe(80.0, .05)
-    assert governor.cap_mps == 6.0
+    assert governor.cap_mps == 4.0
     governor.observe(32.5, .05)
-    assert governor.cap_mps == 2.625
+    assert governor.cap_mps == 2.125
     governor.observe(32.5, .05)
-    assert governor.cap_mps == 2.625
+    assert governor.cap_mps == 2.125
     governor.observe(0.0, .05)
     assert governor.cap_mps == 1.5
 
@@ -68,40 +71,78 @@ def test_clearance_speed_hysteresis_holds_and_recovers_at_a_bounded_rate():
     assert governor.cap_mps == 6.0
 
 
-def test_clearance_retry_retimes_steering_and_stop_uses_the_pi_controller():
+def test_clearance_default_is_specific_to_exp13(monkeypatch):
+    monkeypatch.delenv("MPPI_CONE_CLEARANCE", raising=False)
+    assert cone_clearance_enabled("exp13")
+    assert not cone_clearance_enabled("exp10")
+    monkeypatch.setenv("MPPI_CONE_CLEARANCE", "0")
+    assert not cone_clearance_enabled("exp13")
+
+
+def test_clearance_crawl_retimes_rollouts_and_preserves_path_stops(monkeypatch):
     from controls.mppi_controller import MPPIController
 
     class SmallBatchController(MPPIController):
         K = 8
 
+    monkeypatch.delenv("MPPI_CONE_CLEARANCE", raising=False)
+    monkeypatch.delenv("MPPI_CLEARANCE_SPEED", raising=False)
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         with patch.dict("os.environ", {"MPPI_MODEL": "exp13", "MPPI_SEED": "42",
                                        "MPPI_AUDIT": "1", "MPPI_CSV": "",
-                                       "MPPI_CONE_CLEARANCE": "1", "MPPI_CLEARANCE_SPEED": "1",
                                        "MPPI_STEERING_ACTUATOR": "1", "MPPI_FORCE_STEER0": "0"}):
             controller = SmallBatchController(force_cpu=True)
             controller.update_path([(float(x), 0.0) for x in range(25)])
-            controller._vr_lp = 4.0
+            controller._vr_lp = controller.V_MAX
             prediction = (0.0, np.zeros(48, dtype=np.float32), .04, True)
-            _, _, info = controller.compute(
-                0.0, 0.0, 0.0, 4.0, .05, one_sided=False,
-                steering_prediction=prediction, steering_state_s=1.0,
-                clearance_cones=[(4.7, .15, .15)])
+
+            def solve(t, speed, cones):
+                return controller.compute(
+                    0.0, 0.0, 0.0, speed, .05, one_sided=False,
+                    steering_prediction=prediction, steering_state_s=t, clearance_cones=cones)
+
+            _, _, info = solve(1.0, 4.0, [(4.7, .15, .15)])
             audit = info["audit"]
             assert audit["clearance_initial_feasible_pct"] == 0.0
             assert audit["clearance_feasible_pct"] > 0.0
             assert audit["clearance_selected_margin_m"] > 0.0
-            assert audit["clearance_rollout_target_mps"] == info["target_speed"] == 1.5
-            assert max(audit["rollout_speed_targets"]) <= 1.5
+            assert audit["clearance_rollout_target_mps"] == info["target_speed"] == .5
+            assert max(audit["rollout_speed_targets"]) <= .5
             assert math.isclose(audit["reference"][1][0] - audit["reference"][0][0],
-                                1.5 * .025, abs_tol=.002)
-            assert math.isclose(controller._vr_lp, 5.2)
+                                .5 * .025, abs_tol=.002)
+            assert controller._vr_lp == controller.V_MAX
+            assert audit["clearance_speed_next_cap_mps"] == .5
 
-            _, acceleration, stopped = controller.compute(
-                0.0, 0.0, 0.0, .8, .05, one_sided=False, clearance_cones=None)
+            obstacle = [(1.65, .15, .15)]
+            for t in (1.05, 1.10):
+                steer, acceleration, crawl = solve(t, 0.0, obstacle)
+                audit = crawl["audit"]
+                assert crawl["clearance_crawl"] and not crawl["clearance_blocked"]
+                assert crawl["target_speed"] == audit["clearance_rollout_target_mps"] == .5
+                assert audit["clearance_speed_next_cap_mps"] == .5
+                assert audit["clearance_feasible_count"] == 0
+                assert audit["clearance_infeasible_pct"] == 100.0
+                assert audit["clearance_decision"] == "crawl"
+                assert audit["clearance_selected_margin_m"] < 0.0
+                assert steer == audit["selected_steer_sequence"][0]
+                assert max(audit["rollout_speed_targets"]) <= .5
+                assert "clearance_retry_target_mps" not in audit
+                assert acceleration > 0.0
+
+            _, _, next_step = solve(1.15, .5, [])
+            assert not next_step["clearance_crawl"]
+            assert next_step["target_speed"] == .5
+            assert math.isclose(next_step["audit"]["clearance_speed_next_cap_mps"], .575)
+
+            _, acceleration, stopped = solve(1.20, .8, None)
             assert stopped["clearance_blocked"] and stopped["target_speed"] == 0.0
             assert math.isclose(acceleration, -1.2)
+
+            controller.update_path([(0., 0.), (.7, 0.)])
+            _, _, end_of_path = solve(1.25, 0.0, obstacle)
+            assert end_of_path["clearance_blocked"] and not end_of_path["clearance_crawl"]
+            assert end_of_path["target_speed"] == 0.0
     finally:
         torch.set_num_threads(threads)

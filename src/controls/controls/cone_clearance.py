@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from controls.steering_actuator import steering_option
+
 # Conservative XY boxes from the chassis collision mesh and four tyre cylinders.
 # The front boxes enclose each tyre over the full EUFS steering range (±0.52 rad).
 FOOTPRINT = (
@@ -20,7 +22,12 @@ MAX_CLEARANCE_LOG_PENALTY = 6.0
 CLEARANCE_SPEED_FULL_PCT = 65.0
 CLEARANCE_SPEED_HYSTERESIS_PCT = 10.0
 CLEARANCE_SPEED_FLOOR_MPS = 1.5
+CLEARANCE_CRAWL_MPS = 0.5
 CLEARANCE_SPEED_RELEASE_MPS2 = 1.5
+
+
+def cone_clearance_enabled(model):
+    return steering_option("MPPI_CONE_CLEARANCE", model == "exp13")
 
 
 class ClearanceSpeedGovernor:
@@ -61,8 +68,8 @@ def measured_footprint_gap(cones):
 
 
 def clearance_log_penalty(margins):
-    """Discount feasible samples that barely clear the padded footprint."""
-    shortfall = (1.0 - margins / PREFERRED_MARGIN_M).clamp(0, 1)
+    """Prefer larger margins, including when choosing a crawl trajectory."""
+    shortfall = (1.0 - margins / PREFERRED_MARGIN_M).clamp_min(0)
     return MAX_CLEARANCE_LOG_PENALTY * shortfall.square()
 
 
